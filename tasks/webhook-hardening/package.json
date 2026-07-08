@@ -1,14 +1,13 @@
 {
-  "name": "checkout-service",
+  "name": "webhook-ingress",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Order checkout & payment-capture service (Express + Prisma + SQLite)",
+  "description": "Payment-provider webhook ingestion service (Express + Prisma + SQLite)",
   "scripts": {
     "postinstall": "prisma generate && prisma migrate deploy && node prisma/seed.mjs",
     "setup": "prisma generate && prisma migrate deploy && node prisma/seed.mjs",
     "start": "node src/server.mjs",
-    "load-test": "node scripts/load-test.mjs",
     "test": "node --test \"test/**/*.test.mjs\"",
     "test:coverage": "c8 --all --include=src/**/*.mjs --exclude=src/server.mjs --reporter=text --reporter=lcov node --test \"test/**/*.test.mjs\""
   },

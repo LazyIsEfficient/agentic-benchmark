@@ -3,5 +3,10 @@
   "title": "Implement resolveSafeRedirect + Express handler",
   "logicBearing": true,
   "securityRelevant": true,
-  "seedFiles": ["package.json"]
+  "seedFiles": [
+    ".gitignore",
+    "package.json",
+    "package-lock.json",
+    "test/harness.test.mjs"
+  ]
 }

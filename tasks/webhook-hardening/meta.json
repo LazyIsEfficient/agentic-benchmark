@@ -1,10 +1,11 @@
 {
-  "id": "prisma-tx-deadlock",
-  "title": "Fix payment failures & double-charges under concurrent load",
+  "id": "webhook-hardening",
+  "title": "Harden payment webhook ingestion (signature, replay, idempotency)",
   "logicBearing": true,
   "securityRelevant": true,
   "seedFiles": [
     ".env",
+    ".env.example",
     ".gitignore",
     "README.md",
     "package.json",
@@ -13,13 +14,12 @@
     "prisma/seed.mjs",
     "prisma/migrations/migration_lock.toml",
     "prisma/migrations/20260101000000_init/migration.sql",
-    "scripts/load-test.mjs",
     "src/app.mjs",
     "src/server.mjs",
     "src/lib/prisma.mjs",
-    "src/paymentClient.mjs",
-    "src/routes/orders.mjs",
-    "src/services/orderService.mjs",
-    "test/harness.test.mjs"
+    "src/routes/webhooks.mjs",
+    "src/services/webhookService.mjs",
+    "test/harness.test.mjs",
+    "test/helpers/sign.mjs"
   ]
 }

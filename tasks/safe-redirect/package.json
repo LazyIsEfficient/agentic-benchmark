@@ -2,5 +2,12 @@
   "name": "safe-redirect",
   "version": "0.0.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "test:coverage": "c8 --all --include=src/**/*.{mjs,js,ts} --reporter=text --reporter=lcov node --test \"test/**/*.test.mjs\""
+  },
+  "devDependencies": {
+    "c8": "^10.1.3"
+  }
 }
