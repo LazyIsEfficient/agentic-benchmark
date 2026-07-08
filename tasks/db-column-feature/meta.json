@@ -1,0 +1,19 @@
+{
+  "id": "db-column-feature",
+  "title": "Add a priority field to tickets across Prisma, API, and frontend",
+  "logicBearing": true,
+  "securityRelevant": true,
+  "seedFiles": [
+    ".gitignore",
+    "README.md",
+    "package.json",
+    "prisma/schema.prisma",
+    "prisma/seed.js",
+    "prisma/migrations/migration_lock.toml",
+    "prisma/migrations/20260101000000_init/migration.sql",
+    "src/server.js",
+    "public/index.html",
+    "public/app.js",
+    "public/styles.css"
+  ]
+}

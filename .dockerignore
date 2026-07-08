@@ -1,0 +1,6 @@
+node_modules
+.bench-config
+results
+reports
+.git
+*.log

@@ -1,0 +1,22 @@
+{
+  "name": "claude-md-benchmark",
+  "version": "1.0.0",
+  "description": "Benchmarking harness that scores CLAUDE.md system-prompt variants on a coding task using an isolated claude CLI executor and judge.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build-image": "bash scripts/build-image.sh",
+    "setup-auth": "bash scripts/setup-auth.sh",
+    "bench": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/**/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

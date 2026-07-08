@@ -1,0 +1,21 @@
+{
+  "name": "checkout-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Order checkout & payment-capture service (Express + Prisma + SQLite)",
+  "scripts": {
+    "postinstall": "prisma generate && prisma migrate deploy && node prisma/seed.mjs",
+    "setup": "prisma generate && prisma migrate deploy && node prisma/seed.mjs",
+    "start": "node src/server.mjs",
+    "load-test": "node scripts/load-test.mjs"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0"
+  }
+}

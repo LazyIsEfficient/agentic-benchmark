@@ -1,0 +1,7 @@
+{
+  "id": "safe-redirect",
+  "title": "Implement resolveSafeRedirect + Express handler",
+  "logicBearing": true,
+  "securityRelevant": true,
+  "seedFiles": ["package.json"]
+}
