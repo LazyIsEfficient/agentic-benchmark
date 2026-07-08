@@ -1,0 +1,32 @@
+// Checkout service data model.
+// SQLite in local/dev; the same schema runs on the managed SQL database in prod.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// A customer order moving through checkout.
+model Order {
+  id        String        @id @default(uuid())
+  status    String        @default("pending") // pending | processing | charged | failed
+  amount    Int // minor units (cents)
+  currency  String        @default("usd")
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  ledger    LedgerEntry[]
+}
+
+/// Append-only financial ledger — one row per money movement.
+model LedgerEntry {
+  id        String   @id @default(uuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id])
+  type      String // charge | refund
+  amount    Int
+  createdAt DateTime @default(now())
+}

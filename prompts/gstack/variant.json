@@ -1,0 +1,7 @@
+{
+  "type": "bundle",
+  "install": "setup",
+  "claudeMd": "CLAUDE.md",
+  "setupCommand": "GSTACK_SKIP_FONTS=1 GSTACK_SKIP_COREUTILS=1 GSTACK_SKIP_GBRAIN_REGEN=1 /opt/gstack/setup --local -q --no-prefix",
+  "description": "gstack 1.58.5.0 @11de390 (github.com/garrytan/gstack)"
+}

@@ -1,0 +1,44 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit(examples/**)",
+      "Edit(README.md)",
+      "Edit(SHAPERS.md)",
+      "Edit(.claude/skills/**)",
+      "Edit(.claude/agents/**)",
+      "Edit(.claude/settings.json)",
+      "Edit(pocs/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/block-bad-bash.sh" },
+          { "type": "command", "command": "bash .claude/hooks/survey-before-act.sh" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "bash .claude/hooks/session-state-inject.sh" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash .claude/hooks/session-state-digest.sh" } ] }
+    ],
+    "PreCompact": [
+      { "matcher": "auto",   "hooks": [ { "type": "command", "command": "bash .claude/hooks/session-state-checkpoint.sh" } ] },
+      { "matcher": "manual", "hooks": [ { "type": "command", "command": "bash .claude/hooks/session-state-checkpoint.sh" } ] }
+    ]
+  },
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "The canonical remote for this project is `origin2` = git@github.com:LazyIsEfficient/agentic-os.git — the user's own repository. Pushing branches and opening pull requests to it is expected and authorized."
+    ],
+    "allow": [
+      "$defaults",
+      "Pushing branches/commits and opening pull requests to the project's own remote (origin2 → LazyIsEfficient/agentic-os) is allowed."
+    ]
+  }
+}
