@@ -105,6 +105,7 @@ npm run bench -- --task safe-redirect       # restrict to one task
 npm run bench -- --all --models fable,sonnet,opus   # compare across executor models
 npm run bench -- --all --concurrency 3      # run up to 3 cells in parallel
 npm run bench -- --all --delay-ms 5000      # pace cells to ease rate limits
+npm run bench -- --report reports/<run>/    # regenerate a report from a finished run (offline)
 ```
 
 ### The benchmark matrix: variant × task × executor model
@@ -273,8 +274,36 @@ Both the executor and judge calls are measured. Where they appear:
     are **never averaged across models** (they aren't interchangeable). "Top
     result" reports the best `(variant, model)` overall.
 - `report.json` keeps a flat `results` array (each entry tagged with
-  `executorModel`/`judgeModel`, so it's groupable by model) plus an
-  `executorModels` list and the fixed `judgeModel` in the meta.
+  `executorModel`/`judgeModel`, so it's groupable by model, plus a derived
+  `scored` flag / `excludedReason`) plus an `executorModels` list, the fixed
+  `judgeModel`, and a `variantSummary` (per-unit `scoredCount`/`attemptedCount`/
+  `meanTotal`).
+
+### Scored vs excluded cells (only real verdicts count)
+
+The /100 mean is computed over **scored cells only** — a cell counts iff it
+produced a real judge verdict (executor OK **and** no judge failure; timeouts
+already fail the executor). This keeps wall-clock (the executor timeout) from
+polluting the ranking:
+
+- A failed/timed-out cell is a **coverage gap, never a fabricated 0**. It is
+  excluded from the mean, shown as `⚠️ excluded` in the matrix, and listed under
+  **`## Excluded cells (not scored)`** with its reason.
+- Each matrix row shows **coverage** — e.g. `2/3 scored, 1 excluded`. A unit with
+  **zero** scored cells renders `⚠️ excluded` (not `0`) and ranks **last**.
+- A genuine judge-scored `0` (present output the judge rated 0) **does** count —
+  only the failure path is excluded, never a real verdict.
+- Time/cost KPIs are unchanged: they remain observational and still include
+  failed/timed-out attempts (honest cost accounting), and never feed the score.
+
+### Regenerating a report (`--report`, offline)
+
+`npm run bench -- --report <path>` rebuilds `report.md` + `report.json` from a
+finished run — `<path>` is a run folder (containing `report.json`) or a
+`report.json` directly. It reloads the saved results, re-runs the current
+aggregation + rendering, and rewrites both files in place. Pure and offline: no
+Docker, no auth, no executor/judge calls — so historical runs can be
+re-aggregated after a methodology change like this one.
 
 ## Variant types
 

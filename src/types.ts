@@ -240,6 +240,15 @@ export interface VariantTaskResult {
   judgeFailure?: string;
   /** True if the diff/transcript evidence was truncated to fit the judge context. */
   evidenceTruncated?: boolean;
+  /**
+   * Whether this cell got a real judge verdict (executorOk AND no judge failure).
+   * Only scored cells fold into the /100 mean; excluded cells are coverage gaps,
+   * never a fabricated 0. Stamped onto report.json at write time; derived from
+   * executorFailure/judgeFailure so it recomputes on regenerate.
+   */
+  scored?: boolean;
+  /** Why an unscored cell was excluded (timeout / executor / judge failure). */
+  excludedReason?: string;
 }
 
 /** The full report payload written to <runDir>/report.json. */

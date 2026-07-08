@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import {
   aggregateByVariant,
   aggregateMetrics,
   distinctModels,
+  excludedReasonOf,
   formatScore,
+  isScored,
   orderResultsForDetail,
   rankVariants,
+  regenerateReport,
   renderCrossModelTable,
+  renderExcludedCells,
   renderMatrix,
   renderPerModelMatrices,
   renderReportMarkdown,
@@ -69,7 +76,8 @@ test("formatScore keeps integers and renders means to one decimal", () => {
 test("single task: mean equals the task score", () => {
   const aggs = aggregateByVariant([a]);
   assert.equal(aggs.length, 1);
-  assert.equal(aggs[0]!.taskCount, 1);
+  assert.equal(aggs[0]!.attemptedCount, 1);
+  assert.equal(aggs[0]!.scoredCount, 1);
   assert.equal(aggs[0]!.meanTotal, 86);
   assert.equal(aggs[0]!.mean.testingCoverage, 35);
 });
@@ -97,7 +105,8 @@ test("aggregateByVariant groups runs and averages each dimension + total", () =>
   const alpha = aggs.find((v) => v.variant === "alpha")!;
   const bravo = aggs.find((v) => v.variant === "bravo")!;
 
-  assert.equal(alpha.taskCount, 2);
+  assert.equal(alpha.attemptedCount, 2);
+  assert.equal(alpha.scoredCount, 2);
   assert.equal(alpha.mean.codeQuality, 22.5); // (25+20)/2
   assert.equal(alpha.mean.testingCoverage, 32.5); // (35+30)/2
   assert.equal(alpha.mean.securityQuality, 16.5); // (18+15)/2
@@ -141,6 +150,8 @@ test("a variant with a failed run is flagged in the matrix", () => {
   );
   const md = renderMatrix([a, failed]);
   assert.match(md, /charlie ⚠️/);
+  // A judge-failed cell is not a 0 — it renders as excluded with 0/1 coverage.
+  assert.match(md, /charlie ⚠️ \| — \| — \| — \| — \| ⚠️ excluded \| 0\/1 scored/);
 });
 
 // --- Detail + strengths/weaknesses ------------------------------------------
@@ -156,7 +167,7 @@ test("renderVariantDetail emits the exact judge markdown format", () => {
   assert.match(md, /## Summary/);
 });
 
-test("renderVariantDetail annotates applied caps and judge failure", () => {
+test("renderVariantDetail annotates applied caps on a scored cell", () => {
   const capped = result(
     "capped",
     "t",
@@ -165,12 +176,24 @@ test("renderVariantDetail annotates applied caps and judge failure", () => {
       appliedCaps: [
         { dimension: "testingCoverage", rawScore: 38, cappedTo: 10, reason: "no tests" },
       ],
-      judgeFailure: "timeout",
     },
   );
   const md = renderVariantDetail(capped);
   assert.match(md, /capped from 38/);
-  assert.match(md, /Judge failed: timeout/);
+});
+
+test("renderVariantDetail labels an excluded (failed) cell instead of a 0/100 scorecard", () => {
+  const failed = result(
+    "brokebundle",
+    "t",
+    { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 },
+    { judgeFailure: "judge timed out", executorFailure: undefined },
+  );
+  const md = renderVariantDetail(failed);
+  assert.match(md, /Excluded from score/);
+  assert.match(md, /judge timed out/);
+  assert.doesNotMatch(md, /## Scores/); // no fabricated scorecard
+  assert.doesNotMatch(md, /Total Score: 0\/100/);
 });
 
 test("renderVariantDetail renders the total-cap note when a dimension:total cap fired", () => {
@@ -304,16 +327,16 @@ test("aggregateByVariant groups by (variant, model) — never averaging across m
 test("renderCrossModelTable: rows = variant, columns = models, best marked with star", () => {
   const md = renderCrossModelTable(crossModel);
   assert.match(md, /\| Variant \| sonnet \/100 \| opus \/100 \|/);
-  // alpha: sonnet 86 is best (★), opus 70.
-  assert.match(md, /\| alpha \| 86 ★ \| 70 \|/);
+  // alpha: sonnet 86 is best (★), opus 70. Coverage shown per cell.
+  assert.match(md, /\| alpha \| 86 ★ \(1\/1 scored\) \| 70 \(1\/1 scored\) \|/);
   // bravo: opus 48 is best (★), sonnet 35.
-  assert.match(md, /\| bravo \| 35 \| 48 ★ \|/);
+  assert.match(md, /\| bravo \| 35 \(1\/1 scored\) \| 48 ★ \(1\/1 scored\) \|/);
 });
 
 test("renderCrossModelTable renders a missing (variant,model) cell as em dash", () => {
   // alpha only ran on sonnet; opus column must show — not crash.
   const md = renderCrossModelTable([alphaSon, bravoOpus]);
-  assert.match(md, /\| alpha \| 86 ★ \| — \|/);
+  assert.match(md, /\| alpha \| 86 ★ \(1\/1 scored\) \| — \|/);
   assert.doesNotMatch(md, /undefined|NaN/);
 });
 
@@ -352,4 +375,132 @@ test("renderReportMarkdown (multi model) shows cross-model + per-model sections"
   assert.match(md, /### Model: sonnet/);
   assert.doesNotMatch(md, /## Score matrix/); // replaced by the multi-model sections
   assert.match(md, /Top result.*alpha @ sonnet.*86/);
+});
+
+// --- Scored vs excluded aggregation (methodology fix) -----------------------
+
+test("isScored: genuine judge-0 counts; failures/timeouts are excluded", () => {
+  const judged0 = result("z", "t", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 });
+  assert.equal(isScored(judged0), true); // present output judged 0 → counts
+  assert.equal(isScored(result("z", "t", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { executorFailure: "Executor timed out and the container was killed." })), false);
+  assert.equal(isScored(result("z", "t", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { judgeFailure: "bad json" })), false);
+  assert.equal(
+    excludedReasonOf(result("z", "t", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { executorFailure: "timeout" })),
+    "timeout",
+  );
+});
+
+test("aggregateByVariant: excluded cell drops out of the mean; coverage reflects the gap", () => {
+  const scored1 = result("v", "t1", { codeQuality: 20, testingCoverage: 30, securityQuality: 15, documentation: 5 }); // 70
+  const scored2 = result("v", "t2", { codeQuality: 30, testingCoverage: 40, securityQuality: 20, documentation: 10 }); // 100
+  const excludedCell = result("v", "t3", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { executorFailure: "Executor timed out and the container was killed." });
+  const [agg] = aggregateByVariant([scored1, excludedCell, scored2]);
+  assert.equal(agg!.attemptedCount, 3);
+  assert.equal(agg!.scoredCount, 2);
+  assert.equal(agg!.hasScored, true);
+  assert.equal(agg!.meanTotal, 85); // (70+100)/2 — the timed-out 0 is NOT averaged in
+  assert.equal(agg!.mean.codeQuality, 25); // (20+30)/2
+  assert.equal(agg!.excluded.length, 1);
+});
+
+test("aggregateByVariant: a genuine judge-0 DOES count toward the mean", () => {
+  const zero = result("v", "t1", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }); // judged 0, no failure
+  const hundred = result("v", "t2", { codeQuality: 30, testingCoverage: 40, securityQuality: 20, documentation: 10 });
+  const [agg] = aggregateByVariant([zero, hundred]);
+  assert.equal(agg!.scoredCount, 2);
+  assert.equal(agg!.meanTotal, 50); // (0+100)/2 — the judge-0 counts
+});
+
+test("rankVariants: an all-excluded variant ranks LAST and shows no scored mean", () => {
+  const good = result("good", "t", { codeQuality: 25, testingCoverage: 35, securityQuality: 18, documentation: 8 });
+  const allFailed = result("bad", "t", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { judgeFailure: "boom" });
+  const ranked = rankVariants(aggregateByVariant([allFailed, good]));
+  assert.deepEqual(ranked.map((v) => v.variant), ["good", "bad"]);
+  const bad = ranked.find((v) => v.variant === "bad")!;
+  assert.equal(bad.hasScored, false);
+  assert.equal(bad.scoredCount, 0);
+});
+
+test("renderMatrix: all-excluded variant shows ⚠️ excluded (never 0) with coverage", () => {
+  const good = result("good", "t", { codeQuality: 25, testingCoverage: 35, securityQuality: 18, documentation: 8 });
+  const allFailed = result("bad", "t", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { executorFailure: "Executor timed out and the container was killed." });
+  const md = renderMatrix([good, allFailed]);
+  const goodRow = md.split("\n").find((l) => l.includes("| good "))!;
+  assert.match(goodRow, /\*\*86\*\*/);
+  assert.match(goodRow, /1\/1 scored/);
+  const badRow = md.split("\n").find((l) => l.includes("bad ⚠️"))!;
+  assert.match(badRow, /⚠️ excluded/);
+  assert.match(badRow, /0\/1 scored, 1 excluded/);
+  assert.doesNotMatch(badRow, /\*\*0\*\*/); // never a fabricated 0 total
+});
+
+test("renderExcludedCells: lists each excluded (variant, model, task) with reason", () => {
+  const good = result("good", "t1", { codeQuality: 25, testingCoverage: 35, securityQuality: 18, documentation: 8 });
+  const timedOut = result("good", "t2", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { executorFailure: "Executor timed out and the container was killed." });
+  assert.match(renderExcludedCells([good, timedOut]), /`good` × `t2` \[sonnet\] — excluded: Executor timed out/);
+  assert.match(renderExcludedCells([good]), /None — every attempted cell/);
+});
+
+// --- --report regenerate (offline) ------------------------------------------
+
+test("regenerateReport rewrites report.md/json excluding failed cells from the mean", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "bench-regen-"));
+  try {
+    const scored = result("naked", "safe-redirect", { codeQuality: 20, testingCoverage: 30, securityQuality: 15, documentation: 5 }); // 70
+    const failed = result("naked", "other-task", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { executorFailure: "Executor timed out and the container was killed." });
+    const report: Report = {
+      runId: "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+      generatedAt: "2026-07-08T00:00:00.000Z",
+      taskId: "safe-redirect,other-task",
+      taskTitle: "T",
+      executorModels: ["sonnet"],
+      judgeModel: "opus",
+      results: [scored, failed],
+    };
+    // A finished run's report.json (unaggregated results array).
+    await fs.writeFile(path.join(dir, "report.json"), JSON.stringify(report, null, 2));
+
+    // Regenerate from the folder — offline, no docker/auth.
+    const out = await regenerateReport(dir);
+    assert.equal(out.mdPath, path.join(dir, "report.md"));
+
+    const md = await fs.readFile(path.join(dir, "report.md"), "utf8");
+    // Mean is over the scored cell only (70), not (70+0)/2=35.
+    assert.match(md, /\*\*70\*\* \| 1\/2 scored, 1 excluded/);
+    // Failed cell surfaces under Excluded cells, not as a 0.
+    assert.match(md, /## Excluded cells \(not scored\)/);
+    assert.match(md, /`naked` × `other-task` \[sonnet\] — excluded: Executor timed out/);
+
+    // report.json is re-stamped with scored flags + a variant coverage summary.
+    const json = JSON.parse(await fs.readFile(path.join(dir, "report.json"), "utf8"));
+    const failedResult = json.results.find((r: { taskId: string }) => r.taskId === "other-task");
+    assert.equal(failedResult.scored, false);
+    assert.match(failedResult.excludedReason, /timed out/);
+    assert.equal(json.variantSummary[0].scoredCount, 1);
+    assert.equal(json.variantSummary[0].attemptedCount, 2);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("regenerateReport accepts a direct report.json path too", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "bench-regen2-"));
+  try {
+    const report: Report = {
+      runId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      generatedAt: "2026-07-08T00:00:00.000Z",
+      taskId: "t",
+      taskTitle: "T",
+      executorModels: ["sonnet"],
+      judgeModel: "opus",
+      results: [result("naked", "t", { codeQuality: 10, testingCoverage: 10, securityQuality: 10, documentation: 10 })],
+    };
+    const jsonPath = path.join(dir, "report.json");
+    await fs.writeFile(jsonPath, JSON.stringify(report, null, 2));
+    const out = await regenerateReport(jsonPath);
+    assert.equal(out.jsonPath, jsonPath);
+    assert.ok(await fs.stat(path.join(dir, "report.md")).then(() => true));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

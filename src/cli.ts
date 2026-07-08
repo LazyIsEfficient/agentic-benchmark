@@ -18,7 +18,7 @@ import { runPool } from "./pool.js";
 import { sleep } from "./retry.js";
 import { runVariantTask } from "./executor.js";
 import { buildFailureResult, judgeRun, writeRunResult } from "./judge.js";
-import { writeReport } from "./report.js";
+import { regenerateReport, writeReport } from "./report.js";
 import { buildRunFolderName } from "./runmeta.js";
 import { parseVariantManifest } from "./variant.js";
 import type { Report, Task, TaskMeta, Variant, VariantTaskResult } from "./types.js";
@@ -127,6 +127,8 @@ interface Args {
   concurrency?: string;
   /** Raw --delay-ms value; resolved via parseDelayMs. */
   delayMs?: string;
+  /** --report <path>: regenerate a report from a finished run (offline). */
+  reportPath?: string;
   help: boolean;
 }
 
@@ -160,6 +162,9 @@ function parseArgs(argv: string[]): Args {
         break;
       case "--delay-ms":
         args.delayMs = argv[++i];
+        break;
+      case "--report":
+        args.reportPath = argv[++i];
         break;
       default:
         throw new Error(`Unknown argument: ${a}`);
@@ -241,6 +246,8 @@ Usage:
                                           (default: ${EXECUTOR_MODEL}; judge is fixed)
   npm run bench -- --concurrency <N>      Run up to N cells in parallel (default 1)
   npm run bench -- --delay-ms <N>         Pause N ms between cells (default 0)
+  npm run bench -- --report <path>        Regenerate report.md/json from a finished
+                                          run (folder or report.json) — offline
 
 Prereqs: build the image (npm run build-image) and authenticate once
 (npm run setup-auth). See README for the isolation model.`;
@@ -355,6 +362,14 @@ async function main(): Promise<void> {
 
   if (args.help) {
     console.log(USAGE);
+    return;
+  }
+
+  // Offline: regenerate a finished run's report with the current aggregation.
+  // No containers, no auth, no executor/judge calls.
+  if (args.reportPath) {
+    const { jsonPath, mdPath } = await regenerateReport(args.reportPath);
+    console.error(`Report regenerated:\n  ${mdPath}\n  ${jsonPath}`);
     return;
   }
 
