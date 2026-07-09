@@ -7,6 +7,7 @@ import {
   fmtTokens,
   formatExecLine,
   parseCallMetrics,
+  sumModelUsage,
 } from "./metrics.js";
 
 const fullResult = {
@@ -37,6 +38,83 @@ test("parseCallMetrics maps a full result event (snake_case → camelCase)", () 
     cacheReadTokens: 900,
     cacheCreateTokens: 100,
   });
+});
+
+test("sumModelUsage sums per-model full-session totals", () => {
+  assert.deepEqual(
+    sumModelUsage({
+      "claude-sonnet-5": {
+        inputTokens: 105,
+        outputTokens: 40_000,
+        cacheReadInputTokens: 1_000,
+        cacheCreationInputTokens: 200,
+      },
+      "claude-haiku-4-5": {
+        inputTokens: 10,
+        outputTokens: 329,
+        cacheReadInputTokens: 50,
+        cacheCreationInputTokens: 5,
+      },
+    }),
+    {
+      inputTokens: 115,
+      outputTokens: 40_329,
+      cacheReadTokens: 1_050,
+      cacheCreateTokens: 205,
+    },
+  );
+  assert.equal(sumModelUsage(undefined), null);
+  assert.equal(sumModelUsage({}), null);
+  assert.equal(sumModelUsage({ "claude-sonnet-5": {} }), null);
+});
+
+test("parseCallMetrics falls back to usage when modelUsage entries are hollow", () => {
+  const m = parseCallMetrics(
+    {
+      ...fullResult,
+      modelUsage: { "claude-sonnet-5": {} },
+    },
+    80_000,
+  );
+  assert.deepEqual(m.usage, {
+    inputTokens: 45_200,
+    outputTokens: 3_100,
+    cacheReadTokens: 900,
+    cacheCreateTokens: 100,
+  });
+});
+
+test("parseCallMetrics prefers modelUsage over last-turn usage (includes subagents)", () => {
+  const m = parseCallMetrics(
+    {
+      ...fullResult,
+      usage: {
+        input_tokens: 16,
+        output_tokens: 2_755,
+        cache_creation_input_tokens: 5_967,
+        cache_read_input_tokens: 667_804,
+      },
+      modelUsage: {
+        "claude-sonnet-5": {
+          inputTokens: 105,
+          outputTokens: 46_329,
+          cacheReadInputTokens: 3_116_084,
+          cacheCreationInputTokens: 128_156,
+          costUSD: 2.25099945,
+        },
+      },
+    },
+    80_000,
+  );
+  assert.deepEqual(m.usage, {
+    inputTokens: 105,
+    outputTokens: 46_329,
+    cacheReadTokens: 3_116_084,
+    cacheCreateTokens: 128_156,
+  });
+  // cost/turns still come from the result envelope, not modelUsage
+  assert.equal(m.costUsd, 0.1234);
+  assert.equal(m.numTurns, 12);
 });
 
 test("parseCallMetrics: missing usage/cost → undefined, wallMs preserved", () => {
