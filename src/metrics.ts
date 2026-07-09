@@ -49,9 +49,45 @@ function num0(v: unknown): number {
 }
 
 /**
+ * Sum full-session token totals from a result event's `modelUsage` map.
+ * Claude Code reports per-model cumulative usage here (main agent + subagents).
+ * Returns null when the field is absent or empty.
+ */
+export function sumModelUsage(modelUsage: unknown): ClaudeUsage | null {
+  if (typeof modelUsage !== "object" || modelUsage === null) return null;
+  let any = false;
+  const totals: ClaudeUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreateTokens: 0,
+  };
+  for (const entry of Object.values(modelUsage as Record<string, unknown>)) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const m = entry as Record<string, unknown>;
+    // Ignore hollow entries (`{}`) so we still fall back to last-turn `usage`.
+    const hasTokenField =
+      typeof m["inputTokens"] === "number" ||
+      typeof m["outputTokens"] === "number" ||
+      typeof m["cacheReadInputTokens"] === "number" ||
+      typeof m["cacheCreationInputTokens"] === "number";
+    if (!hasTokenField) continue;
+    any = true;
+    totals.inputTokens += num0(m["inputTokens"]);
+    totals.outputTokens += num0(m["outputTokens"]);
+    totals.cacheReadTokens += num0(m["cacheReadInputTokens"]);
+    totals.cacheCreateTokens += num0(m["cacheCreationInputTokens"]);
+  }
+  return any ? totals : null;
+}
+
+/**
  * Map a claude `type:"result"` event (snake_case) into CallMetrics (camelCase).
  * `wallMs` is host-measured and always present; every CLI-derived field is
  * optional and degrades to undefined when absent. Pure — no I/O, never throws.
+ *
+ * Token tallies prefer `modelUsage` (full-session, includes subagents) over
+ * the last-turn `usage` blob, which under-counts agentic runs that spawn Agents.
  */
 export function parseCallMetrics(
   resultEvent: unknown,
@@ -69,6 +105,12 @@ export function parseCallMetrics(
   if (apiMs !== undefined) metrics.apiMs = apiMs;
   if (numTurns !== undefined) metrics.numTurns = numTurns;
   if (costUsd !== undefined) metrics.costUsd = costUsd;
+
+  const fromModelUsage = sumModelUsage(e["modelUsage"]);
+  if (fromModelUsage) {
+    metrics.usage = fromModelUsage;
+    return metrics;
+  }
 
   const usage = e["usage"];
   if (typeof usage === "object" && usage !== null) {

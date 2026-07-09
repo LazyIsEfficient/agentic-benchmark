@@ -43,6 +43,16 @@ Endpoints:
 - `GET  /health`
 - `POST /orders/:id/charge` — capture payment for an order
 
+### Scripts
+
+| Script                  | What it does                                |
+|-------------------------|---------------------------------------------|
+| `npm start`             | Start the HTTP server                       |
+| `npm run setup`         | Regenerate Prisma client, migrate, and seed |
+| `npm run load-test`     | Fire concurrent charges (load/concurrency check) |
+| `npm test`              | Run the configured test runner              |
+| `npm run test:coverage` | Run tests with coverage reporting           |
+
 ## Load / concurrency check
 
 `scripts/load-test.mjs` boots the app in-process, seeds a fresh batch of pending

@@ -1,7 +1,15 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveOAuthToken } from "./auth.js";
-import type { CallMetrics, ChangedFile, FileKind, RunArtifacts } from "./types.js";
+import type {
+  Behavior,
+  CallMetrics,
+  ChangedFile,
+  FileKind,
+  RunArtifacts,
+  SubAgentDispatch,
+} from "./types.js";
 import { git } from "./workspace.js";
 
 // --- Pure helpers (unit-tested) ---------------------------------------------
@@ -105,6 +113,110 @@ export function extractTranscript(ndjson: string): string {
   return out.filter((s) => s.length > 0).join("\n\n");
 }
 
+/**
+ * Parse observed behavioral signals from a run's raw NDJSON trace + its
+ * (already-redacted) diff. Pure and unit-tested. The `Agent` tool is the
+ * sub-agent spawner; its `subagent_type` is enum-like (persisted verbatim) but
+ * its `description` is free text, so we redact it. No other free-text tool
+ * input is persisted. The diff MUST be the same redacted string written to disk
+ * so `diffHash` is deterministic and leak-free.
+ */
+export function parseBehavior(args: {
+  ndjson: string;
+  diff: string;
+  changedFiles: ChangedFile[];
+  secrets: string[];
+}): Behavior {
+  const byName: Record<string, number> = {};
+  let total = 0;
+  const byType: Record<string, number> = {};
+  const dispatches: SubAgentDispatch[] = [];
+
+  for (const line of args.ndjson.split("\n")) {
+    if (line.trim().length === 0) continue;
+    let evt: TraceEvent;
+    try {
+      evt = JSON.parse(line) as TraceEvent;
+    } catch {
+      continue;
+    }
+    // tool_use blocks only ever appear in assistant events (user events carry
+    // tool_result); guard on type so a partial/adversarial trace can't inject a
+    // tool_use from a non-assistant event.
+    if (evt.type !== "assistant") continue;
+    const content = evt.message?.content;
+    if (!Array.isArray(content)) continue;
+
+    for (const block of content) {
+      if (typeof block !== "object" || block === null) continue;
+      const b = block as { type?: string; name?: string; input?: unknown };
+      if (b.type !== "tool_use" || typeof b.name !== "string") continue;
+
+      total += 1;
+      // Tool names reach report.json/md as histogram keys. Built-ins are fixed
+      // identifiers, but MCP tool names are task-definable and come from the
+      // UNREDACTED raw trace — redact before persisting. Compare on the raw name
+      // ("Agent" never contains a secret) so the branch is unaffected.
+      byName[redactSecrets(b.name, args.secrets)] =
+        (byName[redactSecrets(b.name, args.secrets)] ?? 0) + 1;
+
+      if (b.name === "Agent") {
+        const input = (typeof b.input === "object" && b.input !== null ? b.input : {}) as {
+          subagent_type?: unknown;
+          description?: unknown;
+        };
+        // subagent_type is agent-controlled free text from the raw (unredacted)
+        // trace and lands in byType keys + dispatch.type — redact it too.
+        const type = redactSecrets(
+          typeof input.subagent_type === "string" ? input.subagent_type : "(unknown)",
+          args.secrets,
+        );
+        byType[type] = (byType[type] ?? 0) + 1;
+        const dispatch: SubAgentDispatch = { type };
+        if (typeof input.description === "string") {
+          dispatch.description = redactSecrets(input.description, args.secrets);
+        }
+        dispatches.push(dispatch);
+      }
+    }
+  }
+
+  const shape = { source: 0, test: 0, docs: 0, linesAdded: 0, linesRemoved: 0 };
+  for (const f of args.changedFiles) shape[f.kind] += 1;
+
+  // Walk the unified diff once: tally +/- churn and count added it()/test()
+  // calls that fall inside a test-classified file's hunks. `+++ b/<path>` marks
+  // the file a hunk belongs to; classify it to decide whether to count tests.
+  const TEST_CASE_RE = /\b(it|test)\s*\(/;
+  let currentIsTest = false;
+  let testCasesAdded = 0;
+  for (const line of args.diff.split("\n")) {
+    if (line.startsWith("+++ ")) {
+      const p = line.slice(4).replace(/^b\//, "");
+      currentIsTest = p !== "/dev/null" && classifyFile(p) === "test";
+      continue;
+    }
+    if (line.startsWith("--- ") || line.startsWith("@@") || line.startsWith("diff --git") || line.startsWith("index ")) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      shape.linesAdded += 1;
+      if (currentIsTest && TEST_CASE_RE.test(line)) testCasesAdded += 1;
+    } else if (line.startsWith("-")) {
+      shape.linesRemoved += 1;
+    }
+  }
+
+  return {
+    subAgents: { count: dispatches.length, byType, dispatches },
+    toolCalls: { total, byName },
+    changedFileShape: shape,
+    touchedFiles: args.changedFiles.map((f) => f.path),
+    diffHash: createHash("sha256").update(args.diff).digest("hex"),
+    testCasesAdded,
+  };
+}
+
 // --- I/O capture step -------------------------------------------------------
 
 /**
@@ -142,6 +254,10 @@ export async function captureArtifacts(args: {
   await fs.writeFile(path.join(args.cellDir, "diff.patch"), diff);
   await fs.writeFile(path.join(args.cellDir, "transcript.txt"), transcript);
 
+  // Behavioral signals: parse the raw trace + the ALREADY-REDACTED diff so the
+  // hashed content and any persisted description are leak-free.
+  const behavior = parseBehavior({ ndjson: args.ndjson, diff, changedFiles, secrets });
+
   const artifacts: RunArtifacts = {
     cellId: args.cellId,
     variant: args.variant,
@@ -156,6 +272,7 @@ export async function captureArtifacts(args: {
     executorOk: args.executorOk,
     executorTimedOut: args.executorTimedOut,
     ...(args.failureReason ? { failureReason: args.failureReason } : {}),
+    behavior,
   };
   return artifacts;
 }
