@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import {
+  DEFAULT_CONCURRENCY,
   EXECUTOR_MODEL,
   INTER_CELL_DELAY_MS,
   JUDGE_MODEL,
@@ -244,7 +245,9 @@ Usage:
   npm run bench -- --task <id>            Restrict to one task id
   npm run bench -- --models <csv>         Executor models, e.g. fable,sonnet,opus
                                           (default: ${EXECUTOR_MODEL}; judge is fixed)
-  npm run bench -- --concurrency <N>      Run up to N cells in parallel (default 1)
+  npm run bench -- --concurrency <N>      Run up to N cells in parallel
+                                          (default ${DEFAULT_CONCURRENCY}, or BENCH_CONCURRENCY; heavy —
+                                          watch Docker memory before raising)
   npm run bench -- --delay-ms <N>         Pause N ms between cells (default 0)
   npm run bench -- --report <path>        Regenerate report.md/json from a finished
                                           run (folder or report.json) — offline
@@ -314,17 +317,24 @@ interface Cell {
 async function runCell(
   cell: Cell,
   buffered: boolean,
-  progress: { completed: number; total: number },
+  progress: { completed: number; total: number; started: number; running: number },
   runResultsDir: string,
 ): Promise<VariantTaskResult> {
+  const label = `${cell.variant.name} × ${cell.task.meta.id} [${cell.executorModel}]`;
   const lines: string[] = [];
   const emit = (line: string) => {
     if (buffered) lines.push(line);
     else console.error(line);
   };
 
-  if (!buffered) {
-    console.error(`\n=== ${cell.variant.name} × ${cell.task.meta.id} [${cell.executorModel}] ===`);
+  if (buffered) {
+    // Live: announce the cell as it STARTS (not just on completion) with the
+    // in-flight count, so concurrent containers are visible in real time.
+    const s = ++progress.started;
+    progress.running += 1;
+    console.error(`▶ [${s}/${progress.total}] ${label} started — ${progress.running} running`);
+  } else {
+    console.error(`\n=== ${label} ===`);
   }
 
   const artifacts = await runVariantTask(cell.variant, cell.task, cell.executorModel, runResultsDir);
@@ -351,7 +361,8 @@ async function runCell(
 
   if (buffered) {
     const k = ++progress.completed;
-    const header = `[${k}/${progress.total}] ${cell.variant.name} × ${cell.task.meta.id} [${cell.executorModel}]`;
+    progress.running -= 1;
+    const header = `[${k}/${progress.total}] ${label} — ${progress.running} still running`;
     console.error(`\n${header}\n${lines.join("\n")}`);
   }
   return result;
@@ -395,8 +406,10 @@ async function main(): Promise<void> {
   const selectedVariants = selectVariants(variants, args.variants);
   const selectedTasks = selectTasks(tasks, args.taskId);
   const executorModels = parseModels(args.modelTokens, EXECUTOR_MODEL);
-  const concurrency = parseConcurrency(args.concurrency, (m) =>
-    console.error(`Warning: ${m}`),
+  const concurrency = parseConcurrency(
+    args.concurrency,
+    (m) => console.error(`Warning: ${m}`),
+    DEFAULT_CONCURRENCY,
   );
   const delayMs = parseDelayMs(args.delayMs, INTER_CELL_DELAY_MS);
 
@@ -432,11 +445,15 @@ async function main(): Promise<void> {
     }
   }
 
-  const progress = { completed: 0, total: cells.length };
+  const progress = { completed: 0, total: cells.length, started: 0, running: 0 };
   let results: VariantTaskResult[];
 
-  if (concurrency === 1) {
-    // Sequential: preserve today's streaming per-line logging exactly.
+  // Stream live (per-line, unbuffered) only when there is no real parallelism —
+  // a single cell, or concurrency 1. Otherwise buffer each cell's block so
+  // concurrent output doesn't interleave, and surface start/running lines so the
+  // parallelism is visible (a cell mid-flight would otherwise print nothing).
+  const parallel = concurrency > 1 && cells.length > 1;
+  if (!parallel) {
     results = [];
     for (let i = 0; i < cells.length; i++) {
       if (i > 0 && delayMs > 0) await sleep(delayMs);
@@ -444,7 +461,9 @@ async function main(): Promise<void> {
     }
   } else {
     // Bounded parallelism: buffer each cell's log block so lines don't interleave.
-    console.error(`Running ${cells.length} cells, concurrency=${concurrency} …`);
+    console.error(
+      `Running ${cells.length} cells, concurrency=${concurrency} (up to ${Math.min(concurrency, cells.length)} containers at once) …`,
+    );
     const outcomes = await runPool(
       cells,
       concurrency,

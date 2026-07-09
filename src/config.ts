@@ -59,9 +59,11 @@ export const CONTAINER_WORK_DIR = "/work";
 export const EXECUTOR_MODEL = process.env.BENCH_EXECUTOR_MODEL ?? "sonnet";
 export const JUDGE_MODEL = process.env.BENCH_JUDGE_MODEL ?? "opus";
 
-/** Per-executor-run wall-clock timeout in milliseconds (default 900s). */
+/** Per-executor-run wall-clock timeout in milliseconds (default 1800s). Heavy
+ * cells (e.g. webhook-hardening with agentic-os spawning multiple in-container
+ * subagents) routinely ran past the old 900s cap and got killed. */
 export const EXECUTOR_TIMEOUT_MS = Number(
-  process.env.BENCH_EXECUTOR_TIMEOUT_MS ?? 900_000,
+  process.env.BENCH_EXECUTOR_TIMEOUT_MS ?? 1_800_000,
 );
 
 /** Timeout for a bundle's setup pre-step container (default 300s). */
@@ -104,6 +106,27 @@ export const CONTAINER_KILL_GRACE_MS = Number(
 export const INTER_CELL_DELAY_MS = Number(
   process.env.BENCH_INTER_CELL_DELAY_MS ?? 0,
 );
+
+/**
+ * Cells to run in parallel when --concurrency is omitted. Raised from 1 so the
+ * full matrix isn't serial by default. The binding constraint is NOT local
+ * resources — a cell's container is a thin claude API client (~300 MB RAM, the
+ * real work is server-side) — it's the Anthropic subscription RATE LIMIT: too
+ * many concurrent agent sessions stall on api_retry, especially on Opus-heavy
+ * matrices (see the bench-rate-limits note). So keep this modest and pace with
+ * --delay-ms rather than cranking it; RAM/CPU headroom is not the reason.
+ * Set 1 for fully serial.
+ *
+ * Validated to a positive integer: a garbage/empty/zero/negative env value would
+ * otherwise yield NaN/0 and — since this feeds parseConcurrency's UNVALIDATED
+ * `fallback` — silently force serial execution, the very bug this default fixes.
+ * (An explicit --concurrency is still range-checked and clamped separately.)
+ */
+function resolveDefaultConcurrency(): number {
+  const n = Number(process.env.BENCH_CONCURRENCY);
+  return Number.isInteger(n) && n >= 1 ? n : 3;
+}
+export const DEFAULT_CONCURRENCY = resolveDefaultConcurrency();
 
 /**
  * Ignore patterns applied to each workspace's .git/info/exclude at prepare time
