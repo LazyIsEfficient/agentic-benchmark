@@ -13,6 +13,12 @@ export interface FinalStep {
   diff: string;
   metrics: CallMetrics;
   timedOut: boolean;
+  /**
+   * Raw NDJSON trace of the final step. Only the `setup-gotcha` detector reads
+   * it — the runtime setup command and its failure output live in tool
+   * inputs/outputs that `extractTranscript` drops, so they survive only here.
+   */
+  trace?: string;
 }
 
 /**
@@ -93,15 +99,36 @@ const INTEGER_CENTS_SIGNALS: RegExp[] = [/\bcents\b/i, /[a-z]Cents\b/];
 // --- Pure helpers (unit-tested) ---------------------------------------------
 
 /**
+ * Strip comment content from a line so PROSE can't spoof a money signal. Real
+ * runs showed correct integer-cents code (`FEE = 599`) with a clarifying
+ * comment `// $5.99` being misclassified as float because the classifier saw
+ * the `5.99` in the comment. We only want to judge CODE, so: remove inline
+ * `/* … *​/` blocks and a trailing `// …` line comment, and drop lines that are
+ * purely a comment / JSDoc continuation (`*`, `/*`, `*​/`, `//`). Not a full
+ * parser — a float hidden inside a string literal is out of scope — but it
+ * covers the line/JSDoc/single-line-block shapes real diffs produce.
+ */
+export function stripComments(line: string): string {
+  const noBlock = line.replace(/\/\*.*?\*\//g, "");
+  const noLine = noBlock.replace(/\/\/.*$/, "");
+  const trimmed = noLine.trim();
+  if (trimmed === "" || /^(\*|\/\*|\*\/)/.test(trimmed)) return "";
+  return noLine;
+}
+
+/**
  * Content of the diff's ADDED lines (`+` lines), excluding the `+++` file
- * header. Only additions are scanned: we classify the convention the change
- * ADOPTED, not what it removed.
+ * header, with comments stripped (see {@link stripComments}). Only additions
+ * are scanned: we classify the convention the change ADOPTED, not what it
+ * removed — and only its CODE, not its prose.
  */
 export function extractAddedLines(diff: string): string[] {
   const out: string[] = [];
   for (const line of diff.split("\n")) {
     if (line.startsWith("+++")) continue;
-    if (line.startsWith("+")) out.push(line.slice(1));
+    if (!line.startsWith("+")) continue;
+    const code = stripComments(line.slice(1));
+    if (code.trim() !== "") out.push(code);
   }
   return out;
 }
@@ -164,6 +191,26 @@ function quote(line: string): string {
   return `\`${trimmed}\``;
 }
 
+/**
+ * True iff the unified diff ADDS or MODIFIES `requiredFile` — i.e. the file is
+ * the POST-IMAGE of a hunk. Matches the `+++ ` header's path EXACTLY (after
+ * stripping the `b/` prefix and any trailing tab/timestamp), so it never confuses
+ * a lookalike path (`src/registry.ts.bak`, `src/registry.tsx`), a rename AWAY
+ * from the file (post-image is a different path), or a pure DELETE (post-image is
+ * `/dev/null`) with a real modification. A substring test would false-positive on
+ * all three — fatal for an un-gameable scorer.
+ */
+export function diffTouchesFile(diff: string, requiredFile: string): boolean {
+  const target = requiredFile.replace(/^[ab]\//, "");
+  for (const line of diff.split("\n")) {
+    if (!line.startsWith("+++ ")) continue;
+    const raw = line.slice(4).trim().split("\t")[0]!; // path, minus any tab+timestamp
+    if (raw === "/dev/null") continue; // deletion: post-image is /dev/null
+    if (raw.replace(/^[ab]\//, "") === target) return true;
+  }
+  return false;
+}
+
 // --- The detector -----------------------------------------------------------
 
 /**
@@ -210,10 +257,77 @@ export function detectAnchor(config: AnchorConfig, finalStep: FinalStep): Anchor
       }
       return result;
     }
+    case "registry": {
+      const timeoutNote = finalStep.timedOut ? " (executor timed out)" : "";
+      const conventionHeld = diffTouchesFile(finalStep.diff, config.requiredFile);
+      const evidence = conventionHeld
+        ? `held registry rule: final-step diff modifies ${config.requiredFile}${timeoutNote}`
+        : `registry rule broken: final-step diff does not touch ${config.requiredFile}${timeoutNote}`;
+
+      // No trap concept for the registry rule; fail closed when the file is untouched.
+      const result: AnchorResult = { conventionHeld, hitKnownTrap: false, evidence };
+      if (conventionHeld && finalStep.metrics.numTurns !== undefined) {
+        result.turnsToGreen = finalStep.metrics.numTurns;
+      }
+      return result;
+    }
+    case "setup-gotcha": {
+      const timeoutNote = finalStep.timedOut ? " (executor timed out)" : "";
+      const trace = finalStep.trace;
+
+      if (!trace) {
+        // Fail closed: without the raw trace we cannot observe the runtime step.
+        return {
+          conventionHeld: false,
+          hitKnownTrap: false,
+          evidence: `no trace available for setup-gotcha detection${timeoutNote}`,
+        };
+      }
+
+      let setupRe: RegExp;
+      let trapRe: RegExp;
+      try {
+        setupRe = new RegExp(config.setupSignal);
+        trapRe = new RegExp(config.trapSignal);
+      } catch {
+        // A malformed regex source must never throw the detector — fail closed.
+        return {
+          conventionHeld: false,
+          hitKnownTrap: false,
+          evidence: `invalid setup-gotcha signal pattern${timeoutNote}`,
+        };
+      }
+
+      const setupMatched = setupRe.test(trace);
+      const hitKnownTrap = trapRe.test(trace);
+      // "Held" means the memory was applied PROACTIVELY: ran setup AND never hit
+      // the trap. `setupMatched` alone does NOT discriminate memory — the step
+      // can't go green without the setup, so a memoryless agent runs it too, just
+      // REACTIVELY (after hitting the failure). Requiring !hitKnownTrap is what
+      // separates "remembered and ran it first" from "rediscovered it the hard way".
+      const conventionHeld = setupMatched && !hitKnownTrap;
+
+      // Evidence summarizes matches ONLY — never the raw trace (may hold secrets).
+      let evidence: string;
+      if (conventionHeld) {
+        evidence = `applied setup proactively (matched /${config.setupSignal}/, no trap)${timeoutNote}`;
+      } else if (setupMatched && hitKnownTrap) {
+        evidence = `hit trap (/${config.trapSignal}/) then ran setup — reactive, not proactive${timeoutNote}`;
+      } else {
+        const trapNote = hitKnownTrap ? "; hit trap" : "";
+        evidence = `never ran setup (/${config.setupSignal}/ absent)${trapNote}${timeoutNote}`;
+      }
+
+      const result: AnchorResult = { conventionHeld, hitKnownTrap, evidence };
+      if (conventionHeld && finalStep.metrics.numTurns !== undefined) {
+        result.turnsToGreen = finalStep.metrics.numTurns;
+      }
+      return result;
+    }
     default: {
       // Exhaustive over the AnchorConfig union: a new `kind` must add a case.
-      const _never: never = config.kind;
-      throw new Error(`unsupported anchor kind: ${String(_never)}`);
+      const _never: never = config;
+      throw new Error(`unsupported anchor kind: ${String((_never as AnchorConfig).kind)}`);
     }
   }
 }

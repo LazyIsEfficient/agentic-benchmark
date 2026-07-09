@@ -123,11 +123,52 @@ export interface MoneyCentsAnchor {
 }
 
 /**
+ * Anchor for the setup-gotcha scenario. The knowledge under test exists ONLY at
+ * runtime: a bundle's memory must have recorded that a required setup command
+ * (e.g. `npm run gen-fixtures`) has to be run before the workspace is usable,
+ * because skipping it produces a failure the agent cannot predict from static
+ * code. Both fields are regex SOURCE strings compiled against the raw NDJSON
+ * trace of the final step:
+ * - `setupSignal` matches the setup command being executed (the memory HELD).
+ * - `trapSignal` matches the runtime failure output hit WITHOUT the setup step
+ *   (e.g. `Cannot find .*fixtures\.json`) — the agent fell into the gotcha.
+ */
+export interface SetupGotchaAnchor {
+  /** Discriminant. */
+  kind: "setup-gotcha";
+  /** Regex source matching the required setup command being run in the trace. */
+  setupSignal: string;
+  /** Regex source matching the runtime failure hit without the setup step. */
+  trapSignal: string;
+  /** Step `id` the anchor is evaluated against (default: the last step). */
+  evaluatedStepId?: string;
+}
+
+/**
+ * Anchor for the registry scenario. The knowledge under test is an ARBITRARY,
+ * unguessable project convention: after adding an export you must also register
+ * it in a specific file (e.g. `src/registry.ts`). Nothing in the code makes this
+ * rule re-derivable, so only a bundle whose memory recorded it will comply. The
+ * detector holds the convention iff the correct final-step diff MODIFIES
+ * `requiredFile`.
+ */
+export interface RegistryAnchor {
+  /** Discriminant. */
+  kind: "registry";
+  /** Workspace-relative path the correct step-2 diff must modify (the rule). */
+  requiredFile: string;
+  /** Step `id` the anchor is evaluated against (default: the last step). */
+  evaluatedStepId?: string;
+}
+
+/**
  * Deterministic anchor configuration for a task — a discriminated union keyed by
  * `kind` so future anchor scenarios add a new member without touching existing
- * consumers. Today the only member is {@link MoneyCentsAnchor}.
+ * consumers: {@link MoneyCentsAnchor} (re-derivable convention), plus two whose
+ * knowledge is NOT re-derivable from code — {@link SetupGotchaAnchor} (a runtime
+ * gotcha) and {@link RegistryAnchor} (an arbitrary registry rule).
  */
-export type AnchorConfig = MoneyCentsAnchor;
+export type AnchorConfig = MoneyCentsAnchor | SetupGotchaAnchor | RegistryAnchor;
 
 /** Task metadata from tasks/<id>/meta.json. */
 export interface TaskMeta {

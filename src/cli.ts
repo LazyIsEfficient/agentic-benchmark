@@ -144,6 +144,19 @@ export async function loadTasks(tasksDir: string = TASKS_DIR): Promise<Task[]> {
         });
       }
       meta.steps = steps;
+
+      // The harness evaluates the anchor on the FINAL step only (both the trace
+      // read and the diff are the final step's). If a task pins `evaluatedStepId`
+      // to some other step, that's silently unsupported — fail loud at load rather
+      // than mis-scoring a non-final step.
+      const evalStepId = meta.anchor?.evaluatedStepId;
+      const lastStepId = steps[steps.length - 1]!.id;
+      if (evalStepId !== undefined && evalStepId !== lastStepId) {
+        throw new Error(
+          `Task "${meta.id}": anchor.evaluatedStepId "${evalStepId}" must be the final step ("${lastStepId ?? "<unnamed>"}") — non-final anchoring is not supported.`,
+        );
+      }
+
       tasks.push({ meta, dir, prompt: steps[steps.length - 1]!.prompt });
       continue;
     }
@@ -367,6 +380,21 @@ export interface RunCellDeps {
   detect?: typeof detectAnchor;
 }
 
+/**
+ * Read the raw NDJSON trace of the cell's FINAL step for setup-gotcha detection.
+ * A sequence task tees each step to `trace-step-<n>.ndjson` (n 1-based), so the
+ * final step is `trace-step-<stepCount>.ndjson`; a single-shot cell writes
+ * `trace.ndjson`. A missing/unreadable trace resolves to undefined (never
+ * throws) — the detector fails closed when the trace is absent.
+ */
+async function readFinalTrace(cellDir: string, task: Task): Promise<string | undefined> {
+  const steps = task.meta.steps;
+  const tracePath = steps?.length
+    ? path.join(cellDir, `trace-step-${steps.length}.ndjson`)
+    : path.join(cellDir, "trace.ndjson");
+  return fs.readFile(tracePath, "utf8").catch(() => undefined);
+}
+
 export async function runCell(
   cell: Cell,
   buffered: boolean,
@@ -433,10 +461,20 @@ export async function runCell(
   // established. Skipping keeps that cell an honest coverage gap, not a lie.
   const anchorConfig = cell.task.meta.anchor;
   if (anchorConfig && artifacts.executorOk) {
+    // Only the setup-gotcha detector needs the raw NDJSON trace of the final
+    // step (the runtime setup command / failure lives in tool I/O that the
+    // transcript drops). Diff-based kinds (money-cents, registry) don't — so we
+    // don't touch disk for them. A missing/unreadable trace stays undefined and
+    // the detector already fails closed.
+    const trace =
+      anchorConfig.kind === "setup-gotcha"
+        ? await readFinalTrace(cellDir, cell.task)
+        : undefined;
     result.anchors = detect(anchorConfig, {
       diff: artifacts.diff,
       metrics: artifacts.executorMetrics,
       timedOut: artifacts.executorTimedOut,
+      ...(trace !== undefined ? { trace } : {}),
     });
   }
 

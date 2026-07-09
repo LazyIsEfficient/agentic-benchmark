@@ -355,3 +355,101 @@ test("runCell: no anchor is attached (or detector called) when meta.anchor is ab
   assert.equal(detectCalls, 0);
   assert.equal(result.anchors, undefined);
 });
+
+// --- setup-gotcha trace threading (runCell) ---------------------------------
+
+const OK_ANCHOR: AnchorResult = { conventionHeld: true, hitKnownTrap: false, evidence: "ok" };
+
+/** Capture the `finalStep` handed to `detect` so a test can assert `.trace`. */
+function captureDetectDeps(): {
+  deps: RunCellDeps;
+  captured: { trace?: string; called: number };
+} {
+  const captured: { trace?: string; called: number } = { called: 0 };
+  const { deps } = stubDeps({
+    detect: (_config, finalStep) => {
+      captured.called++;
+      captured.trace = finalStep.trace;
+      return OK_ANCHOR;
+    },
+  });
+  return { deps, captured };
+}
+
+/** A 2-step sequence task carrying a setup-gotcha anchor. */
+function gotchaTask(): Task {
+  return makeTask({
+    steps: [{ prompt: "s1" }, { prompt: "s2" }],
+    anchor: {
+      kind: "setup-gotcha",
+      setupSignal: "gen-fixtures",
+      trapSignal: "Cannot find .*fixtures\\.json",
+    },
+  });
+}
+
+test("runCell: setup-gotcha reads the FINAL step's trace and passes it to detect", async () => {
+  const runDir = await fs.mkdtemp(path.join(os.tmpdir(), "gotcha-trace-"));
+  try {
+    // artifacts.cellId is "c1"; the final step of a 2-step task tees to
+    // trace-step-2.ndjson under <runResultsDir>/<cellId>/.
+    const cellDir = path.join(runDir, "c1");
+    await fs.mkdir(cellDir, { recursive: true });
+    const trace = '{"tool":"Bash","input":"npm run gen-fixtures"}\n';
+    await fs.writeFile(path.join(cellDir, "trace-step-2.ndjson"), trace);
+
+    const { deps, captured } = captureDetectDeps();
+    const cell: CellArg = { executorModel: "sonnet", task: gotchaTask(), variant: NAKED };
+    const result = await runCell(cell, false, PROGRESS(), runDir, deps);
+
+    assert.equal(captured.called, 1);
+    assert.equal(captured.trace, trace);
+    assert.deepEqual(result.anchors, OK_ANCHOR);
+  } finally {
+    await fs.rm(runDir, { recursive: true, force: true });
+  }
+});
+
+test("runCell: setup-gotcha with a MISSING trace does not throw; trace is undefined", async () => {
+  const runDir = await fs.mkdtemp(path.join(os.tmpdir(), "gotcha-notrace-"));
+  try {
+    // No trace file on disk — the read must resolve undefined, not throw.
+    const { deps, captured } = captureDetectDeps();
+    const cell: CellArg = { executorModel: "sonnet", task: gotchaTask(), variant: NAKED };
+    const result = await runCell(cell, false, PROGRESS(), runDir, deps);
+
+    assert.equal(captured.called, 1);
+    assert.equal(captured.trace, undefined);
+    assert.deepEqual(result.anchors, OK_ANCHOR);
+  } finally {
+    await fs.rm(runDir, { recursive: true, force: true });
+  }
+});
+
+test("runCell: a diff-based anchor (registry) does NOT read a trace even when one exists", async () => {
+  const runDir = await fs.mkdtemp(path.join(os.tmpdir(), "registry-notrace-"));
+  try {
+    // A trace file exists on disk, but a registry anchor is diff-based and must
+    // never read it — the finalStep handed to detect has trace undefined.
+    const cellDir = path.join(runDir, "c1");
+    await fs.mkdir(cellDir, { recursive: true });
+    await fs.writeFile(path.join(cellDir, "trace-step-2.ndjson"), "SHOULD NOT BE READ");
+
+    const { deps, captured } = captureDetectDeps();
+    const cell: CellArg = {
+      executorModel: "sonnet",
+      task: makeTask({
+        steps: [{ prompt: "s1" }, { prompt: "s2" }],
+        anchor: { kind: "registry", requiredFile: "src/registry.ts" },
+      }),
+      variant: NAKED,
+    };
+    const result = await runCell(cell, false, PROGRESS(), runDir, deps);
+
+    assert.equal(captured.called, 1);
+    assert.equal(captured.trace, undefined);
+    assert.deepEqual(result.anchors, OK_ANCHOR);
+  } finally {
+    await fs.rm(runDir, { recursive: true, force: true });
+  }
+});

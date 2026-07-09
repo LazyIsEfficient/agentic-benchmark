@@ -1,0 +1,24 @@
+{
+  "id": "memory-gotcha",
+  "title": "Runtime setup step must be remembered across a reset",
+  "logicBearing": true,
+  "securityRelevant": false,
+  "steps": [
+    { "id": "establish", "file": "step-1.md" },
+    { "id": "apply", "file": "step-2.md", "seedOverlay": "step-2-overlay" }
+  ],
+  "anchor": {
+    "kind": "setup-gotcha",
+    "setupSignal": "npm run gen|node scripts/gen",
+    "trapSignal": "Cannot find module.*fixtures\\.gen",
+    "evaluatedStepId": "apply"
+  },
+  "seedFiles": [
+    "seed/package.json",
+    "seed/.gitignore",
+    "seed/src/strcase.mjs",
+    "seed/src/strcase.test.mjs",
+    "seed/src/table.test.mjs",
+    "seed/scripts/gen.mjs"
+  ]
+}

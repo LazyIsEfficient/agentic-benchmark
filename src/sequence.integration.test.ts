@@ -8,27 +8,33 @@ import type { ExecutorRunner } from "./executor.js";
 import { detectAnchor } from "./anchors.js";
 import { loadTasks } from "./cli.js";
 import { renderReportMarkdown } from "./report.js";
-import { git } from "./workspace.js";
+import { git, prepareWorkspace } from "./workspace.js";
 import type { ContainerResult } from "./docker.js";
 import type {
   AnchorResult,
-  Report,
+  CallMetrics,
   RunArtifacts,
+  Report,
   Task,
   Variant,
   VariantTaskResult,
 } from "./types.js";
 
 /**
- * END-TO-END CAPSTONE for sequential-memory mode. It drives the REAL harness —
- * loadTasks (real fixtures) → runSequenceTask (real per-step workspace, commits,
- * overlay, .claude exclusion) → detectAnchor (real deterministic verdict) →
- * renderReportMarkdown (real MEMORY EFFECT renderer). The ONLY fakes are at the
- * executor boundary: two agents whose policy — carry memory vs ignore it — is all
- * that differs. The test proves the mode's two load-bearing claims:
- *   1. memory written in one step survives the per-step context reset, AND
- *   2. that same carried memory can HELP on one task and HURT on another (the
- *      anti-rigging guard: memory is not unconditionally good).
+ * END-TO-END CAPSTONE for sequential-memory mode, rebuilt around the TWO probes
+ * whose knowledge is NOT re-derivable from the code the agent can see:
+ *   - `memory-registry` (diff-based `registry` anchor): an arbitrary "every
+ *     handler must be registered in src/registry.ts" rule stated ONCE, in step 1.
+ *   - `memory-gotcha`  (trace-based `setup-gotcha` anchor): a runtime setup
+ *     command (`npm run gen`) that must be re-run after an overlay relocates the
+ *     generated fixtures, or the suite fails with `Cannot find module …fixtures.gen`.
+ *
+ * It drives the REAL harness — loadTasks (real fixtures) → runSequenceTask (real
+ * per-step workspace, commits, overlay, `.claude` exclusion) → detectAnchor (real
+ * deterministic verdict) → renderReportMarkdown (real MEMORY EFFECT renderer). The
+ * ONLY fakes are at the executor boundary: two agents whose policy — carry memory
+ * vs ignore it — is all that differs. The test proves BOTH probes actually
+ * discriminate a memory-carrying bundle from a memoryless one.
  */
 
 const fakeResult = (over: Partial<ContainerResult> = {}): ContainerResult => ({
@@ -40,204 +46,18 @@ const fakeResult = (over: Partial<ContainerResult> = {}): ContainerResult => ({
   ...over,
 });
 
-// A result event carrying num_turns so the FINAL step's metrics.numTurns flows
-// through the real runner into detectAnchor's turnsToGreen (proven below).
+// A result event carrying num_turns so the anchored step's metrics.numTurns flows
+// through the real runner into detectAnchor's turnsToGreen (asserted below).
 const RESULT_EVENT = '{"type":"result","subtype":"success","num_turns":4}\n';
-
-// --- Representative source the fakes write on the anchored (step-2) step -------
-// Each blob carries exactly one money signal so the REAL detectAnchor classifies
-// it: integer-cents (`amountCents` + a bare `599`), float (a standalone `5.99`
-// literal), or Decimal (the `.times`/`dividedBy` arithmetic idiom).
-
-const INT_CENTS_SRC =
-  "export function reprice(percentOff: number): number {\n" +
-  "  const amountCents = 599;\n" +
-  "  return amountCents - Math.round(amountCents * percentOff / 100);\n" +
-  "}\n";
-
-const FLOAT_SRC =
-  "export const FLAT_SHIPPING_FEE = 5.99;\n" +
-  "export function orderTotal(subtotalDollars: number): number {\n" +
-  "  return subtotalDollars + FLAT_SHIPPING_FEE;\n" +
-  "}\n";
-
-const DECIMAL_SRC =
-  'import { type Money, money } from "./money.js";\n' +
-  "export function reprice(subtotal: Money, percentOff: number): Money {\n" +
-  "  return subtotal.times(money(100 - percentOff)).dividedBy(100);\n" +
-  "}\n";
-
-// --- The two agent policies, as fake executors --------------------------------
-
-interface MemoryCarryingObs {
-  calls: number;
-  sawMemoryAtStep2: boolean;
-  memoryAtStep2: string;
-}
-
-/**
- * memory-carrying agent: on step 1 it WRITES a project-scope memory note recording
- * the codebase's money convention (integer-cents) plus a tracked source change; on
- * step 2 it READS that remembered convention and applies integer-cents BLINDLY —
- * regardless of what the current code now looks like. This is what makes memory a
- * double-edged sword: right when the convention still holds, wrong after a migration.
- */
-function makeMemoryCarrying(): { exec: ExecutorRunner; obs: MemoryCarryingObs } {
-  const obs: MemoryCarryingObs = { calls: 0, sawMemoryAtStep2: false, memoryAtStep2: "" };
-  const exec: ExecutorRunner = async ({ workspaceDir, onStdout }) => {
-    onStdout?.(RESULT_EVENT);
-    obs.calls++;
-    const memDir = path.join(workspaceDir, ".claude", "memory");
-    const memFile = path.join(memDir, "money-convention.md");
-    const srcDir = path.join(workspaceDir, "src");
-    if (obs.calls === 1) {
-      // STEP 1 (establish): record the convention in memory + a tracked change.
-      await fs.mkdir(memDir, { recursive: true });
-      await fs.writeFile(
-        memFile,
-        "# Money convention\nAll amounts are integer-cents — whole integers like " +
-          "amountCents; never floats, never Decimal.\n",
-      );
-      await fs.mkdir(srcDir, { recursive: true });
-      await fs.writeFile(path.join(srcDir, "establish-marker.ts"), "export const establishedCents = 100;\n");
-    } else {
-      // STEP 2 (apply): read remembered convention, apply integer-cents blindly.
-      obs.memoryAtStep2 = await fs.readFile(memFile, "utf8").catch(() => "");
-      obs.sawMemoryAtStep2 = /integer-cents/.test(obs.memoryAtStep2);
-      await fs.writeFile(path.join(srcDir, "reprice.ts"), INT_CENTS_SRC);
-    }
-    return fakeResult();
-  };
-  return { exec, obs };
-}
-
-interface MemorylessObs {
-  calls: number;
-  currentCodeAtStep2: string;
-  detectedDecimal: boolean;
-}
-
-/**
- * memoryless agent: never records or reads memory. On step 2 it reads the CURRENT
- * workspace code and mimics whatever convention that code exhibits — following a
- * strong Decimal type signal when present, but otherwise (plain-number code) it has
- * nothing anchoring it to integer-cents and naively writes the float literal the
- * task mentions (`$5.99` → `5.99`).
- */
-function makeMemoryless(): { exec: ExecutorRunner; obs: MemorylessObs } {
-  const obs: MemorylessObs = { calls: 0, currentCodeAtStep2: "", detectedDecimal: false };
-  const exec: ExecutorRunner = async ({ workspaceDir, onStdout }) => {
-    onStdout?.(RESULT_EVENT);
-    obs.calls++;
-    const srcDir = path.join(workspaceDir, "src");
-    if (obs.calls === 1) {
-      // STEP 1: a tracked change, but deliberately NO memory written.
-      await fs.mkdir(srcDir, { recursive: true });
-      await fs.writeFile(path.join(srcDir, "establish-marker.ts"), "export const established = 100;\n");
-    } else {
-      // STEP 2: ignore memory; read the current code and follow it.
-      obs.currentCodeAtStep2 = await fs.readFile(path.join(srcDir, "cart.ts"), "utf8").catch(() => "");
-      obs.detectedDecimal = /Decimal|\.times\(/.test(obs.currentCodeAtStep2);
-      await fs.writeFile(path.join(srcDir, "reprice.ts"), obs.detectedDecimal ? DECIMAL_SRC : FLOAT_SRC);
-    }
-    return fakeResult();
-  };
-  return { exec, obs };
-}
-
-// --- The four-cell driver (real runner, fakes only at the executor seam) -------
 
 const V_CARRYING: Variant = { name: "memory-carrying", type: "claude-md", content: "# carry memory" };
 const V_MEMORYLESS: Variant = { name: "memoryless", type: "claude-md", content: "# ignore memory" };
 
-interface Cell {
-  artifacts: RunArtifacts;
-  anchor: AnchorResult;
-  variant: Variant;
-  task: Task;
-}
-
-interface FourCells {
-  helpMc: Cell & { obs: MemoryCarryingObs };
-  poisonMc: Cell & { obs: MemoryCarryingObs };
-  helpMl: Cell & { obs: MemorylessObs };
-  poisonMl: Cell & { obs: MemorylessObs };
-  runResultsDir: string;
-}
-
-/**
- * Run all four cells: {helping, poison} × {memory-carrying, memoryless}. Each cell
- * uses a FRESH fake instance — the two memory-carrying cells share the identical
- * POLICY (carry memory), not the same object, so a per-step call counter is a valid
- * step discriminator. The real fixtures' anchor configs drive detectAnchor.
- */
-async function runFour(runResultsDir: string): Promise<FourCells> {
+async function getTask(id: string): Promise<Task> {
   const tasks = await loadTasks();
-  const helping = tasks.find((t) => t.meta.id === "memory-cents");
-  const poison = tasks.find((t) => t.meta.id === "memory-cents-stale");
-  assert.ok(helping?.meta.anchor, "helping fixture must declare an anchor");
-  assert.ok(poison?.meta.anchor, "poison fixture must declare an anchor");
-  // Ground-truth the fixtures so the verdicts below are meaningful.
-  assert.equal(helping.meta.anchor.correctConvention, "integer-cents");
-  assert.equal(helping.meta.anchor.trapConvention, "decimal");
-  assert.equal(poison.meta.anchor.correctConvention, "decimal");
-  assert.equal(poison.meta.anchor.trapConvention, "integer-cents");
-
-  async function drive<O>(
-    variant: Variant,
-    task: Task,
-    factory: () => { exec: ExecutorRunner; obs: O },
-  ): Promise<Cell & { obs: O }> {
-    const fake = factory();
-    const artifacts = await runSequenceTask(variant, task, "sonnet", runResultsDir, {
-      runExecutorFn: fake.exec,
-    });
-    const anchor = detectAnchor(task.meta.anchor!, {
-      diff: artifacts.diff,
-      metrics: artifacts.executorMetrics,
-      timedOut: artifacts.executorTimedOut,
-    });
-    return { artifacts, anchor, variant, task, obs: fake.obs };
-  }
-
-  return {
-    helpMc: await drive(V_CARRYING, helping, makeMemoryCarrying),
-    poisonMc: await drive(V_CARRYING, poison, makeMemoryCarrying),
-    helpMl: await drive(V_MEMORYLESS, helping, makeMemoryless),
-    poisonMl: await drive(V_MEMORYLESS, poison, makeMemoryless),
-    runResultsDir,
-  };
-}
-
-/** Build a scored VariantTaskResult carrying a real anchor verdict, for the report. */
-function scoredResult(cell: Cell, anchor: AnchorResult): VariantTaskResult {
-  const dim = (justification: string) => ({ score: 20, justification });
-  return {
-    cellId: cell.artifacts.cellId,
-    variant: cell.artifacts.variant,
-    taskId: cell.artifacts.taskId,
-    executorModel: cell.artifacts.executorModel,
-    judgeModel: "judge",
-    raw: {
-      codeQuality: dim("ok"),
-      testingCoverage: dim("ok"),
-      securityQuality: dim("ok"),
-      documentation: dim("ok"),
-      securityReviewPerformed: true,
-      summary: "fake judge summary",
-    },
-    final: { codeQuality: 20, testingCoverage: 20, securityQuality: 20, documentation: 15 },
-    total: 75,
-    appliedCaps: [],
-    signals: {
-      testFilesPresent: cell.artifacts.testFilesPresent,
-      securityReviewPerformed: true,
-      changedFiles: cell.artifacts.changedFiles,
-    },
-    metrics: { executor: cell.artifacts.executorMetrics },
-    anchors: anchor,
-    ...(cell.artifacts.behavior ? { behavior: cell.artifacts.behavior } : {}),
-  };
+  const t = tasks.find((x) => x.meta.id === id);
+  assert.ok(t, `fixture ${id} must load`);
+  return t;
 }
 
 async function withTmp(fn: (runResultsDir: string) => Promise<void>): Promise<void> {
@@ -251,110 +71,389 @@ async function withTmp(fn: (runResultsDir: string) => Promise<void>): Promise<vo
   }
 }
 
-// --- 1) The four anchor verdicts + the money-shot contrast --------------------
+// --- Registry-probe fakes (diff-based) --------------------------------------
 
-test("four verdicts: memory HELPS on the helping task and HURTS on the poison task", async () => {
-  await withTmp(async (runResultsDir) => {
-    const { helpMc, poisonMc, helpMl, poisonMl } = await runFour(runResultsDir);
+interface CarryingObs {
+  calls: number;
+  sawMemoryAtStep2: boolean;
+  memoryAtStep2: string;
+}
 
-    // Every cell's executor + final step actually succeeded (real runner path).
-    for (const c of [helpMc, poisonMc, helpMl, poisonMl]) {
-      assert.equal(c.artifacts.executorOk, true, `${c.artifacts.cellId} should run cleanly`);
+/**
+ * memory-carrying agent for `memory-registry`: on step 1 it WRITES a project-scope
+ * memory note recording the codebase's registration rule plus the first handler; on
+ * step 2 it READS that remembered rule and — because it remembers — registers the
+ * new handler by editing `src/registry.ts`. Registering is the load-bearing act the
+ * anchor detects.
+ */
+function makeRegistryCarrying(): { exec: ExecutorRunner; obs: CarryingObs } {
+  const obs: CarryingObs = { calls: 0, sawMemoryAtStep2: false, memoryAtStep2: "" };
+  const exec: ExecutorRunner = async ({ workspaceDir, onStdout }) => {
+    onStdout?.(RESULT_EVENT);
+    obs.calls++;
+    const memDir = path.join(workspaceDir, ".claude", "memory");
+    const memFile = path.join(memDir, "registration-rule.md");
+    const handlersDir = path.join(workspaceDir, "src", "handlers");
+    if (obs.calls === 1) {
+      await fs.mkdir(memDir, { recursive: true });
+      await fs.writeFile(
+        memFile,
+        "# Project rule\nEVERY handler MUST be registered in `src/registry.ts`. " +
+          "Later step prompts stop repeating this — remember it.\n",
+      );
+      await fs.mkdir(handlersDir, { recursive: true });
+      await fs.writeFile(
+        path.join(handlersDir, "echo.ts"),
+        'import type { Handler } from "../handler";\nexport const echo: Handler = (a) => a;\n',
+      );
+    } else {
+      obs.memoryAtStep2 = await fs.readFile(memFile, "utf8").catch(() => "");
+      obs.sawMemoryAtStep2 = /must be registered/i.test(obs.memoryAtStep2);
+      await fs.writeFile(
+        path.join(handlersDir, "reverse.ts"),
+        'import type { Handler } from "../handler";\n' +
+          'export const reverse: Handler = (a) => [...a].reverse().join("");\n',
+      );
+      // The remembered rule fires: register the new handler in src/registry.ts.
+      await fs.writeFile(
+        path.join(workspaceDir, "src", "registry.ts"),
+        'import type { Handler } from "./handler";\nimport { ping } from "./handlers/ping";\n' +
+          'import { echo } from "./handlers/echo";\nimport { reverse } from "./handlers/reverse";\n' +
+          "export const registry: Record<string, Handler> = { ping, echo, reverse };\n",
+      );
     }
+    return fakeResult();
+  };
+  return { exec, obs };
+}
 
-    // (1) Helping + memory-carrying: remembered integer-cents is still correct.
-    assert.equal(helpMc.anchor.conventionHeld, true, "V1: helping+carrying holds integer-cents");
-    assert.equal(helpMc.anchor.hitKnownTrap, false, "V1: no trap on the helping task");
-    // Metrics flowed through the real runner into the deterministic verdict.
-    assert.equal(helpMc.anchor.turnsToGreen, 4, "V1: turnsToGreen comes from the final step's num_turns");
+interface MemorylessObs {
+  calls: number;
+}
 
-    // (2) Helping + memoryless: no memory ⇒ naive float ($5.99) ⇒ convention broken.
-    assert.equal(helpMl.anchor.conventionHeld, false, "V2: helping+memoryless breaks (writes float 5.99)");
+/**
+ * memoryless agent for `memory-registry`: never records or reads memory. On step 2
+ * it adds the handler file the prompt asks for but — having no memory of the
+ * unguessable registration rule (step 2's prompt never repeats it) — leaves
+ * `src/registry.ts` untouched. The anchor catches the missed registration.
+ */
+function makeRegistryMemoryless(): { exec: ExecutorRunner; obs: MemorylessObs } {
+  const obs: MemorylessObs = { calls: 0 };
+  const exec: ExecutorRunner = async ({ workspaceDir, onStdout }) => {
+    onStdout?.(RESULT_EVENT);
+    obs.calls++;
+    const handlersDir = path.join(workspaceDir, "src", "handlers");
+    await fs.mkdir(handlersDir, { recursive: true });
+    if (obs.calls === 1) {
+      await fs.writeFile(
+        path.join(handlersDir, "echo.ts"),
+        'import type { Handler } from "../handler";\nexport const echo: Handler = (a) => a;\n',
+      );
+    } else {
+      await fs.writeFile(
+        path.join(handlersDir, "reverse.ts"),
+        'import type { Handler } from "../handler";\n' +
+          'export const reverse: Handler = (a) => [...a].reverse().join("");\n',
+      );
+    }
+    return fakeResult();
+  };
+  return { exec, obs };
+}
 
-    // (3) Poison + memory-carrying: blindly re-applies remembered integer-cents over
-    //     the migrated Decimal code ⇒ wrong convention AND lands on the known trap.
-    assert.equal(poisonMc.anchor.conventionHeld, false, "V3: poison+carrying does NOT hold decimal");
-    assert.equal(poisonMc.anchor.hitKnownTrap, true, "V3: poison+carrying hits the integer-cents trap");
+// --- Gotcha-probe fakes (used only to prove overlay isolation) ---------------
 
-    // (4) Poison + memoryless: reads the migrated Decimal code and follows it ⇒ correct.
-    assert.equal(poisonMl.anchor.conventionHeld, true, "V4: poison+memoryless follows the migrated Decimal");
-    assert.equal(poisonMl.obs.detectedDecimal, true, "V4: memoryless actually read the migrated Decimal code");
+/**
+ * memory-carrying agent for `memory-gotcha`: on step 1 records the runtime setup
+ * knowledge in memory + a tracked change; on step 2 makes its own tracked change.
+ * The setup-gotcha VERDICT is trace-based (proven separately with a synthetic
+ * trace); this fake exists to drive the real overlay/commit path so we can prove
+ * the relocated fixtures are baseline-committed and NOT attributed to the agent.
+ */
+function makeGotchaCarrying(): { exec: ExecutorRunner; obs: { calls: number } } {
+  const obs = { calls: 0 };
+  const exec: ExecutorRunner = async ({ workspaceDir, onStdout }) => {
+    onStdout?.(RESULT_EVENT);
+    obs.calls++;
+    const strcase = path.join(workspaceDir, "src", "strcase.mjs");
+    if (obs.calls === 1) {
+      const memDir = path.join(workspaceDir, ".claude", "memory");
+      await fs.mkdir(memDir, { recursive: true });
+      await fs.writeFile(
+        path.join(memDir, "setup-gotcha.md"),
+        "# Runtime setup\nRun `npm run gen` (scripts/gen.mjs) to regenerate the " +
+          "gitignored fixtures before the suite runs — they are never committed.\n",
+      );
+      await fs.appendFile(strcase, "\nexport const toScreamingSnake = (s) => toSnake(s).toUpperCase();\n");
+    } else {
+      await fs.appendFile(strcase, '\nexport const toDotCase = (s) => toKebab(s).replaceAll("-", ".");\n');
+    }
+    return fakeResult();
+  };
+  return { exec, obs };
+}
 
-    // THE MONEY SHOT — one identical memory-carrying policy, opposite outcomes:
-    // memory HELPED on the helping task and HURT on the poison task. This is the
-    // anti-rigging guard: carried memory is not unconditionally beneficial.
-    assert.notEqual(
-      helpMc.anchor.conventionHeld,
-      poisonMc.anchor.conventionHeld,
-      "same memory-carrying agent must diverge across the two tasks",
-    );
-    assert.ok(
-      helpMc.anchor.conventionHeld && !poisonMc.anchor.conventionHeld && poisonMc.anchor.hitKnownTrap,
-      "memory HELPED on `memory-cents` but HURT (hit trap) on `memory-cents-stale`",
-    );
+// --- Shared driver: real runSequenceTask, fake only at the executor seam ------
+
+async function drive(
+  variant: Variant,
+  task: Task,
+  exec: ExecutorRunner,
+  runResultsDir: string,
+  prepare?: typeof prepareWorkspace,
+): Promise<RunArtifacts> {
+  return runSequenceTask(variant, task, "sonnet", runResultsDir, {
+    runExecutorFn: exec,
+    ...(prepare ? { prepare } : {}),
   });
-});
+}
 
-// --- 2) Persistence across the reset + per-step / overlay isolation -----------
+/** A scored VariantTaskResult carrying a real anchor verdict, for the report. */
+function scoredResult(artifacts: RunArtifacts, anchor: AnchorResult): VariantTaskResult {
+  const dim = (justification: string) => ({ score: 20, justification });
+  return {
+    cellId: artifacts.cellId,
+    variant: artifacts.variant,
+    taskId: artifacts.taskId,
+    executorModel: artifacts.executorModel,
+    judgeModel: "judge",
+    raw: {
+      codeQuality: dim("ok"),
+      testingCoverage: dim("ok"),
+      securityQuality: dim("ok"),
+      documentation: dim("ok"),
+      securityReviewPerformed: true,
+      summary: "fake judge summary",
+    },
+    final: { codeQuality: 20, testingCoverage: 20, securityQuality: 20, documentation: 15 },
+    total: 75,
+    appliedCaps: [],
+    signals: {
+      testFilesPresent: artifacts.testFilesPresent,
+      securityReviewPerformed: true,
+      changedFiles: artifacts.changedFiles,
+    },
+    metrics: { executor: artifacts.executorMetrics },
+    anchors: anchor,
+    ...(artifacts.behavior ? { behavior: artifacts.behavior } : {}),
+  };
+}
 
-test("memory persists across the context reset, and step-2 diffs stay isolated", async () => {
+// --- A) Persistence across the reset + per-step isolation (memory-registry) ---
+
+test("A: memory persists across the context reset and step-2 diffs stay isolated", async () => {
   await withTmp(async (runResultsDir) => {
-    const { helpMc, poisonMc, helpMl } = await runFour(runResultsDir);
+    const task = await getTask("memory-registry");
+
+    // Count prepareWorkspace invocations by wrapping the real one.
+    let prepareCalls = 0;
+    const countingPrepare: typeof prepareWorkspace = async (...args) => {
+      prepareCalls++;
+      return prepareWorkspace(...args);
+    };
+
+    const { exec, obs } = makeRegistryCarrying();
+    const artifacts = await drive(V_CARRYING, task, exec, runResultsDir, countingPrepare);
+
+    // The workspace is prepared EXACTLY ONCE — any re-prepare would wipe memory.
+    assert.equal(prepareCalls, 1, "prepareWorkspace must run once for the whole sequence");
+    assert.equal(artifacts.executorOk, true, "final step ran cleanly");
 
     // PERSISTENCE: memory written in step 1 was readable by the fresh step-2 context.
-    assert.equal(helpMc.obs.sawMemoryAtStep2, true, "step 2 must read step 1's memory note");
-    assert.match(helpMc.obs.memoryAtStep2, /integer-cents/);
+    assert.equal(obs.sawMemoryAtStep2, true, "step 2 must read step 1's memory note");
+    assert.match(obs.memoryAtStep2, /must be registered/i);
 
     // ...and it lives on the bind mount but is NEVER git-tracked (so it can't leak
     // into a scored diff). Inspect the real workspace the runner prepared.
-    const mcWorkspace = path.join(runResultsDir, `${helpMc.artifacts.taskId}__memory-carrying__sonnet`, "workspace");
-    const onDisk = await fs.readFile(path.join(mcWorkspace, ".claude", "memory", "money-convention.md"), "utf8");
-    assert.match(onDisk, /integer-cents/, "memory is present on disk for later steps");
-    const tracked = await git(mcWorkspace, ["ls-files"]);
+    const workspace = path.join(runResultsDir, artifacts.cellId, "workspace");
+    const onDisk = await fs.readFile(
+      path.join(workspace, ".claude", "memory", "registration-rule.md"),
+      "utf8",
+    );
+    assert.match(onDisk, /must be registered/i, "memory is present on disk for later steps");
+    const tracked = await git(workspace, ["ls-files"]);
     assert.doesNotMatch(tracked, /\.claude/, "memory must never be committed to git");
 
-    // ISOLATION: the FINAL (step-2) diff carries only step-2's own file — never
-    // step-1's already-committed work.
-    assert.match(helpMc.artifacts.diff, /reprice\.ts/, "final diff has the step-2 change");
-    assert.doesNotMatch(helpMc.artifacts.diff, /establish-marker\.ts/, "final diff excludes step-1 committed work");
-    assert.doesNotMatch(helpMc.artifacts.diff, /money-convention\.md/, "memory must never appear in a diff");
-
-    // OVERLAY-NOT-ATTRIBUTED: the poison task's `migrate/` overlay (a teammate's
-    // Decimal migration) is committed as step-2's baseline, so it is NOT in the
-    // agent's diff even though the agent worked on top of it.
-    assert.match(poisonMc.artifacts.diff, /reprice\.ts/, "poison final diff has the agent's own change");
-    assert.doesNotMatch(poisonMc.artifacts.diff, /money\.ts/, "the migrated module is not in the agent's diff");
-    assert.doesNotMatch(
-      poisonMc.artifacts.diff,
-      /migrated away from integer cents/,
-      "the migration overlay text is never attributed to the agent",
-    );
-    assert.doesNotMatch(poisonMc.artifacts.diff, /establish-marker\.ts/, "poison final diff excludes step-1 work");
-
-    // The memoryless agent genuinely wrote NO memory (proves the policy contrast).
-    const mlMemDir = path.join(runResultsDir, `${helpMl.artifacts.taskId}__memoryless__sonnet`, "workspace", ".claude");
-    await assert.rejects(fs.access(mlMemDir), "memoryless agent must not create a .claude memory tree");
+    // ISOLATION: the FINAL (step-2) diff carries only step-2's own changes — never
+    // step-1's already-committed file, and never the memory note.
+    assert.match(artifacts.diff, /reverse\.ts/, "final diff has step-2's new handler");
+    assert.doesNotMatch(artifacts.diff, /echo\.ts/, "final diff excludes step-1's committed handler");
+    assert.doesNotMatch(artifacts.diff, /registration-rule\.md/, "memory must never appear in a diff");
   });
 });
 
-// --- 3) The MEMORY EFFECT report renders the helping-vs-poison contrast --------
+// --- B) Registry probe divergence (diff-based) --------------------------------
 
-test("MEMORY EFFECT report renders the helping-vs-poison contrast pivot", async () => {
+test("B: the registry probe discriminates — carrying registers, memoryless forgets", async () => {
   await withTmp(async (runResultsDir) => {
-    const { helpMc, poisonMc, helpMl, poisonMl } = await runFour(runResultsDir);
+    const task = await getTask("memory-registry");
+    const anchor = task.meta.anchor;
+    assert.ok(anchor, "memory-registry must declare an anchor");
+    assert.equal(anchor.kind, "registry");
 
-    // Feed the REAL anchor verdicts (order: helping first, poison second, so the
-    // pivot columns read `memory-cents` then `memory-cents-stale`).
+    const carrying = makeRegistryCarrying();
+    const carryingArtifacts = await drive(V_CARRYING, task, carrying.exec, runResultsDir);
+    const carryingVerdict = detectAnchor(anchor, {
+      diff: carryingArtifacts.diff,
+      metrics: carryingArtifacts.executorMetrics,
+      timedOut: carryingArtifacts.executorTimedOut,
+    });
+
+    const memoryless = makeRegistryMemoryless();
+    const memorylessArtifacts = await drive(V_MEMORYLESS, task, memoryless.exec, runResultsDir);
+    const memorylessVerdict = detectAnchor(anchor, {
+      diff: memorylessArtifacts.diff,
+      metrics: memorylessArtifacts.executorMetrics,
+      timedOut: memorylessArtifacts.executorTimedOut,
+    });
+
+    // Carrying REMEMBERED the rule → its step-2 diff modifies src/registry.ts.
+    assert.equal(carryingVerdict.conventionHeld, true, "carrying holds the registry rule");
+    assert.equal(carryingVerdict.turnsToGreen, 4, "turnsToGreen flows from the final step's num_turns");
+    assert.match(carryingArtifacts.diff, /registry\.ts/, "carrying diff actually touches registry.ts");
+
+    // Memoryless FORGOT the rule → its step-2 diff never touches src/registry.ts.
+    assert.equal(memorylessVerdict.conventionHeld, false, "memoryless breaks the registry rule");
+    assert.equal(memorylessVerdict.hitKnownTrap, false, "registry rule has no trap concept");
+    assert.doesNotMatch(memorylessArtifacts.diff, /registry\.ts/, "memoryless diff leaves registry.ts alone");
+
+    // THE DIVERGENCE: the same probe, opposite verdicts across the two bundles.
+    assert.notEqual(
+      carryingVerdict.conventionHeld,
+      memorylessVerdict.conventionHeld,
+      "the registry probe must separate the memory-carrying bundle from the memoryless one",
+    );
+  });
+});
+
+// --- C) Gotcha probe divergence (trace-based) + overlay isolation -------------
+
+test("C: the gotcha overlay is baseline-committed and the setup trace discriminates the trap", async () => {
+  await withTmp(async (runResultsDir) => {
+    const task = await getTask("memory-gotcha");
+    const anchor = task.meta.anchor;
+    assert.ok(anchor, "memory-gotcha must declare an anchor");
+    assert.equal(anchor.kind, "setup-gotcha");
+
+    // OVERLAY ISOLATION: drive the REAL runner. Step 2's `step-2-overlay` relocates
+    // the generated fixtures (scripts/gen.mjs → writes src/generated/…, and the
+    // migrated table.test.mjs). It is committed as step-2's BASELINE, so the
+    // relocated/migrated files are NOT attributed to the agent's own diff.
+    const gotcha = makeGotchaCarrying();
+    const artifacts = await drive(V_CARRYING, task, gotcha.exec, runResultsDir);
+    assert.equal(artifacts.executorOk, true, "final step ran cleanly");
+    assert.match(artifacts.diff, /strcase\.mjs/, "agent's own step-2 change is in the diff");
+    assert.doesNotMatch(artifacts.diff, /generated/, "relocated src/generated/… is not in the agent's diff");
+    assert.doesNotMatch(artifacts.diff, /table\.test\.mjs/, "the migrated test file is baseline, not agent work");
+    assert.doesNotMatch(artifacts.diff, /gen\.mjs/, "the migrated generator is baseline, not agent work");
+
+    // VERDICT: the setup-gotcha detector reads the raw trace (file-read wiring is
+    // unit-tested elsewhere), so feed SYNTHETIC final-step traces directly.
+    const metrics: CallMetrics = { wallMs: 5, numTurns: 3 };
+
+    // memory-carrying: remembered to run setup proactively → matched the setup signal,
+    // never hit the missing-module trap.
+    const carryingVerdict = detectAnchor(anchor, {
+      diff: "",
+      metrics,
+      timedOut: false,
+      trace:
+        '{"type":"assistant"}\n' +
+        '{"tool":"Bash","input":"npm run gen"}\n' +
+        '{"stdout":"gen: wrote src/generated/fixtures.gen.mjs (5 cases)"}\n' +
+        '{"stdout":"# tests 1\\n# pass 1"}\n',
+    });
+
+    // memoryless: a capable agent STILL reaches green — but reactively, running
+    // setup only AFTER hitting the runtime gotcha. This realistic trace includes
+    // the recovery `npm run gen`; the probe must still separate it from the
+    // proactive bundle (holding requires NOT hitting the trap).
+    const memorylessVerdict = detectAnchor(anchor, {
+      diff: "",
+      metrics,
+      timedOut: false,
+      trace:
+        '{"type":"assistant"}\n' +
+        '{"tool":"Bash","input":"npm test"}\n' +
+        '{"stderr":"Error: Cannot find module ./src/generated/fixtures.gen.mjs"}\n' +
+        '{"tool":"Bash","input":"npm run gen"}\n' +
+        '{"stdout":"# tests 1\\n# pass 1"}\n',
+    });
+
+    assert.equal(carryingVerdict.conventionHeld, true, "carrying applied the remembered setup proactively");
+    assert.equal(carryingVerdict.hitKnownTrap, false, "carrying avoided the trap");
+    assert.equal(carryingVerdict.turnsToGreen, 3, "turnsToGreen surfaces on a held verdict");
+
+    assert.equal(memorylessVerdict.conventionHeld, false, "memoryless ran setup only REACTIVELY → not held");
+    assert.equal(memorylessVerdict.hitKnownTrap, true, "memoryless fell into the missing-module trap first");
+    assert.match(memorylessVerdict.evidence, /reactive/, "the verdict names the reactive recovery");
+
+    // THE DIVERGENCE: same probe, opposite verdicts — the memory bundle avoided the trap.
+    assert.notEqual(
+      carryingVerdict.conventionHeld,
+      memorylessVerdict.conventionHeld,
+      "the gotcha probe must separate the memory-carrying bundle from the memoryless one",
+    );
+    assert.ok(
+      carryingVerdict.conventionHeld && memorylessVerdict.hitKnownTrap,
+      "carried memory ran setup; memoryless hit the known trap",
+    );
+  });
+});
+
+// --- D) The MEMORY EFFECT report renders BOTH probes --------------------------
+
+test("D: the MEMORY EFFECT report renders both the registry and the gotcha probe", async () => {
+  await withTmp(async (runResultsDir) => {
+    const registryTask = await getTask("memory-registry");
+    const gotchaTask = await getTask("memory-gotcha");
+    const registryAnchor = registryTask.meta.anchor!;
+    const gotchaAnchor = gotchaTask.meta.anchor!;
+
+    // Registry cells: REAL verdicts from the real runner + real detectAnchor.
+    const regCarry = makeRegistryCarrying();
+    const regCarryArt = await drive(V_CARRYING, registryTask, regCarry.exec, runResultsDir);
+    const regCarryVerdict = detectAnchor(registryAnchor, {
+      diff: regCarryArt.diff,
+      metrics: regCarryArt.executorMetrics,
+      timedOut: regCarryArt.executorTimedOut,
+    });
+    const regMl = makeRegistryMemoryless();
+    const regMlArt = await drive(V_MEMORYLESS, registryTask, regMl.exec, runResultsDir);
+    const regMlVerdict = detectAnchor(registryAnchor, {
+      diff: regMlArt.diff,
+      metrics: regMlArt.executorMetrics,
+      timedOut: regMlArt.executorTimedOut,
+    });
+
+    // Gotcha cells: REAL runner (for cellIds/artifacts) + REAL detectAnchor over the
+    // trace-based anchor with synthetic traces (the verdict source proven in C).
+    const gotchaCarryArt = await drive(V_CARRYING, gotchaTask, makeGotchaCarrying().exec, runResultsDir);
+    const gotchaCarryVerdict = detectAnchor(gotchaAnchor, {
+      diff: "",
+      metrics: { wallMs: 5, numTurns: 3 },
+      timedOut: false,
+      trace: '{"tool":"Bash","input":"npm run gen"}\n{"stdout":"# pass 1"}\n',
+    });
+    const gotchaMlArt = await drive(V_MEMORYLESS, gotchaTask, makeGotchaCarrying().exec, runResultsDir);
+    const gotchaMlVerdict = detectAnchor(gotchaAnchor, {
+      diff: "",
+      metrics: { wallMs: 5 },
+      timedOut: false,
+      trace: '{"stderr":"Error: Cannot find module ./src/generated/fixtures.gen.mjs"}\n',
+    });
+
+    // Order so the pivot columns read `memory-registry` then `memory-gotcha`.
     const results: VariantTaskResult[] = [
-      scoredResult(helpMc, helpMc.anchor),
-      scoredResult(poisonMc, poisonMc.anchor),
-      scoredResult(helpMl, helpMl.anchor),
-      scoredResult(poisonMl, poisonMl.anchor),
+      scoredResult(regCarryArt, regCarryVerdict),
+      scoredResult(regMlArt, regMlVerdict),
+      scoredResult(gotchaCarryArt, gotchaCarryVerdict),
+      scoredResult(gotchaMlArt, gotchaMlVerdict),
     ];
     const report: Report = {
       runId: "e2e-run",
       generatedAt: "2026-07-09T00:00:00.000Z",
-      taskId: "memory-cents,memory-cents-stale",
+      taskId: "memory-registry,memory-gotcha",
       taskTitle: "Sequential memory",
       executorModels: ["sonnet"],
       judgeModel: "judge",
@@ -363,26 +462,25 @@ test("MEMORY EFFECT report renders the helping-vs-poison contrast pivot", async 
 
     const md = renderReportMarkdown(report);
 
-    // The section renders at all (gated on anchors being present).
+    // The section renders (gated on anchors being present).
     assert.match(md, /## Memory effect \(not scored\)/);
     assert.match(md, /Contrast — memory helped vs hurt/);
 
-    // The CONTRAST pivot: the memory-carrying bundle held on the helping task but
-    // hit the trap on the poison task — visible side by side in one row.
-    assert.match(
-      md,
-      /\| memory-carrying \| ✓ held \(4 turns\) \| ✗ hit trap \|/,
-      "carrying row: held on helping, hit trap on poison",
-    );
-    // And the memoryless bundle shows the mirror image: broke on helping, held on poison.
-    assert.match(
-      md,
-      /\| memoryless \| ✗ broke \| ✓ held \(4 turns\) \|/,
-      "memoryless row: broke on helping, held on poison",
-    );
+    // BOTH probes appear as anchored tasks in the readout.
+    assert.match(md, /### Task: `memory-registry`/, "registry probe detail renders");
+    assert.match(md, /### Task: `memory-gotcha`/, "gotcha probe detail renders");
 
-    // Both fixtures appear as anchored tasks in the readout.
-    assert.match(md, /memory-cents-stale/);
-    assert.match(md, /`memory-cents`/);
+    // The CONTRAST pivot shows one memory-carrying row that held BOTH probes, and a
+    // memoryless row that broke the registry rule and hit the gotcha trap.
+    assert.match(
+      md,
+      /\| memory-carrying \| ✓ held \(4 turns\) \| ✓ held \(3 turns\) \|/,
+      "carrying row: registered on registry, ran setup on gotcha",
+    );
+    assert.match(
+      md,
+      /\| memoryless \| ✗ broke \| ✗ hit trap \|/,
+      "memoryless row: missed registration, hit the gotcha trap",
+    );
   });
 });

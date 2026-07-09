@@ -1,6 +1,6 @@
 {
-  "id": "memory-cents",
-  "title": "Money convention carries across a context reset (helping)",
+  "id": "memory-registry",
+  "title": "Arbitrary registration rule must carry across a reset",
   "logicBearing": true,
   "securityRelevant": false,
   "steps": [
@@ -8,15 +8,16 @@
     { "id": "apply", "file": "step-2.md" }
   ],
   "anchor": {
-    "kind": "money-cents",
-    "correctConvention": "integer-cents",
-    "trapConvention": "decimal",
+    "kind": "registry",
+    "requiredFile": "src/registry.ts",
     "evaluatedStepId": "apply"
   },
   "seedFiles": [
     "seed/package.json",
     "seed/tsconfig.json",
-    "seed/src/cart.ts",
-    "seed/src/cart.test.ts"
+    "seed/src/handler.ts",
+    "seed/src/registry.ts",
+    "seed/src/dispatch.ts",
+    "seed/src/handlers/ping.ts"
   ]
 }

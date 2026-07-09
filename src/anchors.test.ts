@@ -135,6 +135,34 @@ test("Decimal.js method idiom (no `Decimal` by name) classifies as decimal", () 
   assert.equal(classifyMoneyConvention(aliasIdiom).convention, "decimal");
 });
 
+test("a $ float in a COMMENT does not override integer-cents CODE (real-run bug)", () => {
+  // Reproduces the memory-cents run: naked/gstack kept 599 cents but a
+  // clarifying comment mentioning $5.99 flipped the verdict to float.
+  const nakedCase = `+  // subtotal 3648 + flat fee 599 ($5.99)\n+  const FLAT_SHIPPING_FEE = 599;\n+  return subtotalCents(items) + FLAT_SHIPPING_FEE;`;
+  assert.equal(classifyMoneyConvention(nakedCase).convention, "integer-cents");
+  const gstackCase = `+  // Flat shipping fee of $5.99, in cents (matches the module's cents convention).\n+  const FLAT_SHIPPING_FEE = 599;\n+  return subtotalCents(items) + FLAT_SHIPPING_FEE;`;
+  assert.equal(classifyMoneyConvention(gstackCase).convention, "integer-cents");
+});
+
+test("a bare integer whose cents-ness lives ONLY in a comment is unknown, not float", () => {
+  // Honest limitation: with the comment stripped, `599` alone carries no code
+  // signal that it is cents. Fails CLOSED (unknown → not held), never a false
+  // float verdict — the failure mode that mattered.
+  const bare = `+  // $5.99 flat fee, in cents\n+  const FLAT_SHIPPING_FEE = 599;`;
+  assert.equal(classifyMoneyConvention(bare).convention, "unknown");
+});
+
+test("a $ float in a JSDoc line is ignored", () => {
+  const jsdoc = `+/**\n+ * Flat shipping fee, $5.99, stored as cents.\n+ */\n+const feeCents = 599;`;
+  assert.equal(classifyMoneyConvention(jsdoc).convention, "integer-cents");
+});
+
+test("a genuine float literal in CODE still classifies as float", () => {
+  // Comment stripping must not hide a real float in code.
+  const realFloat = `+const fee = 5.99; // dollars`;
+  assert.equal(classifyMoneyConvention(realFloat).convention, "float");
+});
+
 test("extractAddedLines takes + lines but not the +++ header", () => {
   const lines = extractAddedLines(PARSE_FLOAT_DIFF);
   assert.ok(lines.some((l) => l.includes("parseFloat(amount)")));
@@ -215,4 +243,150 @@ test("timeout is reflected in evidence", () => {
 
   const noChange = detectAnchor(HELPING, step(EMPTY_DIFF, { timedOut: true }));
   assert.match(noChange.evidence, /executor timed out/);
+});
+
+// --- detector: registry (arbitrary "register your export" rule) --------------
+
+const REGISTRY: AnchorConfig = { kind: "registry", requiredFile: "src/registry.ts" };
+
+/** A step-2 diff that touches the required registry file. */
+const REGISTRY_TOUCHED_DIFF = `diff --git a/src/registry.ts b/src/registry.ts
+--- a/src/registry.ts
++++ b/src/registry.ts
+@@ -1,3 +1,4 @@
++export { widget } from "./widget.js";
+`;
+
+/** A step-2 diff that adds an export but ignores the registry file. */
+const REGISTRY_MISSED_DIFF = `diff --git a/src/widget.ts b/src/widget.ts
+--- a/src/widget.ts
++++ b/src/widget.ts
+@@ -1,2 +1,3 @@
++export function widget() {}
+`;
+
+test("registry: diff touching src/registry.ts holds, no trap", () => {
+  const r = detectAnchor(
+    REGISTRY,
+    step(REGISTRY_TOUCHED_DIFF, { metrics: { wallMs: 1_000, numTurns: 3 } }),
+  );
+  assert.equal(r.conventionHeld, true);
+  assert.equal(r.hitKnownTrap, false);
+  assert.equal(r.turnsToGreen, 3);
+  assert.match(r.evidence, /modifies src\/registry\.ts/);
+});
+
+test("registry: diff not touching the registry file fails closed", () => {
+  const r = detectAnchor(REGISTRY, step(REGISTRY_MISSED_DIFF));
+  assert.equal(r.conventionHeld, false);
+  assert.equal(r.hitKnownTrap, false);
+  assert.equal(r.turnsToGreen, undefined);
+  assert.match(r.evidence, /does not touch src\/registry\.ts/);
+});
+
+test("registry: empty diff fails closed", () => {
+  const r = detectAnchor(REGISTRY, step(EMPTY_DIFF));
+  assert.equal(r.conventionHeld, false);
+  assert.equal(r.turnsToGreen, undefined);
+});
+
+test("registry: lookalike paths, rename-away, and delete do NOT count as held", () => {
+  // Substring matching would false-positive on all of these; exact post-image
+  // path matching must reject them.
+  const lookalikeBak = `+++ b/src/registry.ts.bak\n@@ -1 +1,2 @@\n+noise`;
+  const lookalikeTsx = `+++ b/src/registry.tsx\n@@ -1 +1,2 @@\n+noise`;
+  const renameAway = `diff --git a/src/registry.ts b/src/other.ts\n--- a/src/registry.ts\n+++ b/src/other.ts\n@@ -1 +1 @@\n+moved`;
+  const deletion = `diff --git a/src/registry.ts b/src/registry.ts\n--- a/src/registry.ts\n+++ /dev/null\n@@ -1 +0,0 @@`;
+  for (const d of [lookalikeBak, lookalikeTsx, renameAway, deletion]) {
+    assert.equal(detectAnchor(REGISTRY, step(d)).conventionHeld, false, `should not hold: ${d.split("\n")[0]}`);
+  }
+  // Sanity: an exact modification still holds.
+  const exact = `+++ b/src/registry.ts\n@@ -1 +1,2 @@\n+export { x } from "./x.js";`;
+  assert.equal(detectAnchor(REGISTRY, step(exact)).conventionHeld, true);
+});
+
+// --- detector: setup-gotcha (runtime-only knowledge) -------------------------
+
+const GOTCHA: AnchorConfig = {
+  kind: "setup-gotcha",
+  setupSignal: "npm run gen-fixtures",
+  trapSignal: "Cannot find .*fixtures\\.json",
+};
+
+/** A trace where the agent ran the required setup command. */
+const TRACE_RAN_SETUP = JSON.stringify({
+  type: "assistant",
+  message: { content: [{ type: "tool_use", name: "Bash", input: { command: "npm run gen-fixtures" } }] },
+});
+
+/** A trace where the agent hit the runtime failure. */
+const TRACE_HIT_TRAP = JSON.stringify({
+  type: "user",
+  message: { content: [{ type: "tool_result", content: "Error: Cannot find ./data/fixtures.json" }] },
+});
+
+test("setup-gotcha: trace running the setup command holds", () => {
+  const r = detectAnchor(
+    GOTCHA,
+    step("", { trace: TRACE_RAN_SETUP, metrics: { wallMs: 1_000, numTurns: 2 } }),
+  );
+  assert.equal(r.conventionHeld, true);
+  assert.equal(r.hitKnownTrap, false);
+  assert.equal(r.turnsToGreen, 2);
+  assert.match(r.evidence, /proactively/);
+});
+
+test("setup-gotcha: trace with the trap signature sets hitKnownTrap", () => {
+  const r = detectAnchor(GOTCHA, step("", { trace: TRACE_HIT_TRAP }));
+  assert.equal(r.conventionHeld, false);
+  assert.equal(r.hitKnownTrap, true);
+  assert.equal(r.turnsToGreen, undefined);
+  assert.match(r.evidence, /hit trap/);
+});
+
+test("setup-gotcha: hit trap THEN ran setup is REACTIVE, not held", () => {
+  // A memoryless agent MUST run setup to go green — but reactively, after hitting
+  // the failure. "Ran setup" alone doesn't discriminate memory; holding requires
+  // NOT hitting the trap (i.e. proactive application from memory).
+  const both = `${TRACE_HIT_TRAP}\n${TRACE_RAN_SETUP}`;
+  const r = detectAnchor(
+    GOTCHA,
+    step("", { trace: both, metrics: { wallMs: 1_000, numTurns: 5 } }),
+  );
+  assert.equal(r.conventionHeld, false);
+  assert.equal(r.hitKnownTrap, true);
+  assert.equal(r.turnsToGreen, undefined);
+  assert.match(r.evidence, /reactive/);
+});
+
+test("setup-gotcha: absent/empty trace fails closed with explicit evidence", () => {
+  const absent = detectAnchor(GOTCHA, step(""));
+  assert.equal(absent.conventionHeld, false);
+  assert.equal(absent.hitKnownTrap, false);
+  assert.match(absent.evidence, /no trace available/);
+
+  const empty = detectAnchor(GOTCHA, step("", { trace: "" }));
+  assert.equal(empty.conventionHeld, false);
+  assert.match(empty.evidence, /no trace available/);
+});
+
+test("setup-gotcha: evidence never leaks the raw trace", () => {
+  const r = detectAnchor(GOTCHA, step("", { trace: TRACE_RAN_SETUP }));
+  assert.ok(!r.evidence.includes("tool_use"));
+  assert.ok(!r.evidence.includes(TRACE_RAN_SETUP));
+});
+
+test("setup-gotcha: a malformed regex source fails closed without throwing", () => {
+  const bad: AnchorConfig = {
+    kind: "setup-gotcha",
+    setupSignal: "npm run gen-fixtures",
+    trapSignal: "Cannot find [", // unterminated character class
+  };
+  let r: ReturnType<typeof detectAnchor> | undefined;
+  assert.doesNotThrow(() => {
+    r = detectAnchor(bad, step("", { trace: TRACE_RAN_SETUP }));
+  });
+  assert.equal(r?.conventionHeld, false);
+  assert.equal(r?.hitKnownTrap, false);
+  assert.match(r!.evidence, /invalid setup-gotcha signal pattern/);
 });
