@@ -56,6 +56,77 @@ test("resolveWithin rejects the base dir itself (empty relative)", () => {
   assert.throws(() => resolveWithin(base, "."), /escapes its base/);
 });
 
+test("prepareWorkspace strips a leading seed/ prefix from seed-file destinations", async () => {
+  // Fixtures authored under a `seed/` subdir must land at the workspace ROOT so
+  // the agent works in the right tree.
+  const taskDir = await fs.mkdtemp(path.join(os.tmpdir(), "bench-seed-"));
+  await fs.mkdir(path.join(taskDir, "seed", "src"), { recursive: true });
+  await fs.writeFile(path.join(taskDir, "seed", "src", "a.ts"), "export const a = 1;\n");
+
+  const variant: Variant = { name: "v", type: "claude-md", content: "# CLAUDE\n" };
+  const task: Task = {
+    meta: {
+      id: "seeded",
+      title: "t",
+      logicBearing: true,
+      securityRelevant: false,
+      seedFiles: ["seed/src/a.ts"],
+    },
+    dir: taskDir,
+    prompt: "x",
+  };
+  const runResultsDir = await tmpResultsDir();
+  try {
+    const ws = await prepareWorkspace(variant, task, "sonnet", runResultsDir);
+    // Prefix stripped: lands at <workspace>/src/a.ts, not <workspace>/seed/src/a.ts.
+    assert.equal(
+      await fs.readFile(path.join(ws.workspaceDir, "src", "a.ts"), "utf8"),
+      "export const a = 1;\n",
+    );
+    assert.ok(
+      !(await fs.stat(path.join(ws.workspaceDir, "seed", "src", "a.ts")).then(
+        () => true,
+        () => false,
+      )),
+      "no seed/ dir should survive at the workspace root",
+    );
+  } finally {
+    await fs.rm(runResultsDir, { recursive: true, force: true });
+    await fs.rm(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("prepareWorkspace leaves prefix-less seed-file destinations unchanged", async () => {
+  const taskDir = await fs.mkdtemp(path.join(os.tmpdir(), "bench-seed-"));
+  await fs.mkdir(path.join(taskDir, "src"), { recursive: true });
+  await fs.writeFile(path.join(taskDir, "src", "b.ts"), "export const b = 2;\n");
+
+  const variant: Variant = { name: "v", type: "claude-md", content: "# CLAUDE\n" };
+  const task: Task = {
+    meta: {
+      id: "plain",
+      title: "t",
+      logicBearing: true,
+      securityRelevant: false,
+      seedFiles: ["src/b.ts"],
+    },
+    dir: taskDir,
+    prompt: "x",
+  };
+  const runResultsDir = await tmpResultsDir();
+  try {
+    const ws = await prepareWorkspace(variant, task, "sonnet", runResultsDir);
+    // No prefix ⇒ unchanged: lands at <workspace>/src/b.ts.
+    assert.equal(
+      await fs.readFile(path.join(ws.workspaceDir, "src", "b.ts"), "utf8"),
+      "export const b = 2;\n",
+    );
+  } finally {
+    await fs.rm(runResultsDir, { recursive: true, force: true });
+    await fs.rm(taskDir, { recursive: true, force: true });
+  }
+});
+
 // Integration: exercises the real prepareWorkspace + captureArtifacts git path.
 test("captured file list excludes dependency/build artifacts, keeps source & tests", async () => {
   const variant: Variant = { name: "excltest", type: "claude-md", content: "# CLAUDE\n" };

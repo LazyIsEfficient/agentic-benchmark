@@ -69,6 +69,66 @@ export type BundleVariant = CopyBundleVariant | SetupBundleVariant;
 /** A CLAUDE.md variant under test — either a lone CLAUDE.md or a full bundle. */
 export type Variant = ClaudeMdVariant | BundleVariant;
 
+/**
+ * One ordered step of a sequential (multi-turn) task. A step's `prompt` is what
+ * that step hands the executor when its turn comes; steps run in array order and
+ * share one accumulating workspace. Used only by sequential-memory tasks — a
+ * single-prompt task (no `steps`) never constructs these.
+ */
+export interface TaskStep {
+  /** The prompt handed to the executor for this step. */
+  prompt: string;
+  /** Optional human-readable label for the step (e.g. "migrate", "reprice"). */
+  id?: string;
+  /**
+   * Optional task-dir-relative directory whose files are laid over the workspace
+   * (overwriting existing files) immediately BEFORE this step runs. Used by the
+   * poison scenario: a teammate-style migration replaces the money module between
+   * steps so that memory formed by an earlier step ("money is integer cents")
+   * becomes stale. The overlay is committed as this step's baseline, so it is
+   * never attributed to the agent's own diff. Omit for ordinary steps.
+   */
+  seedOverlay?: string;
+}
+
+/**
+ * The numeric convention a money value is expected to be expressed in. The
+ * anchor detector reads this to decide which shape counts as "correct" on the
+ * final step:
+ * - `integer-cents` — a plain integer count of cents (the helping baseline).
+ * - `decimal` — a Decimal-typed value (e.g. a Decimal.js / db `numeric` wrapper).
+ * - `bigint` — a native `bigint` count of cents.
+ */
+export type MoneyConvention = "integer-cents" | "decimal" | "bigint";
+
+/**
+ * Anchor for the money-cents scenario. Declares which convention the final-step
+ * output must use to count as correct, and (optionally) which convention is the
+ * known trap. This single shape expresses BOTH variants:
+ * - helping — `correctConvention: "integer-cents"`, trap is the migrated type.
+ * - poison — the current code has migrated to Decimal/BigInt, so following it is
+ *   correct: `correctConvention: "decimal" | "bigint"`, trap is `integer-cents`.
+ * One detector consumes this for both by comparing observed final-step output
+ * against `correctConvention` (held) and against `trapConvention` (hit the trap).
+ */
+export interface MoneyCentsAnchor {
+  /** Discriminant. */
+  kind: "money-cents";
+  /** The convention the final step must use to count as correct. */
+  correctConvention: MoneyConvention;
+  /** The convention that constitutes the known trap, when one is defined. */
+  trapConvention?: MoneyConvention;
+  /** Step `id` the anchor is evaluated against (default: the last step). */
+  evaluatedStepId?: string;
+}
+
+/**
+ * Deterministic anchor configuration for a task — a discriminated union keyed by
+ * `kind` so future anchor scenarios add a new member without touching existing
+ * consumers. Today the only member is {@link MoneyCentsAnchor}.
+ */
+export type AnchorConfig = MoneyCentsAnchor;
+
 /** Task metadata from tasks/<id>/meta.json. */
 export interface TaskMeta {
   id: string;
@@ -85,6 +145,17 @@ export interface TaskMeta {
   successCriteria?: string;
   /** Optional seed files (relative paths) copied into the workspace. */
   seedFiles?: string[];
+  /**
+   * Ordered steps for a sequential-memory task. When absent, this is today's
+   * single-prompt task (unchanged behavior). When present, the harness runs each
+   * step's prompt in order against one accumulating workspace.
+   */
+  steps?: TaskStep[];
+  /**
+   * Deterministic anchor for this task — a convention the final step must hold.
+   * When absent, no anchor verdict is computed (today's default).
+   */
+  anchor?: AnchorConfig;
 }
 
 /** A resolved task: metadata + the prompt handed to the executor. */
@@ -235,6 +306,25 @@ export interface JudgeResult {
   summary: string;
 }
 
+/**
+ * Deterministic verdict produced by an anchor detector for one run. Independent
+ * of the judge's scores: a mechanical read of whether the run held the required
+ * convention on the anchored step and whether it fell into the known trap.
+ */
+export interface AnchorResult {
+  /** True if the final-step output used the anchor's `correctConvention`. */
+  conventionHeld: boolean;
+  /**
+   * For a sequential task, the number of steps taken to first satisfy the
+   * convention ("turn green"). Undefined when it never held.
+   */
+  turnsToGreen?: number;
+  /** True if the run adopted the anchor's `trapConvention` (fell for the trap). */
+  hitKnownTrap: boolean;
+  /** Human-readable justification for the verdict (what was observed). */
+  evidence: string;
+}
+
 /** Records a single deterministic cap that fired after judging. */
 export interface AppliedCap {
   dimension: "testingCoverage" | "securityQuality" | "total";
@@ -284,6 +374,12 @@ export interface VariantTaskResult {
    * degrade to `—` in the behavior comparison table.
    */
   behavior?: Behavior;
+  /**
+   * Deterministic anchor verdict for this run, when the task declared an
+   * `anchor`. Optional for backward-compat: results in old report.json files
+   * lack it. Never folded into the /100 score — a separate, mechanical signal.
+   */
+  anchors?: AnchorResult;
   /** Set when the executor failed; the run is scored as zero. */
   executorFailure?: string;
   /** Set when the judge failed (container error, timeout, or bad output). */

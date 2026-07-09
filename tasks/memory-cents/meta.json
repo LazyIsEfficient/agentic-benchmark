@@ -1,0 +1,22 @@
+{
+  "id": "memory-cents",
+  "title": "Money convention carries across a context reset (helping)",
+  "logicBearing": true,
+  "securityRelevant": false,
+  "steps": [
+    { "id": "establish", "file": "step-1.md" },
+    { "id": "apply", "file": "step-2.md" }
+  ],
+  "anchor": {
+    "kind": "money-cents",
+    "correctConvention": "integer-cents",
+    "trapConvention": "decimal",
+    "evaluatedStepId": "apply"
+  },
+  "seedFiles": [
+    "seed/package.json",
+    "seed/tsconfig.json",
+    "seed/src/cart.ts",
+    "seed/src/cart.test.ts"
+  ]
+}

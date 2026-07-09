@@ -1,0 +1,15 @@
+{
+  "name": "checkout-cart",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Pricing and cart math for the checkout service.",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

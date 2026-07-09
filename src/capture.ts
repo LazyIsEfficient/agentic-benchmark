@@ -235,11 +235,19 @@ export async function captureArtifacts(args: {
   executorOk: boolean;
   executorTimedOut: boolean;
   executorMetrics: CallMetrics;
+  /**
+   * Optional git ref to diff the staged workspace against. Omitted (default) ⇒
+   * `git diff --cached` (index vs HEAD), the single-cell behavior — byte-for-byte
+   * unchanged. A sequential step passes the PREVIOUS step's commit so this step's
+   * diff is isolated from work already committed by earlier steps.
+   */
+  baselineRef?: string;
   failureReason?: string;
 }): Promise<RunArtifacts> {
+  const ref = args.baselineRef ? [args.baselineRef] : [];
   await git(args.workspaceDir, ["add", "-A"]);
-  const rawDiff = await git(args.workspaceDir, ["diff", "--cached"]);
-  const nameOnly = await git(args.workspaceDir, ["diff", "--cached", "--name-only"]);
+  const rawDiff = await git(args.workspaceDir, ["diff", "--cached", ...ref]);
+  const nameOnly = await git(args.workspaceDir, ["diff", "--cached", "--name-only", ...ref]);
   const changedFiles = classifyChangedFiles(nameOnly.split("\n"));
 
   const rawTranscript = extractTranscript(args.ndjson);

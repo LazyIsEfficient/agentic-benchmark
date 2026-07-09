@@ -1,14 +1,30 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import {
   MAX_CONCURRENCY,
   formatVariantListLine,
+  loadTasks,
   loadVariants,
   parseConcurrency,
   parseDelayMs,
   parseModels,
+  runCell,
+  type RunCellDeps,
 } from "./cli.js";
-import type { CopyBundleVariant, SetupBundleVariant } from "./types.js";
+import type {
+  AnchorResult,
+  CopyBundleVariant,
+  JudgeResult,
+  RunArtifacts,
+  SetupBundleVariant,
+  Task,
+  TaskMeta,
+  Variant,
+  VariantTaskResult,
+} from "./types.js";
 
 test("parseModels splits comma/space, trims, dedups, drops empties", () => {
   // Simulates `--models "fable, sonnet ,opus"` (one token).
@@ -122,4 +138,220 @@ test("formatVariantListLine: shows the type (and description for bundles)", () =
     }),
     "  - agentic-os [bundle] — agentic-os v2.6.0",
   );
+});
+
+// --- Sequence task loading (loadTasks) --------------------------------------
+
+/** Write a minimal task dir under `root/<id>/` and return its path. */
+async function writeTaskDir(
+  root: string,
+  id: string,
+  files: Record<string, string>,
+): Promise<void> {
+  const dir = path.join(root, id);
+  await fs.mkdir(dir, { recursive: true });
+  await Promise.all(
+    Object.entries(files).map(([name, content]) =>
+      fs.writeFile(path.join(dir, name), content),
+    ),
+  );
+}
+
+test("loadTasks: a `steps` meta builds a sequence Task with per-step prompts from files", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "seqtask-"));
+  try {
+    await writeTaskDir(root, "seq", {
+      "meta.json": JSON.stringify({
+        id: "seq",
+        title: "Seq",
+        logicBearing: true,
+        securityRelevant: false,
+        steps: [
+          { id: "establish", file: "step-1.md" },
+          { id: "apply", file: "step-2.md", seedOverlay: "migrate/" },
+        ],
+      }),
+      "step-1.md": "ESTABLISH the convention.",
+      "step-2.md": "APPLY it now.",
+      // A redundant task.md in a sequence dir must be IGNORED (steps win).
+      "task.md": "POISON — should never be used.",
+    });
+
+    const tasks = await loadTasks(root);
+    assert.equal(tasks.length, 1);
+    const t = tasks[0]!;
+    const steps = t.meta.steps!;
+    assert.equal(steps.length, 2);
+    assert.deepEqual(steps[0], { prompt: "ESTABLISH the convention.", id: "establish" });
+    assert.deepEqual(steps[1], {
+      prompt: "APPLY it now.",
+      id: "apply",
+      seedOverlay: "migrate/",
+    });
+    // Task.prompt is the FINAL step's prompt (the judge scores the final step),
+    // NOT the redundant task.md.
+    assert.equal(t.prompt, "APPLY it now.");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("loadTasks: a steps-less task still loads its prompt from task.md", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "single-"));
+  try {
+    await writeTaskDir(root, "single", {
+      "meta.json": JSON.stringify({
+        id: "single",
+        title: "Single",
+        logicBearing: false,
+        securityRelevant: false,
+      }),
+      "task.md": "The single-shot prompt.",
+    });
+
+    const tasks = await loadTasks(root);
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0]!.meta.steps, undefined);
+    assert.equal(tasks[0]!.prompt, "The single-shot prompt.");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- Cell dispatch + anchor threading (runCell) -----------------------------
+
+type CellArg = Parameters<typeof runCell>[0];
+const PROGRESS = () => ({ completed: 0, total: 1, started: 0, running: 0 });
+const NAKED: Variant = { name: "naked", type: "claude-md", content: "" };
+
+function makeTask(meta: Partial<TaskMeta> = {}): Task {
+  return {
+    meta: { id: "t", title: "T", logicBearing: false, securityRelevant: false, ...meta },
+    dir: "/x",
+    prompt: "final",
+  };
+}
+
+function makeArtifacts(overrides: Partial<RunArtifacts> = {}): RunArtifacts {
+  return {
+    cellId: "c1",
+    variant: "naked",
+    taskId: "t",
+    workspaceDir: "/w",
+    diff: "",
+    changedFiles: [],
+    transcript: "",
+    testFilesPresent: false,
+    executorModel: "sonnet",
+    executorMetrics: { wallMs: 0 },
+    executorOk: true,
+    executorTimedOut: false,
+    ...overrides,
+  };
+}
+
+const ZERO_DIM = { score: 0, justification: "" };
+function makeResult(overrides: Partial<VariantTaskResult> = {}): VariantTaskResult {
+  const raw: JudgeResult = {
+    codeQuality: ZERO_DIM,
+    testingCoverage: ZERO_DIM,
+    securityQuality: ZERO_DIM,
+    documentation: ZERO_DIM,
+    securityReviewPerformed: true,
+    summary: "",
+  };
+  return {
+    cellId: "c1",
+    variant: "naked",
+    taskId: "t",
+    executorModel: "sonnet",
+    judgeModel: "opus",
+    raw,
+    final: { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 },
+    total: 42,
+    appliedCaps: [],
+    signals: { testFilesPresent: false, securityReviewPerformed: true, changedFiles: [] },
+    metrics: { executor: { wallMs: 0 } },
+    ...overrides,
+  };
+}
+
+/** runCell deps that never touch disk or containers; records which runner fired. */
+function stubDeps(over: Partial<RunCellDeps> = {}): {
+  deps: RunCellDeps;
+  calls: { variant: number; sequence: number };
+} {
+  const calls = { variant: 0, sequence: 0 };
+  const deps: RunCellDeps = {
+    runVariant: async () => {
+      calls.variant++;
+      return makeArtifacts();
+    },
+    runSequence: async () => {
+      calls.sequence++;
+      return makeArtifacts();
+    },
+    judge: async () => makeResult(),
+    writeResult: async () => {},
+    ...over,
+  };
+  return { deps, calls };
+}
+
+test("runCell: a task WITH `steps` dispatches to runSequence, not runVariant", async () => {
+  const { deps, calls } = stubDeps();
+  const cell: CellArg = {
+    executorModel: "sonnet",
+    task: makeTask({ steps: [{ prompt: "s1" }, { prompt: "s2" }] }),
+    variant: NAKED,
+  };
+  await runCell(cell, false, PROGRESS(), "/tmp", deps);
+  assert.deepEqual(calls, { variant: 0, sequence: 1 });
+});
+
+test("runCell: a task WITHOUT `steps` dispatches to runVariant, not runSequence", async () => {
+  const { deps, calls } = stubDeps();
+  const cell: CellArg = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  await runCell(cell, false, PROGRESS(), "/tmp", deps);
+  assert.deepEqual(calls, { variant: 1, sequence: 0 });
+});
+
+test("runCell: attaches the anchor verdict when meta.anchor is present", async () => {
+  const anchor: AnchorResult = {
+    conventionHeld: true,
+    hitKnownTrap: false,
+    evidence: "held integer-cents",
+  };
+  let detectCalls = 0;
+  const { deps } = stubDeps({
+    detect: () => {
+      detectCalls++;
+      return anchor;
+    },
+  });
+  const cell: CellArg = {
+    executorModel: "sonnet",
+    task: makeTask({
+      steps: [{ prompt: "s1" }, { prompt: "s2" }],
+      anchor: { kind: "money-cents", correctConvention: "integer-cents", trapConvention: "decimal" },
+    }),
+    variant: NAKED,
+  };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+  assert.equal(detectCalls, 1);
+  assert.deepEqual(result.anchors, anchor);
+});
+
+test("runCell: no anchor is attached (or detector called) when meta.anchor is absent", async () => {
+  let detectCalls = 0;
+  const { deps } = stubDeps({
+    detect: () => {
+      detectCalls++;
+      return { conventionHeld: false, hitKnownTrap: false, evidence: "x" };
+    },
+  });
+  const cell: CellArg = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+  assert.equal(detectCalls, 0);
+  assert.equal(result.anchors, undefined);
 });

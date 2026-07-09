@@ -17,12 +17,14 @@ import { checkAuth } from "./docker.js";
 import { formatExecLine } from "./metrics.js";
 import { runPool } from "./pool.js";
 import { sleep } from "./retry.js";
-import { runVariantTask } from "./executor.js";
+import { runSequenceTask, runVariantTask } from "./executor.js";
+import { detectAnchor } from "./anchors.js";
 import { buildFailureResult, judgeRun, writeRunResult } from "./judge.js";
 import { regenerateReport, writeReport } from "./report.js";
 import { buildRunFolderName } from "./runmeta.js";
 import { parseVariantManifest } from "./variant.js";
-import type { Report, Task, TaskMeta, Variant, VariantTaskResult } from "./types.js";
+import { resolveWithin } from "./workspace.js";
+import type { Report, Task, TaskMeta, TaskStep, Variant, VariantTaskResult } from "./types.js";
 
 // --- Loaders ----------------------------------------------------------------
 
@@ -97,18 +99,56 @@ export function formatVariantListLine(v: Variant): string {
   return `  - ${v.name} [${v.type}]${desc}`;
 }
 
-async function loadTasks(): Promise<Task[]> {
-  const entries = await fs.readdir(TASKS_DIR, { withFileTypes: true });
+/**
+ * On-disk shape of a `meta.json` step entry: a task-dir-relative `file` ref,
+ * not the resolved prompt. loadTasks reads each `file` into the runtime
+ * {@link TaskStep}'s `prompt`, carrying `id`/`seedOverlay` through.
+ */
+interface TaskStepDto {
+  id?: string;
+  file: string;
+  seedOverlay?: string;
+}
+
+export async function loadTasks(tasksDir: string = TASKS_DIR): Promise<Task[]> {
+  const entries = await fs.readdir(tasksDir, { withFileTypes: true });
   const tasks: Task[] = [];
   for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (!e.isDirectory()) continue;
-    const dir = path.join(TASKS_DIR, e.name);
+    const dir = path.join(tasksDir, e.name);
     // Skip dirs that aren't a task yet (no meta.json) — mirrors loadVariants
     // skipping dirs without a CLAUDE.md, so an in-progress task dir doesn't
     // break the whole load. A malformed meta.json still throws (real error).
     const rawMeta = await fs.readFile(path.join(dir, "meta.json"), "utf8").catch(() => null);
     if (rawMeta === null) continue;
     const meta = JSON.parse(rawMeta) as TaskMeta;
+
+    // Sequence task: `meta.steps` present ⇒ resolve each step's `file`
+    // (task-dir-relative) into its prompt, carrying id/seedOverlay through, and
+    // write the resolved TaskStep[] back onto meta so runSequenceTask reads
+    // prompts. `steps` WINS over any task.md — the poison fixture ships a
+    // redundant one, which we deliberately ignore. Task.prompt is the FINAL
+    // step's prompt: the judge scores the final step, and judgeRun uses
+    // task.prompt as the task context, so it must see the final step's ask.
+    const rawSteps = (meta as { steps?: TaskStepDto[] }).steps;
+    if (rawSteps && rawSteps.length > 0) {
+      const steps: TaskStep[] = [];
+      for (const s of rawSteps) {
+        // Validate the task-controlled `file` ref stays inside the task dir —
+        // a malformed/hostile meta.json must not read arbitrary host files.
+        const prompt = await fs.readFile(resolveWithin(dir, s.file), "utf8");
+        steps.push({
+          prompt,
+          ...(s.id !== undefined ? { id: s.id } : {}),
+          ...(s.seedOverlay !== undefined ? { seedOverlay: s.seedOverlay } : {}),
+        });
+      }
+      meta.steps = steps;
+      tasks.push({ meta, dir, prompt: steps[steps.length - 1]!.prompt });
+      continue;
+    }
+
+    // Single-prompt task (no steps): today's behavior — task.md is required.
     const prompt = await fs.readFile(path.join(dir, "task.md"), "utf8");
     tasks.push({ meta, dir, prompt });
   }
@@ -314,12 +354,31 @@ interface Cell {
  *     as one contiguous block with a `[k/total]` progress header on completion,
  *     so concurrent cells don't interleave into noise.
  */
-async function runCell(
+/**
+ * Injectable seams for {@link runCell} (tests only; real deps default). Lets a
+ * unit test assert the sequence-vs-single dispatch branch and the anchor
+ * attachment without spawning containers or a real judge.
+ */
+export interface RunCellDeps {
+  runVariant?: typeof runVariantTask;
+  runSequence?: typeof runSequenceTask;
+  judge?: typeof judgeRun;
+  writeResult?: typeof writeRunResult;
+  detect?: typeof detectAnchor;
+}
+
+export async function runCell(
   cell: Cell,
   buffered: boolean,
   progress: { completed: number; total: number; started: number; running: number },
   runResultsDir: string,
+  deps: RunCellDeps = {},
 ): Promise<VariantTaskResult> {
+  const runVariant = deps.runVariant ?? runVariantTask;
+  const runSequence = deps.runSequence ?? runSequenceTask;
+  const judge = deps.judge ?? judgeRun;
+  const writeResult = deps.writeResult ?? writeRunResult;
+  const detect = deps.detect ?? detectAnchor;
   const label = `${cell.variant.name} × ${cell.task.meta.id} [${cell.executorModel}]`;
   const lines: string[] = [];
   const emit = (line: string) => {
@@ -337,7 +396,12 @@ async function runCell(
     console.error(`\n=== ${label} ===`);
   }
 
-  const artifacts = await runVariantTask(cell.variant, cell.task, cell.executorModel, runResultsDir);
+  // A task with resolved `steps` is a sequential-memory run: the same
+  // accumulating workspace is driven step-by-step and we score the FINAL step's
+  // artifacts. A stepless task takes today's single-shot path unchanged.
+  const artifacts = cell.task.meta.steps?.length
+    ? await runSequence(cell.variant, cell.task, cell.executorModel, runResultsDir)
+    : await runVariant(cell.variant, cell.task, cell.executorModel, runResultsDir);
   if (!artifacts.executorOk) {
     emit(`  executor: FAILED — ${artifacts.failureReason}`);
   } else {
@@ -351,12 +415,32 @@ async function runCell(
   // output) must not abort the matrix or discard prior results.
   let result: VariantTaskResult;
   try {
-    result = await judgeRun(artifacts, cell.task);
+    result = await judge(artifacts, cell.task);
   } catch (err) {
     result = buildFailureResult(artifacts, cell.task, { judge: (err as Error).message });
     emit(`  judge: FAILED — ${result.judgeFailure}`);
   }
-  await writeRunResult(cellDir, result);
+
+  // Deterministic anchor verdict (separate from the /100 score): when the task
+  // declares an anchor, mechanically read the FINAL-step diff for whether it
+  // held the required convention / hit the known trap, and attach it BEFORE
+  // persisting so it survives to disk and renders in the report.
+  //
+  // GATED on executorOk: a failed OR demoted cell must NOT get an anchor. In
+  // particular runSequenceTask demotes a cell to executorOk=false when a
+  // non-final (establish) step failed while leaving the final diff intact — so
+  // an ungated read here would score "✓ held" for a run where memory was never
+  // established. Skipping keeps that cell an honest coverage gap, not a lie.
+  const anchorConfig = cell.task.meta.anchor;
+  if (anchorConfig && artifacts.executorOk) {
+    result.anchors = detect(anchorConfig, {
+      diff: artifacts.diff,
+      metrics: artifacts.executorMetrics,
+      timedOut: artifacts.executorTimedOut,
+    });
+  }
+
+  await writeResult(cellDir, result);
   emit(`  judged: total ${result.total}/100  ${formatExecLine(result.metrics.executor)}`);
 
   if (buffered) {

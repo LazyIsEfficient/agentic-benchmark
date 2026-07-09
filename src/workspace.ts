@@ -77,9 +77,15 @@ export async function prepareWorkspace(
 
   // Copy seed files (if any) from tasks/<id>/ into the workspace. Both the read
   // source and the write destination are validated to stay inside their dirs.
+  // Seed files may be authored under a `seed/` prefix (e.g. `seed/src/cart.ts`)
+  // so the fixture's baseline sits in its own subdir; that prefix is a source-tree
+  // convention only and must be stripped from the DESTINATION so the file lands at
+  // the workspace root (`src/cart.ts`) where the agent works. Only a LEADING
+  // `seed/` is stripped — tasks whose paths have no such prefix are unchanged.
   for (const rel of task.meta.seedFiles ?? []) {
     const src = resolveWithin(task.dir, rel);
-    const dest = resolveWithin(workspaceDir, rel);
+    const destRel = rel.startsWith("seed/") ? rel.slice("seed/".length) : rel;
+    const dest = resolveWithin(workspaceDir, destRel);
     await fs.mkdir(path.dirname(dest), { recursive: true });
     await fs.copyFile(src, dest);
   }
@@ -109,6 +115,21 @@ export async function prepareWorkspace(
   await materializeVariant(variant, workspaceDir);
 
   return { cellId, cellDir, workspaceDir };
+}
+
+/**
+ * Stage and commit one sequential step's tracked work, then return the new HEAD
+ * SHA. `.claude/` (accumulating memory, and any bundle config) is excluded via
+ * .git/info/exclude, so memory is NEVER committed and persists on the bind mount
+ * between steps — that survival is the whole point of sequential-memory mode.
+ * --allow-empty so a no-op step still advances HEAD, giving the next step a real
+ * per-step baseline to diff against in isolation. Never re-run prepareWorkspace
+ * between steps: re-materializing the workspace would wipe the accumulated memory.
+ */
+export async function commitStep(workspaceDir: string, message: string): Promise<string> {
+  await git(workspaceDir, ["add", "-A"]);
+  await git(workspaceDir, ["commit", "-q", "--allow-empty", "-m", message]);
+  return (await git(workspaceDir, ["rev-parse", "HEAD"])).trim();
 }
 
 /**

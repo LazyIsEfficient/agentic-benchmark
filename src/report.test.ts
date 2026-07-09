@@ -6,9 +6,12 @@ import { test } from "node:test";
 import {
   aggregateByVariant,
   aggregateMetrics,
+  buildMemoryEffect,
+  buildReportJson,
   distinctModels,
   excludedReasonOf,
   formatScore,
+  hasMemoryEffect,
   isScored,
   orderResultsForDetail,
   rankVariants,
@@ -17,6 +20,7 @@ import {
   renderCrossModelTable,
   renderExcludedCells,
   renderMatrix,
+  renderMemoryEffect,
   renderPerModelMatrices,
   renderReportMarkdown,
   renderRunMetrics,
@@ -490,6 +494,126 @@ test("renderBehaviorComparison groups by task; with-behavior shows counts, witho
   // zero sub-agents renders "0" (not "0 ()").
   const t2Block = md.slice(md.indexOf("### Task: `t2`"));
   assert.match(t2Block, /\| alpha \| 0 \| 12 \|/);
+  assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+// --- Memory effect (deterministic anchor readout) ---------------------------
+
+import type { AnchorResult } from "./types.js";
+
+function anchored(
+  variant: string,
+  taskId: string,
+  anchors: AnchorResult,
+  extra: Partial<VariantTaskResult> = {},
+): VariantTaskResult {
+  return result(
+    variant,
+    taskId,
+    { codeQuality: 20, testingCoverage: 30, securityQuality: 15, documentation: 5 }, // 70
+    { anchors, ...extra },
+  );
+}
+
+// One bundle helped on the "helping" task, hurt on the "poison" task — the whole
+// point of the section is making that contrast legible.
+const helpHeld = anchored("gstack", "memory-cents", {
+  conventionHeld: true,
+  turnsToGreen: 2,
+  hitKnownTrap: false,
+  evidence: "apply step emitted integer cents (subtotal * 100)",
+});
+const poisonTrap = anchored("gstack", "memory-cents-stale", {
+  conventionHeld: false,
+  hitKnownTrap: true,
+  evidence: "reused stale integer-cents memory against migrated Decimal code",
+});
+
+test("hasMemoryEffect: true iff some result carries .anchors", () => {
+  assert.equal(hasMemoryEffect([helpHeld, poisonTrap]), true);
+  assert.equal(hasMemoryEffect([a, b]), false); // single-shot fixtures, no anchors
+});
+
+test("renderMemoryEffect leads with a per-bundle contrast pivot + per-task detail", () => {
+  const md = renderMemoryEffect([helpHeld, poisonTrap]);
+  // Pivot: one row per bundle, one column per anchored task.
+  assert.match(md, /\| Variant \| `memory-cents` \| `memory-cents-stale` \|/);
+  assert.match(md, /\| gstack \| ✓ held \(2 turns\) \| ✗ hit trap \|/);
+  // Per-task detail carries conventionHeld / turns / trap / evidence + secondary score.
+  assert.match(md, /### Task: `memory-cents`/);
+  assert.match(md, /### Task: `memory-cents-stale`/);
+  assert.match(md, /Convention held \| Turns to green \| Hit known trap \| Score \/100 \| Evidence/);
+  assert.match(md, /apply step emitted integer cents/);
+  assert.match(md, /reused stale integer-cents memory/);
+  assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+test("renderReportMarkdown surfaces MEMORY EFFECT for sequence runs and buildReportJson structures it", () => {
+  const report: Report = {
+    runId: "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    generatedAt: "2026-07-08T00:00:00.000Z",
+    taskId: "memory-cents,memory-cents-stale",
+    taskTitle: "Sequential memory",
+    executorModels: ["sonnet"],
+    judgeModel: "opus",
+    results: [helpHeld, poisonTrap],
+  };
+  const md = renderReportMarkdown(report);
+  assert.match(md, /## Memory effect \(not scored\)/);
+  // Leads: the section appears before the /100 score matrix.
+  assert.ok(md.indexOf("## Memory effect") < md.indexOf("## Score matrix"));
+
+  const json = buildReportJson(report) as {
+    memoryEffect: {
+      tasks: string[];
+      cells: Array<{
+        taskId: string;
+        conventionHeld: boolean;
+        turnsToGreen: number | null;
+        hitKnownTrap: boolean;
+        total: number | null;
+      }>;
+    };
+  };
+  assert.deepEqual(json.memoryEffect.tasks, ["memory-cents", "memory-cents-stale"]);
+  const help = json.memoryEffect.cells.find((c) => c.taskId === "memory-cents")!;
+  assert.equal(help.conventionHeld, true);
+  assert.equal(help.turnsToGreen, 2);
+  assert.equal(help.hitKnownTrap, false);
+  assert.equal(help.total, 70); // /100 preserved as secondary context
+  const poison = json.memoryEffect.cells.find((c) => c.taskId === "memory-cents-stale")!;
+  assert.equal(poison.conventionHeld, false);
+  assert.equal(poison.turnsToGreen, null); // never turned green
+  assert.equal(poison.hitKnownTrap, true);
+});
+
+test("single-shot report: NO Memory effect section, json has no memoryEffect key", () => {
+  const report: Report = {
+    runId: "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    generatedAt: "2026-07-07T00:00:00.000Z",
+    taskId: "t1,t2",
+    taskTitle: "Tasks",
+    executorModels: ["sonnet"],
+    judgeModel: "opus",
+    results: multi, // no .anchors anywhere
+  };
+  const md = renderReportMarkdown(report);
+  assert.doesNotMatch(md, /Memory effect/);
+  assert.equal(buildMemoryEffect(multi), undefined);
+  const json = buildReportJson(report) as Record<string, unknown>;
+  assert.ok(!("memoryEffect" in json));
+});
+
+test("renderMemoryEffect: undefined turnsToGreen renders as — without throwing", () => {
+  const noTurns = anchored("gstack", "memory-cents", {
+    conventionHeld: false,
+    hitKnownTrap: false,
+    evidence: "never reached the convention",
+  }); // turnsToGreen omitted
+  const md = renderMemoryEffect([noTurns]);
+  assert.match(md, /### Task: `memory-cents`/);
+  // Detail row's Turns column shows an em dash, not "undefined".
+  assert.match(md, /\| gstack \| ✗ \| — \| no \|/);
   assert.doesNotMatch(md, /undefined|NaN/);
 });
 
