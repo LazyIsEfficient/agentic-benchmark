@@ -1,0 +1,7 @@
+# Force textual diffs for source/text files. Git's binary heuristic otherwise
+# trips on files with a high concentration of non-ASCII glyphs (e.g. the
+# ✓/✗/box-drawing characters in the report renderer), hiding real diffs.
+*.ts   text diff
+*.js   text diff
+*.json text diff
+*.md   text diff
