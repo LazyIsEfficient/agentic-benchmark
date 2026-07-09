@@ -303,5 +303,6 @@ export function scoreRun(
     },
     // Executor metrics are always available; the judge's are attached by judgeRun.
     metrics: { executor: artifacts.executorMetrics },
+    ...(artifacts.behavior ? { behavior: artifacts.behavior } : {}),
   };
 }

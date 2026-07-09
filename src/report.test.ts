@@ -13,6 +13,7 @@ import {
   orderResultsForDetail,
   rankVariants,
   regenerateReport,
+  renderBehaviorComparison,
   renderCrossModelTable,
   renderExcludedCells,
   renderMatrix,
@@ -22,7 +23,7 @@ import {
   renderStrengthsWeaknesses,
   renderVariantDetail,
 } from "./report.js";
-import type { Report, RunMetrics, VariantTaskResult } from "./types.js";
+import type { Behavior, Report, RunMetrics, VariantTaskResult } from "./types.js";
 
 function result(
   variant: string,
@@ -439,6 +440,57 @@ test("renderExcludedCells: lists each excluded (variant, model, task) with reaso
   const timedOut = result("good", "t2", { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 }, { executorFailure: "Executor timed out and the container was killed." });
   assert.match(renderExcludedCells([good, timedOut]), /`good` × `t2` \[sonnet\] — excluded: Executor timed out/);
   assert.match(renderExcludedCells([good]), /None — every attempted cell/);
+});
+
+// --- Behavioral signals -----------------------------------------------------
+
+function behavior(extra: Partial<Behavior> = {}): Behavior {
+  return {
+    subAgents: {
+      count: 3,
+      byType: { engineer: 2, "code-reviewer": 1 },
+      dispatches: [{ type: "engineer" }, { type: "engineer" }, { type: "code-reviewer" }],
+    },
+    toolCalls: { total: 12, byName: { Agent: 3, Bash: 5, Read: 4 } },
+    changedFileShape: { source: 2, test: 1, docs: 0, linesAdded: 120, linesRemoved: 8 },
+    touchedFiles: ["src/a.ts", "src/b.ts", "src/a.test.ts"],
+    diffHash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    testCasesAdded: 4,
+    ...extra,
+  };
+}
+
+test("renderBehaviorComparison groups by task; with-behavior shows counts, without shows —", () => {
+  const withB = result(
+    "alpha",
+    "t1",
+    { codeQuality: 25, testingCoverage: 35, securityQuality: 18, documentation: 8 },
+    { behavior: behavior() },
+  );
+  const withoutB = result("bravo", "t1", {
+    codeQuality: 15, testingCoverage: 10, securityQuality: 8, documentation: 2,
+  }); // no behavior
+  const otherTask = result(
+    "alpha",
+    "t2",
+    { codeQuality: 20, testingCoverage: 30, securityQuality: 15, documentation: 5 },
+    { behavior: behavior({ subAgents: { count: 0, byType: {}, dispatches: [] } }) },
+  );
+
+  const md = renderBehaviorComparison([withB, withoutB, otherTask]);
+
+  // Grouped per task.
+  assert.match(md, /### Task: `t1`/);
+  assert.match(md, /### Task: `t2`/);
+
+  // with-behavior row: sub-agent count + types, tool calls, file shape, LOC, tests, hash prefix.
+  assert.match(md, /\| alpha \| 3 \(engineer, code-reviewer\) \| 12 \| 2\/1\/0 \| \+120\/-8 \| 4 \| `abcdef01` \|/);
+  // without-behavior row: all em dashes.
+  assert.match(md, /\| bravo \| — \| — \| — \| — \| — \| — \|/);
+  // zero sub-agents renders "0" (not "0 ()").
+  const t2Block = md.slice(md.indexOf("### Task: `t2`"));
+  assert.match(t2Block, /\| alpha \| 0 \| 12 \|/);
+  assert.doesNotMatch(md, /undefined|NaN/);
 });
 
 // --- --report regenerate (offline) ------------------------------------------

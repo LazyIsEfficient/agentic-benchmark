@@ -104,9 +104,51 @@ export interface ChangedFile {
   kind: FileKind;
 }
 
+/** One sub-agent dispatch observed in the trace (an `Agent` tool_use block). */
+export interface SubAgentDispatch {
+  /** The `subagent_type` (enum-like, safe to persist verbatim). */
+  type: string;
+  /** The free-text `description` label — REDACTED before persistence. */
+  description?: string;
+}
+
 /**
- * Token usage from the claude result event. Ground-truth cost signal on a
- * subscription (where total_cost_usd is only a would-be-API proxy).
+ * Observed behavioral signals for one executor run — what the run actually
+ * *did*, independent of its score. Computed at capture time from the raw NDJSON
+ * trace + the redacted diff, then stored on the result so it regenerates. Never
+ * scored: purely observational, to prove that different CLAUDE.md variants
+ * produce genuinely different behavior.
+ */
+export interface Behavior {
+  /** Sub-agent dispatches (Agent tool_use blocks): total, per-type, and the list. */
+  subAgents: {
+    count: number;
+    byType: Record<string, number>;
+    dispatches: SubAgentDispatch[];
+  };
+  /** Every tool_use block: total count and per-tool-name breakdown. */
+  toolCalls: { total: number; byName: Record<string, number> };
+  /** File-kind counts plus diff line churn (parsed from the unified diff). */
+  changedFileShape: {
+    source: number;
+    test: number;
+    docs: number;
+    linesAdded: number;
+    linesRemoved: number;
+  };
+  /** The actual set of changed paths (from changedFiles). */
+  touchedFiles: string[];
+  /** sha256 hex of the (redacted) diff.patch content — a content fingerprint. */
+  diffHash: string;
+  /** Count of added `it()`/`test()` calls inside test-file hunks. */
+  testCasesAdded: number;
+}
+
+/**
+ * Token usage for one claude call. Prefer full-session `modelUsage` totals
+ * (main agent + subagents) when present; otherwise last-turn `usage`.
+ * Ground-truth cost signal on a subscription (where total_cost_usd is only a
+ * would-be-API proxy).
  */
 export interface ClaudeUsage {
   inputTokens: number;
@@ -161,6 +203,8 @@ export interface RunArtifacts {
   executorTimedOut: boolean;
   /** Populated when executorOk is false. */
   failureReason?: string;
+  /** Observed behavioral signals derived from the trace + diff (never scored). */
+  behavior?: Behavior;
 }
 
 /** One dimension's score plus the judge's justification. */
@@ -234,6 +278,12 @@ export interface VariantTaskResult {
   };
   /** Observed cost/time KPIs for this run. Never scored. */
   metrics: RunMetrics;
+  /**
+   * Observed behavioral signals (sub-agent usage, tool calls, diff shape).
+   * Optional for backward-compat: results in old report.json files lack it and
+   * degrade to `—` in the behavior comparison table.
+   */
+  behavior?: Behavior;
   /** Set when the executor failed; the run is scored as zero. */
   executorFailure?: string;
   /** Set when the judge failed (container error, timeout, or bad output). */
