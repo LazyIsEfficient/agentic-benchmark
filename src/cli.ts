@@ -17,14 +17,25 @@ import { checkAuth } from "./docker.js";
 import { formatExecLine } from "./metrics.js";
 import { runPool } from "./pool.js";
 import { sleep } from "./retry.js";
-import { runSequenceTask, runVariantTask } from "./executor.js";
+import { runCampaign, runSequenceTask, runVariantTask } from "./executor.js";
 import { detectAnchor } from "./anchors.js";
 import { buildFailureResult, judgeRun, writeRunResult } from "./judge.js";
 import { regenerateReport, writeReport } from "./report.js";
 import { buildRunFolderName } from "./runmeta.js";
 import { parseVariantManifest } from "./variant.js";
 import { resolveWithin } from "./workspace.js";
-import type { Report, Task, TaskMeta, TaskStep, Variant, VariantTaskResult } from "./types.js";
+import type {
+  AnchorConfig,
+  CampaignResult,
+  CampaignTask,
+  CampaignTaskResult,
+  Report,
+  Task,
+  TaskMeta,
+  TaskStep,
+  Variant,
+  VariantTaskResult,
+} from "./types.js";
 
 // --- Loaders ----------------------------------------------------------------
 
@@ -110,6 +121,18 @@ interface TaskStepDto {
   seedOverlay?: string;
 }
 
+/**
+ * On-disk shape of a `meta.json` campaign entry: a task-dir-relative `file` ref
+ * (not the resolved prompt), plus the link's `id` and optional deterministic
+ * `anchor`. loadTasks reads each `file` into the runtime {@link CampaignTask}'s
+ * `prompt`, carrying `id`/`anchor` through. Mirrors {@link TaskStepDto}.
+ */
+interface CampaignTaskDto {
+  id?: string;
+  file: string;
+  anchor?: AnchorConfig;
+}
+
 export async function loadTasks(tasksDir: string = TASKS_DIR): Promise<Task[]> {
   const entries = await fs.readdir(tasksDir, { withFileTypes: true });
   const tasks: Task[] = [];
@@ -122,6 +145,15 @@ export async function loadTasks(tasksDir: string = TASKS_DIR): Promise<Task[]> {
     const rawMeta = await fs.readFile(path.join(dir, "meta.json"), "utf8").catch(() => null);
     if (rawMeta === null) continue;
     const meta = JSON.parse(rawMeta) as TaskMeta;
+
+    // `steps` (sequence) and `campaign` (longitudinal) are mutually exclusive
+    // modes. Declaring both is a misconfig: the `steps` branch would win and leave
+    // `meta.campaign` as raw DTOs (no resolved prompts) that main() then mis-routes
+    // into the campaign lane with undefined prompts. Fail loud at load instead.
+    const mAny = meta as { steps?: unknown[]; campaign?: unknown[] };
+    if (mAny.steps?.length && mAny.campaign?.length) {
+      throw new Error(`Task "${meta.id}": a task cannot declare both "steps" and "campaign".`);
+    }
 
     // Sequence task: `meta.steps` present ⇒ resolve each step's `file`
     // (task-dir-relative) into its prompt, carrying id/seedOverlay through, and
@@ -158,6 +190,31 @@ export async function loadTasks(tasksDir: string = TASKS_DIR): Promise<Task[]> {
       }
 
       tasks.push({ meta, dir, prompt: steps[steps.length - 1]!.prompt });
+      continue;
+    }
+
+    // Campaign task: `meta.campaign` present ⇒ resolve each link's `file`
+    // (task-dir-relative) into its prompt, carrying id/anchor through, and write
+    // the resolved CampaignTask[] back onto meta so runCampaign reads prompts.
+    // `campaign` WINS over any redundant task.md (loader-safety) — the fixture
+    // ships one deliberately, which we ignore, exactly as `steps` does. Task.prompt
+    // is the FIRST link's prompt: any valid prompt suffices since each link carries
+    // its own and the CLI judges every link against ITS own ask, not Task.prompt.
+    const rawCampaign = (meta as { campaign?: CampaignTaskDto[] }).campaign;
+    if (rawCampaign && rawCampaign.length > 0) {
+      const campaign: CampaignTask[] = [];
+      for (const c of rawCampaign) {
+        // Validate the task-controlled `file` ref stays inside the task dir —
+        // a malformed/hostile meta.json must not read arbitrary host files.
+        const prompt = await fs.readFile(resolveWithin(dir, c.file), "utf8");
+        campaign.push({
+          prompt,
+          ...(c.id !== undefined ? { id: c.id } : {}),
+          ...(c.anchor !== undefined ? { anchor: c.anchor } : {}),
+        });
+      }
+      meta.campaign = campaign;
+      tasks.push({ meta, dir, prompt: campaign[0]!.prompt });
       continue;
     }
 
@@ -490,6 +547,103 @@ export async function runCell(
   return result;
 }
 
+/**
+ * Injectable seams for {@link runCampaignCell} (tests only; real deps default).
+ * Lets a unit test drive the per-link judge + anchor + assemble logic with a fake
+ * chain runner, so no containers, no real judge, and no fs are touched.
+ */
+export interface RunCampaignDeps {
+  campaign?: typeof runCampaign;
+  judge?: typeof judgeRun;
+  detect?: typeof detectAnchor;
+}
+
+/**
+ * Run ONE campaign cell: drive the whole `runCampaign` chain in a single
+ * persistent workspace, then judge AND anchor EACH link independently, assembling
+ * the ordered per-link {@link CampaignTaskResult}s into one {@link CampaignResult}.
+ *
+ * Unlike {@link runCell} (one scored task) a campaign scores every link against
+ * ITS OWN ask: the judge sees `{ ...task, prompt: <that link's prompt> }` so the
+ * /100 reflects the link, not the chain. The deterministic anchor is computed only
+ * when the link declares one AND its executor succeeded — GATED on `executorOk`
+ * exactly like {@link runCell}, so a failed/empty-diff link never scores "held".
+ * Campaign anchors are `rule`-kind (diff-based), so no NDJSON trace is threaded.
+ *
+ * Never throws: a judge failure on ONE link is captured into that link's `failure`
+ * and the chain continues — one bad link must not abort the campaign or the matrix.
+ */
+export async function runCampaignCell(
+  cell: Cell,
+  runResultsDir: string,
+  deps: RunCampaignDeps = {},
+): Promise<CampaignResult> {
+  const runChain = deps.campaign ?? runCampaign;
+  const judge = deps.judge ?? judgeRun;
+  const detect = deps.detect ?? detectAnchor;
+  const label = `${cell.variant.name} × ${cell.task.meta.id} [${cell.executorModel}]`;
+  console.error(`\n=== campaign ${label} ===`);
+
+  const links = await runChain(cell.variant, cell.task, cell.executorModel, runResultsDir);
+  const campaignLinks = cell.task.meta.campaign ?? [];
+
+  const tasks: CampaignTaskResult[] = [];
+  for (const link of links) {
+    // The runner returns artifacts + identity per link, in chain order; the link's
+    // prompt and anchor live on the resolved campaign meta at the same index.
+    const linkMeta = campaignLinks[link.index];
+    const linkTask: Task = { ...cell.task, prompt: linkMeta?.prompt ?? cell.task.prompt };
+
+    // A single judge failure (container error, timeout, malformed output) must not
+    // abort the campaign — capture it into an all-zero failure result and proceed.
+    let result: VariantTaskResult;
+    try {
+      result = await judge(link.artifacts, linkTask);
+    } catch (err) {
+      result = buildFailureResult(link.artifacts, linkTask, { judge: (err as Error).message });
+    }
+
+    // Deterministic anchor verdict, GATED on executorOk (a failed link's empty
+    // diff must not read as "held"). Skip entirely when the link has no anchor.
+    const anchorConfig = linkMeta?.anchor;
+    if (anchorConfig && link.artifacts.executorOk) {
+      result.anchors = detect(anchorConfig, {
+        diff: link.artifacts.diff,
+        metrics: link.artifacts.executorMetrics,
+        timedOut: link.artifacts.executorTimedOut,
+      });
+    }
+
+    // A link is scored iff neither the executor nor the judge failed; otherwise the
+    // link carries `failure` and no score (never a fabricated 0). The anchor verdict
+    // is independent of the score, so it survives a judge failure.
+    const failure = result.executorFailure ?? result.judgeFailure;
+    const taskResult: CampaignTaskResult = {
+      taskId: link.campaignTaskId,
+      index: link.index,
+      metrics: link.artifacts.executorMetrics,
+      ...(failure === undefined ? { score: result.total } : { failure }),
+      ...(result.anchors ? { anchors: result.anchors } : {}),
+    };
+    tasks.push(taskResult);
+
+    const anchorNote = result.anchors
+      ? `, anchor ${result.anchors.conventionHeld ? "held" : "broken"}`
+      : "";
+    console.error(
+      `  task ${link.index + 1}/${links.length} (${link.campaignTaskId}): ` +
+        (failure ? `FAILED — ${failure}` : `score ${result.total}/100${anchorNote}`),
+    );
+  }
+
+  return {
+    variant: cell.variant.name,
+    executorModel: cell.executorModel,
+    campaignId: cell.task.meta.id,
+    tasks,
+  };
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
@@ -557,12 +711,17 @@ async function main(): Promise<void> {
 
   // The matrix is a flat set of cells in executorModel → task → variant order.
   // The judge model is held FIXED so scores stay comparable across executor
-  // models. Each cell is resource-heavy and spends quota.
+  // models. Each cell is resource-heavy and spends quota. Campaign tasks route to
+  // a SEPARATE lane: each (variant × campaign × model) runs the whole chain in one
+  // persistent workspace and assembles a CampaignResult, not a per-cell score.
   const cells: Cell[] = [];
+  const campaignCells: Cell[] = [];
   for (const executorModel of executorModels) {
     for (const task of selectedTasks) {
       for (const variant of selectedVariants) {
-        cells.push({ executorModel, task, variant });
+        const cell: Cell = { executorModel, task, variant };
+        if (task.meta.campaign?.length) campaignCells.push(cell);
+        else cells.push(cell);
       }
     }
   }
@@ -612,6 +771,27 @@ async function main(): Promise<void> {
       a.taskId.localeCompare(b.taskId),
   );
   report.results = results;
+
+  // Campaign lane: each chain runs sequentially in its own persistent workspace
+  // (memory must accumulate across links, so no cross-campaign parallelism here).
+  // One failed link never aborts the campaign or the run — runCampaignCell absorbs
+  // it into that link's result.
+  if (campaignCells.length > 0) {
+    const campaigns: CampaignResult[] = [];
+    for (const cell of campaignCells) {
+      // Absorb a thrown campaign cell exactly like the pooled lane does: a
+      // prepare/git/fs throw must not propagate past here and discard the
+      // already-computed, quota-expensive report.results before writeReport runs.
+      try {
+        campaigns.push(await runCampaignCell(cell, runResultsDir));
+      } catch (err) {
+        console.error(
+          `Campaign cell ${cell.variant.name} × ${cell.task.meta.id} failed unexpectedly: ${(err as Error).message}`,
+        );
+      }
+    }
+    report.campaigns = campaigns;
+  }
 
   const { jsonPath, mdPath } = await writeReport(report, runDir);
   console.error(`\nReport written:\n  ${mdPath}\n  ${jsonPath}`);

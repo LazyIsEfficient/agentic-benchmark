@@ -5,6 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 import {
   needsSetupPreStep,
+  runCampaign,
   runSequenceTask,
   runSetupPreStep,
   runWithExecutorRetry,
@@ -375,6 +376,191 @@ test("runSequenceTask: a sequence with no steps degrades to a failed cell", asyn
     assert.equal(res.executorOk, false);
     assert.match(res.failureReason ?? "", /no steps/);
     assert.equal(executorCalls, 0, "no step ⇒ executor never invoked");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- Longitudinal-campaign mode ---------------------------------------------
+//
+// A campaign is a chain of N INDEPENDENTLY-JUDGED links sharing ONE workspace so
+// `.claude/memory/` compounds across the whole chain. The runner returns EVERY
+// link's artifacts (not just the last), and continues past a mid-chain failure.
+
+test("runCampaign: memory compounds across the chain; per-link diffs are isolated; one entry per link", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "bench-camp-"));
+  const runResultsDir = path.join(root, "results");
+  const taskDir = path.join(root, "task");
+  await fs.mkdir(runResultsDir, { recursive: true });
+  await fs.mkdir(taskDir, { recursive: true });
+
+  const variant: Variant = { name: "cm", type: "claude-md", content: "# doctrine" };
+  const task: Task = {
+    dir: taskDir,
+    prompt: "unused for a campaign task",
+    meta: {
+      id: "camptask",
+      title: "Campaign",
+      logicBearing: true,
+      securityRelevant: false,
+      campaign: [
+        { prompt: "link one", id: "one" },
+        { prompt: "link two", id: "two" },
+        { prompt: "link three", id: "three" },
+      ],
+    },
+  };
+
+  let prepareCalls = 0;
+  const prepare: typeof prepareWorkspace = async (...a) => {
+    prepareCalls++;
+    return prepareWorkspace(...a);
+  };
+
+  // The fake executor mutates the bind-mounted workspace directly, as the real
+  // agent would. Link 1 writes memory + a tracked file; link 3 must READ the
+  // memory link 1 wrote — proving it survived two fresh executor contexts.
+  let link3SawMemory = false;
+  let memoryAtLink3 = "";
+  const fakeExecutor: ExecutorRunner = async ({ workspaceDir, taskPrompt, onStdout }) => {
+    onStdout?.('{"type":"result","subtype":"success"}\n');
+    if (taskPrompt === "link one") {
+      await fs.mkdir(path.join(workspaceDir, ".claude", "memory"), { recursive: true });
+      await fs.writeFile(
+        path.join(workspaceDir, ".claude", "memory", "note.md"),
+        "remember: prices are integer cents",
+      );
+      await fs.mkdir(path.join(workspaceDir, "src"), { recursive: true });
+      await fs.writeFile(path.join(workspaceDir, "src", "link1.ts"), "export const a = 1;\n");
+    } else if (taskPrompt === "link two") {
+      await fs.writeFile(path.join(workspaceDir, "src", "link2.ts"), "export const b = 2;\n");
+    } else {
+      memoryAtLink3 = await fs
+        .readFile(path.join(workspaceDir, ".claude", "memory", "note.md"), "utf8")
+        .catch(() => "");
+      link3SawMemory = memoryAtLink3.length > 0;
+      await fs.writeFile(path.join(workspaceDir, "src", "link3.ts"), "export const c = 3;\n");
+    }
+    return fakeResult({ stdout: "" });
+  };
+
+  try {
+    const results = await runCampaign(variant, task, "sonnet", runResultsDir, {
+      prepare,
+      runExecutorFn: fakeExecutor,
+    });
+
+    // prepareWorkspace ran exactly once across the whole chain.
+    assert.equal(prepareCalls, 1, "prepareWorkspace must run exactly once");
+
+    // One artifacts entry per link, in chain order, tagged with its identity.
+    assert.equal(results.length, 3, "one entry per campaign link");
+    assert.deepEqual(
+      results.map((r) => [r.index, r.campaignTaskId]),
+      [
+        [0, "one"],
+        [1, "two"],
+        [2, "three"],
+      ],
+    );
+    assert.ok(results.every((r) => r.artifacts.executorOk), "every link succeeded");
+
+    // Memory written in link 1 was readable in link 3's fresh context.
+    assert.equal(link3SawMemory, true, "link 3 must read link 1's .claude/memory/note.md");
+    assert.match(memoryAtLink3, /integer cents/);
+
+    const cellDir = path.join(runResultsDir, "camptask__cm__sonnet");
+    const workspaceDir = path.join(cellDir, "workspace");
+
+    // Per-link diff isolation: link 2's captured diff carries only link 2's work,
+    // never link 1's already-committed source change.
+    assert.match(results[1]!.artifacts.diff, /link2\.ts/, "link 2 diff has link 2's file");
+    assert.doesNotMatch(
+      results[1]!.artifacts.diff,
+      /link1\.ts/,
+      "link 2 diff must NOT re-contain link 1's committed file",
+    );
+
+    // Memory is in NO captured diff...
+    for (const r of results) {
+      assert.doesNotMatch(r.artifacts.diff, /note\.md/, "memory must never appear in a diff");
+    }
+    // ...it is never tracked by git...
+    const tracked = await git(workspaceDir, ["ls-files"]);
+    assert.doesNotMatch(tracked, /\.claude/, "memory must not be tracked by git");
+    // ...yet it IS present on disk for later links to read.
+    const onDisk = await fs.readFile(
+      path.join(workspaceDir, ".claude", "memory", "note.md"),
+      "utf8",
+    );
+    assert.match(onDisk, /integer cents/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runCampaign: a mid-chain executor failure is captured AND the later link still runs", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "bench-camp-fail-"));
+  const runResultsDir = path.join(root, "results");
+  const taskDir = path.join(root, "task");
+  await fs.mkdir(runResultsDir, { recursive: true });
+  await fs.mkdir(taskDir, { recursive: true });
+
+  const variant: Variant = { name: "cm", type: "claude-md", content: "" };
+  const task: Task = {
+    dir: taskDir,
+    prompt: "unused",
+    meta: {
+      id: "campfail",
+      title: "CampaignFail",
+      logicBearing: true,
+      securityRelevant: false,
+      campaign: [
+        { prompt: "first", id: "first" },
+        { prompt: "middle", id: "middle" },
+        { prompt: "last", id: "last" },
+      ],
+    },
+  };
+
+  let lastLinkRan = false;
+  const fakeExecutor: ExecutorRunner = async ({ workspaceDir, taskPrompt, onStdout }) => {
+    onStdout?.('{"type":"result","subtype":"success"}\n');
+    if (taskPrompt === "first") {
+      await fs.mkdir(path.join(workspaceDir, "src"), { recursive: true });
+      await fs.writeFile(path.join(workspaceDir, "src", "first.ts"), "export const a = 1;\n");
+      return fakeResult();
+    }
+    if (taskPrompt === "middle") {
+      // The middle link's executor exits non-zero → a failed entry.
+      return fakeResult({ exitCode: 1, stderr: "boom" });
+    }
+    lastLinkRan = true;
+    await fs.writeFile(path.join(workspaceDir, "src", "last.ts"), "export const c = 3;\n");
+    return fakeResult();
+  };
+
+  try {
+    const results = await runCampaign(variant, task, "sonnet", runResultsDir, {
+      runExecutorFn: fakeExecutor,
+    });
+
+    assert.equal(results.length, 3, "every link yields an entry, even the failed one");
+
+    // First link succeeded; its result is NOT lost by the later failure.
+    assert.equal(results[0]!.artifacts.executorOk, true);
+    assert.match(results[0]!.artifacts.diff, /first\.ts/);
+
+    // Middle link is a failed entry.
+    assert.equal(results[1]!.campaignTaskId, "middle");
+    assert.equal(results[1]!.artifacts.executorOk, false, "middle link recorded as failed");
+    assert.match(results[1]!.artifacts.failureReason ?? "", /exited with code 1/);
+
+    // The chain PROCEEDED: the last link still ran and was captured.
+    assert.equal(lastLinkRan, true, "chain must continue past a mid-chain failure");
+    assert.equal(results[2]!.artifacts.executorOk, true);
+    assert.match(results[2]!.artifacts.diff, /last\.ts/);
+    assert.doesNotMatch(results[2]!.artifacts.diff, /first\.ts/, "last link diff is isolated");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

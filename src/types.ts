@@ -162,13 +162,69 @@ export interface RegistryAnchor {
 }
 
 /**
+ * Anchor for the generic rule scenario — the least scenario-specific member,
+ * intended for campaign tasks whose "did the memory hold?" test is simply the
+ * presence/absence of textual signals in the task's diff. Both fields are regex
+ * SOURCE strings compiled against the unified diff:
+ * - `required` — every pattern MUST be present for the convention to hold.
+ * - `forbidden` — no pattern may be present (each is a trap signal).
+ * The convention is HELD iff all `required` match AND no `forbidden` matches; an
+ * empty/omitted `required` is vacuously satisfied. Unlike {@link RegistryAnchor}
+ * (a single required post-image path) this expresses an arbitrary conjunction of
+ * must-appear / must-not-appear signals without a dedicated detector shape.
+ */
+export interface RuleAnchor {
+  /** Discriminant. */
+  kind: "rule";
+  /** Optional human-readable label for the rule (e.g. "uses shared logger"). */
+  label?: string;
+  /** Regex sources that must ALL match the diff for the rule to hold. */
+  required?: string[];
+  /** Regex sources that must NOT match the diff (each is a trap). */
+  forbidden?: string[];
+  /**
+   * Step `id` the anchor is evaluated against (default: the last step). Shared
+   * with the other {@link AnchorConfig} members so generic consumers can read
+   * `anchor.evaluatedStepId` without narrowing by `kind`.
+   */
+  evaluatedStepId?: string;
+}
+
+/**
  * Deterministic anchor configuration for a task — a discriminated union keyed by
  * `kind` so future anchor scenarios add a new member without touching existing
- * consumers: {@link MoneyCentsAnchor} (re-derivable convention), plus two whose
+ * consumers: {@link MoneyCentsAnchor} (re-derivable convention), plus those whose
  * knowledge is NOT re-derivable from code — {@link SetupGotchaAnchor} (a runtime
- * gotcha) and {@link RegistryAnchor} (an arbitrary registry rule).
+ * gotcha), {@link RegistryAnchor} (an arbitrary registry rule), and
+ * {@link RuleAnchor} (an arbitrary required/forbidden diff-signal conjunction).
  */
-export type AnchorConfig = MoneyCentsAnchor | SetupGotchaAnchor | RegistryAnchor;
+export type AnchorConfig =
+  | MoneyCentsAnchor
+  | SetupGotchaAnchor
+  | RegistryAnchor
+  | RuleAnchor;
+
+/**
+ * One task in a longitudinal CAMPAIGN — a chain of N related tasks run in one
+ * persistent workspace so that memory formed by an earlier task can compound
+ * into a later one. This is the RUNTIME shape the runner consumes: `prompt` is
+ * the fully-resolved text handed to the executor when this link's turn comes.
+ * (The on-disk meta.json DTO instead carries `{ id, file, anchor? }`; the loader
+ * reads `file` and resolves it to `prompt`.) Distinct from {@link TaskStep}:
+ * campaign links are independently JUDGED and ANCHORED, whereas steps are turns
+ * of a single scored task.
+ */
+export interface CampaignTask {
+  /** Optional human-readable label for this link (defaults to its index). */
+  id?: string;
+  /** The resolved prompt handed to the executor for this link. */
+  prompt: string;
+  /**
+   * Deterministic anchor for this link — a convention its diff must hold. When
+   * absent, no anchor verdict is computed for the link.
+   */
+  anchor?: AnchorConfig;
+}
 
 /** Task metadata from tasks/<id>/meta.json. */
 export interface TaskMeta {
@@ -197,6 +253,14 @@ export interface TaskMeta {
    * When absent, no anchor verdict is computed (today's default).
    */
   anchor?: AnchorConfig;
+  /**
+   * Ordered links of a longitudinal campaign — a chain of related tasks run in
+   * one persistent workspace to measure whether memory compounds across tasks.
+   * Distinct from {@link steps}: each link is independently judged AND anchored,
+   * where steps are turns of one scored task. When absent, this is today's
+   * single-task behavior (unchanged).
+   */
+  campaign?: CampaignTask[];
 }
 
 /** A resolved task: metadata + the prompt handed to the executor. */
@@ -438,6 +502,45 @@ export interface VariantTaskResult {
   excludedReason?: string;
 }
 
+/**
+ * Scored outcome of ONE link in a campaign chain — the per-task record that lets
+ * a trajectory be read link-by-link. Lighter than {@link VariantTaskResult}: a
+ * single optional `score` (not the four-dimension breakdown) plus the link's
+ * deterministic `anchors` verdict and observed `metrics`, since a campaign's
+ * signal is the SHAPE of the curve across links, not each link's full rubric.
+ */
+export interface CampaignTaskResult {
+  /** The link's `id` (or its stringified index when the link had no `id`). */
+  taskId: string;
+  /** Zero-based position of this link within the campaign chain. */
+  index: number;
+  /** The link's judge score, when it was judged. Absent on failure. */
+  score?: number;
+  /** Deterministic anchor verdict for this link, when it declared an `anchor`. */
+  anchors?: AnchorResult;
+  /** Observed executor cost/time for this link (never scored). */
+  metrics: CallMetrics;
+  /** Set when the link failed (executor or judge); the link scores as zero. */
+  failure?: string;
+}
+
+/**
+ * The full trajectory of ONE campaign for one variant × executor model: the
+ * ordered per-link results in a single persistent workspace. Downstream report
+ * code reads `tasks` in order to chart whether persistent memory compounds
+ * (e.g. rising scores / falling turns-to-green across links).
+ */
+export interface CampaignResult {
+  /** The variant under test for this campaign run. */
+  variant: string;
+  /** The executor model alias this campaign ran under (a benchmark dimension). */
+  executorModel: string;
+  /** Identifier of the campaign chain (the `TaskMeta.id` that declared it). */
+  campaignId: string;
+  /** Per-link results in chain order. */
+  tasks: CampaignTaskResult[];
+}
+
 /** The full report payload written to <runDir>/report.json. */
 export interface Report {
   /** Per-execution GUID (crypto.randomUUID), one per `bench` invocation. */
@@ -450,4 +553,10 @@ export interface Report {
   /** The fixed judge model used for every run. */
   judgeModel: string;
   results: VariantTaskResult[];
+  /**
+   * Longitudinal campaign trajectories carried alongside `results`, when the run
+   * exercised any campaign task. Optional for backward-compat: single-task and
+   * single-shot runs omit it entirely (old report.json files lack the field).
+   */
+  campaigns?: CampaignResult[];
 }

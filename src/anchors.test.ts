@@ -390,3 +390,130 @@ test("setup-gotcha: a malformed regex source fails closed without throwing", () 
   assert.equal(r?.hitKnownTrap, false);
   assert.match(r!.evidence, /invalid setup-gotcha signal pattern/);
 });
+
+// --- detector: rule (arbitrary required/forbidden diff-signal conjunction) ----
+
+// Convention: format money with Intl, never a date/time lib as a money helper.
+const INTL_RULE: AnchorConfig = {
+  kind: "rule",
+  label: "format money with Intl",
+  required: ["Intl\\."],
+  forbidden: ["date-fns|dayjs|moment"],
+};
+
+// Convention: mint ids via the shared newId(), never crypto.randomUUID directly.
+const ID_RULE: AnchorConfig = {
+  kind: "rule",
+  label: "mint ids via newId()",
+  required: ["newId\\("],
+  forbidden: ["\\brandomUUID\\b"],
+};
+
+/** Satisfies INTL_RULE: uses Intl, no banned date lib. */
+const INTL_HELD_DIFF = `diff --git a/src/money.ts b/src/money.ts
+--- a/src/money.ts
++++ b/src/money.ts
+@@ -1,2 +1,4 @@
++export function format(cents: number): string {
++  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(cents / 100);
++}
+`;
+
+/**
+ * Trips INTL_RULE's trap: satisfies the required `Intl.` marker but ALSO pulls in
+ * a forbidden date lib — isolates the forbidden branch (required is present, so
+ * the verdict fails on the trap, not on a missing marker).
+ */
+const INTL_TRAP_DIFF = `diff --git a/src/money.ts b/src/money.ts
+--- a/src/money.ts
++++ b/src/money.ts
+@@ -1,2 +1,4 @@
++import dayjs from "dayjs";
++export function format(cents: number): string {
++  return new Intl.NumberFormat("en-US").format(cents / 100) + dayjs().format();
++}
+`;
+
+test("rule: required present and no forbidden holds, turnsToGreen from numTurns", () => {
+  const r = detectAnchor(
+    INTL_RULE,
+    step(INTL_HELD_DIFF, { metrics: { wallMs: 1_000, numTurns: 6 } }),
+  );
+  assert.equal(r.conventionHeld, true);
+  assert.equal(r.hitKnownTrap, false);
+  assert.equal(r.turnsToGreen, 6);
+  assert.match(r.evidence, /held rule/);
+  assert.match(r.evidence, /format money with Intl/);
+});
+
+test("rule: a missing required marker fails, evidence names it", () => {
+  // Uses newId() nowhere — the required marker is absent.
+  const noNewId = `diff --git a/src/thing.ts b/src/thing.ts
++++ b/src/thing.ts
+@@ -1 +1,2 @@
++const id = String(counter++);
+`;
+  const r = detectAnchor(ID_RULE, step(noNewId));
+  assert.equal(r.conventionHeld, false);
+  assert.equal(r.hitKnownTrap, false);
+  assert.equal(r.turnsToGreen, undefined);
+  assert.match(r.evidence, /required \/newId\\\(\//);
+});
+
+test("rule: a forbidden marker present fails AND sets hitKnownTrap, evidence names it", () => {
+  const r = detectAnchor(INTL_RULE, step(INTL_TRAP_DIFF));
+  assert.equal(r.conventionHeld, false);
+  assert.equal(r.hitKnownTrap, true);
+  assert.equal(r.turnsToGreen, undefined);
+  assert.match(r.evidence, /forbidden \/date-fns\|dayjs\|moment\/ present — known trap/);
+});
+
+test("rule: required/forbidden markers appearing only in a COMMENT do not count", () => {
+  // Required `newId(` and forbidden `randomUUID` both live ONLY in comments, so
+  // extractAddedLines strips them: the required is absent (not held) and the
+  // forbidden is NOT tripped (no trap) — the verdict is driven by CODE alone.
+  const commentOnly = `diff --git a/src/thing.ts b/src/thing.ts
++++ b/src/thing.ts
+@@ -1 +1,3 @@
++// prefer newId() over crypto.randomUUID here
++const id = String(counter++);
+`;
+  const r = detectAnchor(ID_RULE, step(commentOnly));
+  assert.equal(r.conventionHeld, false);
+  assert.equal(r.hitKnownTrap, false);
+  assert.match(r.evidence, /required \/newId\\\(\//);
+
+  // And a forbidden marker only in a comment does NOT trip the trap while the
+  // required marker IS present in code ⇒ the rule holds.
+  const forbiddenInComment = `diff --git a/src/thing.ts b/src/thing.ts
++++ b/src/thing.ts
+@@ -1 +1,3 @@
++// do not use crypto.randomUUID
++const id = newId();
+`;
+  const held = detectAnchor(ID_RULE, step(forbiddenInComment));
+  assert.equal(held.conventionHeld, true);
+  assert.equal(held.hitKnownTrap, false);
+});
+
+test("rule: a malformed regex source fails closed without throwing", () => {
+  const bad: AnchorConfig = {
+    kind: "rule",
+    label: "bad pattern",
+    required: ["Intl\\."],
+    forbidden: ["("], // unterminated group
+  };
+  let r: ReturnType<typeof detectAnchor> | undefined;
+  assert.doesNotThrow(() => {
+    r = detectAnchor(bad, step(INTL_HELD_DIFF));
+  });
+  assert.equal(r?.conventionHeld, false);
+  assert.equal(r?.hitKnownTrap, false);
+  assert.match(r!.evidence, /invalid rule pattern/);
+});
+
+test("rule: empty required is vacuously held, empty forbidden means no trap", () => {
+  const r = detectAnchor({ kind: "rule" }, step(INTL_HELD_DIFF));
+  assert.equal(r.conventionHeld, true);
+  assert.equal(r.hitKnownTrap, false);
+});

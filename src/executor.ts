@@ -312,9 +312,12 @@ async function runExecutorStep(args: {
   baselineRef: string;
   executorModel: string;
   runExecutorFn: ExecutorRunner;
+  /** Trace-file stem: `trace-<prefix>-<n>.ndjson`. Defaults to "step" so the
+   *  sequence path is byte-unchanged; the campaign path passes "task". */
+  tracePrefix?: string;
 }): Promise<RunArtifacts> {
   const { cellId, variant, taskId, cellDir, workspaceDir, executorModel } = args;
-  const tracePath = path.join(cellDir, `trace-step-${args.stepNum}.ndjson`);
+  const tracePath = path.join(cellDir, `trace-${args.tracePrefix ?? "step"}-${args.stepNum}.ndjson`);
   const traceStream = createWriteStream(tracePath, { flags: "a" });
 
   let executorOk = false;
@@ -538,4 +541,141 @@ export async function runSequenceTask(
   }
 
   return finalArtifacts;
+}
+
+// --- Longitudinal-campaign mode ---------------------------------------------
+
+/**
+ * Artifacts for ONE link of a campaign chain: the link's captured
+ * {@link RunArtifacts} plus enough identity for the CLI to judge + anchor it in
+ * isolation. Unlike a sequence (one scored task with many turns), each campaign
+ * link is independently judged and anchored, so the runner returns EVERY link's
+ * artifacts rather than only the final one.
+ */
+export interface CampaignTaskArtifacts {
+  /** The link's `id` (or its stringified zero-based index when it had none). */
+  campaignTaskId: string;
+  /** Zero-based position of this link within the campaign chain. */
+  index: number;
+  /** The link's captured artifacts (executorOk=false on failure). */
+  artifacts: RunArtifacts;
+}
+
+/**
+ * Run a longitudinal CAMPAIGN: its ordered `task.meta.campaign` links execute in
+ * a SINGLE persistent workspace so a bundle's project-scope `.claude/memory/`
+ * accumulates across the WHOLE chain — memory formed by an early link can
+ * compound into a later one.
+ *
+ * Same load-bearing invariant as {@link runSequenceTask}: prepareWorkspace runs
+ * EXACTLY ONCE, and the entire `.claude/` tree is excluded from git for EVERY
+ * variant so memory is never committed and survives each link's fresh executor
+ * context on the bind mount. Between links we `git add -A && commit` the link's
+ * tracked work so the next link's diff is isolated from work already done.
+ *
+ * Two things distinguish it from the sequence runner:
+ * - It returns an ARRAY — one {@link CampaignTaskArtifacts} per link, in chain
+ *   order — because the CLI judges AND anchors each link, not just the last.
+ * - CONTINUE-ON-FAILURE: a link whose executor fails yields a failed entry
+ *   (executorOk=false) and the chain PROCEEDS. A mid-chain stall must never lose
+ *   earlier links' results, and re-preparing (which would wipe memory) is never
+ *   an option. It does NOT judge or anchor — that is the CLI's job per link.
+ */
+export async function runCampaign(
+  variant: Variant,
+  task: Task,
+  executorModel: string,
+  runResultsDir: string,
+  deps: SequenceDeps = {},
+): Promise<CampaignTaskArtifacts[]> {
+  const prepare = deps.prepare ?? prepareWorkspace;
+  const runExecutorFn = deps.runExecutorFn ?? runExecutor;
+
+  // ONCE: any re-prepare between links would wipe accumulated memory.
+  const { cellId, cellDir, workspaceDir } = await prepare(
+    variant,
+    task,
+    executorModel,
+    runResultsDir,
+  );
+
+  // Exclude the ENTIRE `.claude/` tree from every link commit UNCONDITIONALLY
+  // (prepareWorkspace only does this for bundle variants) — memory accumulates
+  // for ANY variant and must NEVER be committed, or it would leak into a link's
+  // captured diff and be scored as the agent's work. Same rationale as the
+  // sequence path; registered in .git/info/exclude for a hermetic exclusion.
+  await fs.appendFile(
+    path.join(workspaceDir, ".git", "info", "exclude"),
+    `\n${WORKSPACE_CONFIG_DIR}/\n`,
+  );
+
+  const campaign = task.meta.campaign ?? [];
+
+  // Parity with runSequenceTask's "no steps" path: a campaign declared with zero
+  // links emits ONE failed entry (not an empty array), so the CLI's per-link loop
+  // can distinguish "ran, empty" from "never ran" rather than silently seeing nothing.
+  if (campaign.length === 0) {
+    return [
+      {
+        campaignTaskId: "0",
+        index: 0,
+        artifacts: failedCell(cellId, variant, "0", workspaceDir, executorModel, "Campaign has no links."),
+      },
+    ];
+  }
+
+  /** Build the identity for link `i` (id or stringified zero-based index). */
+  const linkId = (i: number): string => campaign[i]!.id ?? String(i);
+
+  // Setup-bundle pre-step: register skills into <workspace>/.claude ONCE, before
+  // any link runs. A failed install can't run the chain — emit one failed entry
+  // per link so the CLI's per-link loop still sees a uniform, lossless array.
+  if (needsSetupPreStep(variant)) {
+    const failure = await runSetupPreStep(variant.setupCommand, workspaceDir, cellDir);
+    if (failure) {
+      return campaign.map((_, i) => ({
+        campaignTaskId: linkId(i),
+        index: i,
+        artifacts: failedCell(cellId, variant, linkId(i), workspaceDir, executorModel, failure),
+      }));
+    }
+  }
+
+  // First link diffs against the prepareWorkspace baseline commit; each later
+  // link diffs against the commit the previous link produced.
+  let baselineRef = (await git(workspaceDir, ["rev-parse", "HEAD"])).trim();
+  const results: CampaignTaskArtifacts[] = [];
+
+  for (let i = 0; i < campaign.length; i++) {
+    const taskNum = i + 1; // 1-based for filenames
+    const id = linkId(i);
+
+    // runExecutorStep never throws: an executor/capture failure degrades this
+    // link to executorOk=false. We push it and PROCEED — continue-on-failure.
+    const artifacts = await runExecutorStep({
+      cellId,
+      variant,
+      taskId: id,
+      cellDir,
+      workspaceDir,
+      prompt: campaign[i]!.prompt,
+      stepNum: taskNum,
+      baselineRef,
+      executorModel,
+      runExecutorFn,
+      tracePrefix: "task",
+    });
+
+    await fs
+      .writeFile(path.join(cellDir, `diff-task-${taskNum}.patch`), artifacts.diff)
+      .catch(() => {});
+
+    // Commit this link's tracked work so the next link's diff is isolated. This
+    // does NOT stage `.claude/` (excluded), so memory persists uncommitted.
+    baselineRef = await commitStep(workspaceDir, `task ${taskNum}`);
+
+    results.push({ campaignTaskId: id, index: i, artifacts });
+  }
+
+  return results;
 }

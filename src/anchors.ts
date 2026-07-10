@@ -324,6 +324,57 @@ export function detectAnchor(config: AnchorConfig, finalStep: FinalStep): Anchor
       }
       return result;
     }
+    case "rule": {
+      const timeoutNote = finalStep.timedOut ? " (executor timed out)" : "";
+      const labelNote = config.label ? ` (${config.label})` : "";
+      const requiredSrc = config.required ?? [];
+      const forbiddenSrc = config.forbidden ?? [];
+
+      let required: RegExp[];
+      let forbidden: RegExp[];
+      try {
+        required = requiredSrc.map((src) => new RegExp(src));
+        forbidden = forbiddenSrc.map((src) => new RegExp(src));
+      } catch {
+        // A malformed regex source must never throw the detector — fail closed.
+        return {
+          conventionHeld: false,
+          hitKnownTrap: false,
+          evidence: `invalid rule pattern${labelNote}${timeoutNote}`,
+        };
+      }
+
+      // Judge CODE only: comments are already stripped by extractAddedLines, so a
+      // marker that appears only in a comment does not count as present.
+      const added = extractAddedLines(finalStep.diff);
+      const matchesAny = (re: RegExp): boolean => added.some((line) => re.test(line));
+
+      // First required marker with no matching added line (empty required ⇒ none).
+      const missingIdx = required.findIndex((re) => !matchesAny(re));
+      // First forbidden marker that matched an added line (empty forbidden ⇒ none).
+      const trapIdx = forbidden.findIndex((re) => matchesAny(re));
+
+      const hitKnownTrap = trapIdx !== -1;
+      const conventionHeld = missingIdx === -1 && !hitKnownTrap;
+
+      let evidence: string;
+      if (conventionHeld) {
+        evidence = `held rule${labelNote}: all required markers present, no forbidden${timeoutNote}`;
+      } else {
+        // Report BOTH failure modes when both occur, so the evidence never hides a
+        // trap hit behind a missing-required message.
+        const parts: string[] = [];
+        if (missingIdx !== -1) parts.push(`required /${requiredSrc[missingIdx]}/ absent`);
+        if (hitKnownTrap) parts.push(`forbidden /${forbiddenSrc[trapIdx]}/ present — known trap`);
+        evidence = `rule broken${labelNote}: ${parts.join("; ")}${timeoutNote}`;
+      }
+
+      const result: AnchorResult = { conventionHeld, hitKnownTrap, evidence };
+      if (conventionHeld && finalStep.metrics.numTurns !== undefined) {
+        result.turnsToGreen = finalStep.metrics.numTurns;
+      }
+      return result;
+    }
     default: {
       // Exhaustive over the AnchorConfig union: a new `kind` must add a case.
       const _never: never = config;

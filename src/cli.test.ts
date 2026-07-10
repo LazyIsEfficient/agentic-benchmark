@@ -11,10 +11,14 @@ import {
   parseConcurrency,
   parseDelayMs,
   parseModels,
+  runCampaignCell,
   runCell,
+  type RunCampaignDeps,
   type RunCellDeps,
 } from "./cli.js";
+import type { CampaignTaskArtifacts } from "./executor.js";
 import type {
+  AnchorConfig,
   AnchorResult,
   CopyBundleVariant,
   JudgeResult,
@@ -452,4 +456,213 @@ test("runCell: a diff-based anchor (registry) does NOT read a trace even when on
   } finally {
     await fs.rm(runDir, { recursive: true, force: true });
   }
+});
+
+// --- Campaign loading (loadTasks) -------------------------------------------
+
+test("loadTasks: a `campaign` meta builds a Task with per-link prompts + anchors", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "camptask-"));
+  try {
+    const anchor: AnchorConfig = {
+      kind: "rule",
+      label: "R2 newId",
+      required: ["newId\\("],
+      forbidden: ["\\brandomUUID\\b"],
+    };
+    await writeTaskDir(root, "camp", {
+      "meta.json": JSON.stringify({
+        id: "camp",
+        title: "Camp",
+        logicBearing: true,
+        securityRelevant: false,
+        campaign: [
+          { id: "t1-search", file: "t1.md" },
+          { id: "t2-rename", file: "t2.md", anchor },
+        ],
+      }),
+      "t1.md": "FIRST link ask.",
+      "t2.md": "SECOND link ask.",
+      // A redundant task.md in a campaign dir must be IGNORED (campaign wins).
+      "task.md": "POISON — should never be used.",
+    });
+
+    const tasks = await loadTasks(root);
+    assert.equal(tasks.length, 1);
+    const t = tasks[0]!;
+    const campaign = t.meta.campaign!;
+    assert.equal(campaign.length, 2);
+    // Per-link prompts resolved from files; id carried; no anchor on link 0.
+    assert.deepEqual(campaign[0], { prompt: "FIRST link ask.", id: "t1-search" });
+    // Link 1 carries id AND the anchor, verbatim.
+    assert.deepEqual(campaign[1], { prompt: "SECOND link ask.", id: "t2-rename", anchor });
+    // Task.prompt is the FIRST link's prompt (any valid), NOT the redundant task.md.
+    assert.equal(t.prompt, "FIRST link ask.");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("loadTasks: a campaign `file` escaping the task dir is rejected", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "campescape-"));
+  try {
+    await writeTaskDir(root, "camp", {
+      "meta.json": JSON.stringify({
+        id: "camp",
+        title: "Camp",
+        logicBearing: true,
+        securityRelevant: false,
+        campaign: [{ id: "evil", file: "../../etc/passwd" }],
+      }),
+    });
+    await assert.rejects(loadTasks(root), /escapes its base directory/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- Campaign dispatch + per-link judge/anchor (runCampaignCell) -------------
+
+/** A campaign task carrying resolved per-link prompts + anchors (as loadTasks builds). */
+function campaignTask(): Task {
+  return makeTask({
+    id: "camp",
+    campaign: [
+      { prompt: "ask 0", id: "t0" },
+      {
+        prompt: "ask 1",
+        id: "t1",
+        anchor: { kind: "rule", label: "R", required: ["newId\\("] },
+      },
+    ],
+  });
+}
+
+/** Build one link's artifacts, executorOk unless overridden. */
+function makeLink(index: number, over: Partial<RunArtifacts> = {}): CampaignTaskArtifacts {
+  return {
+    campaignTaskId: `t${index}`,
+    index,
+    artifacts: makeArtifacts({ diff: `diff-${index}`, ...over }),
+  };
+}
+
+test("runCampaignCell: routes to runCampaign and assembles a CampaignResult per link", async () => {
+  const judged: string[] = [];
+  const detected: AnchorConfig[] = [];
+  let campaignCalls = 0;
+  const deps: RunCampaignDeps = {
+    campaign: async () => {
+      campaignCalls++;
+      return [makeLink(0), makeLink(1)];
+    },
+    // Score each link against ITS OWN prompt — proves the judge sees the link ask.
+    judge: async (_artifacts, t) => {
+      judged.push(t.prompt);
+      return makeResult({ total: t.prompt === "ask 0" ? 10 : 90 });
+    },
+    detect: (config) => {
+      detected.push(config);
+      return { conventionHeld: true, hitKnownTrap: false, evidence: "held" };
+    },
+  };
+
+  const cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const result = await runCampaignCell(cell, "/tmp", deps);
+
+  // One chain run; each link judged against its own prompt, in order.
+  assert.equal(campaignCalls, 1);
+  assert.deepEqual(judged, ["ask 0", "ask 1"]);
+  // Only link 1 declares an anchor, so detect fires exactly once.
+  assert.equal(detected.length, 1);
+  assert.equal(detected[0]!.kind, "rule");
+
+  assert.equal(result.variant, "naked");
+  assert.equal(result.executorModel, "sonnet");
+  assert.equal(result.campaignId, "camp");
+  assert.equal(result.tasks.length, 2);
+  // Link 0: scored, no anchor (no anchor declared).
+  assert.deepEqual(result.tasks[0], {
+    taskId: "t0",
+    index: 0,
+    metrics: { wallMs: 0 },
+    score: 10,
+  });
+  // Link 1: scored AND anchored.
+  assert.deepEqual(result.tasks[1], {
+    taskId: "t1",
+    index: 1,
+    metrics: { wallMs: 0 },
+    score: 90,
+    anchors: { conventionHeld: true, hitKnownTrap: false, evidence: "held" },
+  });
+});
+
+test("runCampaignCell: a link lacking an anchor skips anchoring for that link", async () => {
+  let detectCalls = 0;
+  const deps: RunCampaignDeps = {
+    campaign: async () => [makeLink(0), makeLink(1)],
+    judge: async () => makeResult({ total: 50 }),
+    detect: () => {
+      detectCalls++;
+      return { conventionHeld: false, hitKnownTrap: false, evidence: "x" };
+    },
+  };
+  const cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const result = await runCampaignCell(cell, "/tmp", deps);
+
+  // Only link 1 has an anchor; link 0 must skip the detector entirely.
+  assert.equal(detectCalls, 1);
+  assert.equal(result.tasks[0]!.anchors, undefined);
+  assert.ok(result.tasks[1]!.anchors, "link 1 carries an anchor verdict");
+});
+
+test("runCampaignCell: a failed executor link gets no anchor and carries a failure", async () => {
+  let detectCalls = 0;
+  const deps: RunCampaignDeps = {
+    campaign: async () => [
+      // Link 1 (which DOES declare an anchor) failed its executor.
+      makeLink(0),
+      makeLink(1, { executorOk: false, failureReason: "executor blew up" }),
+    ],
+    // judgeRun returns a failure result (executorFailure set) for a failed executor;
+    // emulate that here so the assemble path sees executorFailure.
+    judge: async (artifacts) =>
+      artifacts.executorOk
+        ? makeResult({ total: 70 })
+        : makeResult({ total: 0, executorFailure: artifacts.failureReason }),
+    detect: () => {
+      detectCalls++;
+      return { conventionHeld: true, hitKnownTrap: false, evidence: "held" };
+    },
+  };
+  const cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const result = await runCampaignCell(cell, "/tmp", deps);
+
+  // Anchor gated on executorOk: the failed link is NOT anchored despite declaring one.
+  assert.equal(detectCalls, 0);
+  assert.deepEqual(result.tasks[0], { taskId: "t0", index: 0, metrics: { wallMs: 0 }, score: 70 });
+  assert.equal(result.tasks[1]!.score, undefined);
+  assert.equal(result.tasks[1]!.failure, "executor blew up");
+  assert.equal(result.tasks[1]!.anchors, undefined);
+});
+
+test("runCampaignCell: a judge failure on one link is captured, chain continues", async () => {
+  const deps: RunCampaignDeps = {
+    campaign: async () => [makeLink(0), makeLink(1)],
+    // Link 0's judge throws; link 1 succeeds. The throw must not abort the chain.
+    judge: async (_artifacts, t) => {
+      if (t.prompt === "ask 0") throw new Error("judge container died");
+      return makeResult({ total: 88 });
+    },
+    detect: () => ({ conventionHeld: false, hitKnownTrap: false, evidence: "broken" }),
+  };
+  const cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const result = await runCampaignCell(cell, "/tmp", deps);
+
+  assert.equal(result.tasks.length, 2);
+  // Link 0: judge failed → no score, failure recorded.
+  assert.equal(result.tasks[0]!.score, undefined);
+  assert.match(result.tasks[0]!.failure ?? "", /judge container died/);
+  // Link 1: still scored — one bad link did not abort the campaign.
+  assert.equal(result.tasks[1]!.score, 88);
 });
