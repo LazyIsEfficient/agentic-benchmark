@@ -21,8 +21,8 @@
       "file": "t4.md",
       "anchor": {
         "kind": "rule",
-        "label": "R2 newId",
-        "required": ["newId\\("],
+        "label": "R2 ulid_ format",
+        "required": ["ulid_"],
         "forbidden": ["\\brandomUUID\\b"]
       }
     },
@@ -32,7 +32,7 @@
       "anchor": {
         "kind": "rule",
         "label": "R1+R2",
-        "required": ["Date\\.now\\(\\)\\s*/\\s*1000", "newId\\("],
+        "required": ["Date\\.now\\(\\)\\s*/\\s*1000", "ulid_"],
         "forbidden": ["toISOString", "new Date\\(", "date-fns|dayjs|moment", "\\brandomUUID\\b"]
       }
     }
@@ -41,7 +41,6 @@
     "seed/package.json",
     "seed/tsconfig.json",
     "seed/src/note.ts",
-    "seed/src/store.ts",
-    "seed/src/id.ts"
+    "seed/src/store.ts"
   ]
 }

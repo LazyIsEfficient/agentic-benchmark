@@ -14,7 +14,7 @@ import type { AnchorResult, CampaignResult, Report, Task, Variant } from "./type
 /**
  * End-to-end proof of the LONGITUDINAL campaign mode on the REAL fixture. Fakes
  * live only at the executor boundary: a memory-carrying agent records the two
- * conventions (R1 epoch-seconds, R2 newId) on links 1-2 and APPLIES them on links
+ * conventions (R1 epoch-seconds, R2 ulid_ format) on links 1-2 and APPLIES them on links
  * 3-5; a memoryless agent writes the natural DEFAULT that DRIFTS. The verdict is
  * the REAL `detectAnchor` on the REAL fixture anchors, driven by the REAL
  * `runCampaign` (one persistent workspace, memory accumulating across links).
@@ -65,21 +65,21 @@ function makeCarrying(): ExecutorRunner {
       await write(workspaceDir, MEMORY_FILE, "R1: timestamps are Unix SECONDS — Math.floor(Date.now() / 1000).\n");
       await write(workspaceDir, "src/search.ts", "export const search = () => [];\n");
     } else if (call === 2) {
-      await fs.appendFile(path.join(workspaceDir, MEMORY_FILE), "R2: entity ids come from newId(), never randomUUID.\n");
+      await fs.appendFile(path.join(workspaceDir, MEMORY_FILE), "R2: entity ids are `ulid_<8 base36>`, never randomUUID.\n");
       await write(workspaceDir, "src/rename.ts", "export const rename = () => {};\n");
     } else if (call === 3) {
       // Persistence proof: the note written on link 1 survived the context reset.
       const note = await fs.readFile(path.join(workspaceDir, MEMORY_FILE), "utf8");
       assert.match(note, /Math\.floor/, "R1 note must persist into link 3");
-      assert.match(note, /newId/, "R2 note must persist into link 3");
+      assert.match(note, /ulid_/, "R2 note must persist into link 3");
       await write(workspaceDir, "src/createdAt.ts", "export const stamp = () => Math.floor(Date.now() / 1000);\n");
     } else if (call === 4) {
-      await write(workspaceDir, "src/attach.ts", "export const mint = () => newId();\n");
+      await write(workspaceDir, "src/attach.ts", "export const mint = () => `ulid_${Math.random().toString(36).slice(2, 10)}`;\n");
     } else {
       await write(
         workspaceDir,
         "src/revision.ts",
-        "export const rev = () => ({ at: Math.floor(Date.now() / 1000), id: newId() });\n",
+        "export const rev = () => ({ at: Math.floor(Date.now() / 1000), id: `ulid_${Math.random().toString(36).slice(2, 10)}` });\n",
       );
     }
     return ok();
