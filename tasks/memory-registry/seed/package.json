@@ -1,0 +1,14 @@
+{
+  "name": "command-bus",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "A tiny command/handler bus. Handlers are plain functions; the dispatcher routes commands through the registry.",
+  "scripts": {
+    "test": "node --test --experimental-strip-types",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

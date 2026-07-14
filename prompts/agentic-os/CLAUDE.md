@@ -34,12 +34,14 @@ Why in-repo: memory sits next to the work, is visible in the editor, and is giti
 - If a memory contradicts what the code says now, trust the code and update or remove the stale memory.
 
 ### Write memory whenever you learn something durable
-A non-obvious fact about the user, the project, or how to work — that a future session would otherwise have to relearn — must be saved before the conversation ends. Specifically:
+Save a fact iff **(a) decision-relevance** — a cold future session would act differently without it — **AND (b) non-derivability** — it can't be reconstructed from the repo, git history, or tools. Both clauses, every time; the examples below span the space, they don't bound it:
 
-- **Feedback memories** — every correction (`"don't do X"`, `"stop Xing"`) AND every quiet confirmation (`"yes that was right"`, accepting an unusual choice without pushback). Lead with the rule, then `**Why:**` and `**How to apply:**`.
-- **Project memories** — decisions, deadlines, in-flight initiatives, who owns what. Convert relative dates to absolute (`"Thursday"` → `"2026-05-14"`).
-- **User memories** — role, expertise, preferences, mental models the user already has.
-- **Reference memories** — pointers to external systems (Linear projects, dashboards, channels).
+- **A correction or fact about the user** — `"don't do X"`, a confirmed preference, their role or mental model; lead with the rule, then `**Why:**` and `**How to apply:**`.
+- **A project fact** — a decision, deadline, in-flight initiative, or who owns what; convert relative dates to absolute (`"Thursday"` → `"2026-05-14"`).
+- **A pointer to an external system** — a Linear project, dashboard, or channel the repo never names.
+- **A data representation** — e.g. timestamps stored as Unix epoch seconds, never a Date/ISO string; an enum's canonical values — facts that change how you read or write the data.
+
+The primary capture point is the end-of-session extraction pass (the Stop hook nudges the `memory-extraction` skill), so durable facts get swept up at session close — don't interrupt task work to write mid-conversation unless losing the fact to an abrupt end would be costly.
 
 ### Do NOT write to memory
 - Code patterns, file paths, architecture — derivable from the repo.
@@ -60,8 +62,6 @@ If the user explicitly asks to "save" something on this list, push back and ask 
 ## Subagent usage — non-negotiable habits
 
 The default for any non-trivial work in this repo is **dispatch, don't do**. The orchestrator (you) decomposes, briefs, reviews, integrates. Subagents do the work.
-
-**Mechanical enforcement (Tier 0):** these patterns are backed by Cursor hooks that block the main thread when dispatch is skipped (research/impl/stop gates) — see [dispatch-enforcement.md](docs/dispatch-enforcement.md).
 
 ### Pattern 1 — Shaper → planner → fan-out
 Any vague request goes through a shaper before code is touched.

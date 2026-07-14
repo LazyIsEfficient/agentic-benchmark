@@ -69,6 +69,163 @@ export type BundleVariant = CopyBundleVariant | SetupBundleVariant;
 /** A CLAUDE.md variant under test — either a lone CLAUDE.md or a full bundle. */
 export type Variant = ClaudeMdVariant | BundleVariant;
 
+/**
+ * One ordered step of a sequential (multi-turn) task. A step's `prompt` is what
+ * that step hands the executor when its turn comes; steps run in array order and
+ * share one accumulating workspace. Used only by sequential-memory tasks — a
+ * single-prompt task (no `steps`) never constructs these.
+ */
+export interface TaskStep {
+  /** The prompt handed to the executor for this step. */
+  prompt: string;
+  /** Optional human-readable label for the step (e.g. "migrate", "reprice"). */
+  id?: string;
+  /**
+   * Optional task-dir-relative directory whose files are laid over the workspace
+   * (overwriting existing files) immediately BEFORE this step runs. Used by the
+   * poison scenario: a teammate-style migration replaces the money module between
+   * steps so that memory formed by an earlier step ("money is integer cents")
+   * becomes stale. The overlay is committed as this step's baseline, so it is
+   * never attributed to the agent's own diff. Omit for ordinary steps.
+   */
+  seedOverlay?: string;
+}
+
+/**
+ * The numeric convention a money value is expected to be expressed in. The
+ * anchor detector reads this to decide which shape counts as "correct" on the
+ * final step:
+ * - `integer-cents` — a plain integer count of cents (the helping baseline).
+ * - `decimal` — a Decimal-typed value (e.g. a Decimal.js / db `numeric` wrapper).
+ * - `bigint` — a native `bigint` count of cents.
+ */
+export type MoneyConvention = "integer-cents" | "decimal" | "bigint";
+
+/**
+ * Anchor for the money-cents scenario. Declares which convention the final-step
+ * output must use to count as correct, and (optionally) which convention is the
+ * known trap. This single shape expresses BOTH variants:
+ * - helping — `correctConvention: "integer-cents"`, trap is the migrated type.
+ * - poison — the current code has migrated to Decimal/BigInt, so following it is
+ *   correct: `correctConvention: "decimal" | "bigint"`, trap is `integer-cents`.
+ * One detector consumes this for both by comparing observed final-step output
+ * against `correctConvention` (held) and against `trapConvention` (hit the trap).
+ */
+export interface MoneyCentsAnchor {
+  /** Discriminant. */
+  kind: "money-cents";
+  /** The convention the final step must use to count as correct. */
+  correctConvention: MoneyConvention;
+  /** The convention that constitutes the known trap, when one is defined. */
+  trapConvention?: MoneyConvention;
+  /** Step `id` the anchor is evaluated against (default: the last step). */
+  evaluatedStepId?: string;
+}
+
+/**
+ * Anchor for the setup-gotcha scenario. The knowledge under test exists ONLY at
+ * runtime: a bundle's memory must have recorded that a required setup command
+ * (e.g. `npm run gen-fixtures`) has to be run before the workspace is usable,
+ * because skipping it produces a failure the agent cannot predict from static
+ * code. Both fields are regex SOURCE strings compiled against the raw NDJSON
+ * trace of the final step:
+ * - `setupSignal` matches the setup command being executed (the memory HELD).
+ * - `trapSignal` matches the runtime failure output hit WITHOUT the setup step
+ *   (e.g. `Cannot find .*fixtures\.json`) — the agent fell into the gotcha.
+ */
+export interface SetupGotchaAnchor {
+  /** Discriminant. */
+  kind: "setup-gotcha";
+  /** Regex source matching the required setup command being run in the trace. */
+  setupSignal: string;
+  /** Regex source matching the runtime failure hit without the setup step. */
+  trapSignal: string;
+  /** Step `id` the anchor is evaluated against (default: the last step). */
+  evaluatedStepId?: string;
+}
+
+/**
+ * Anchor for the registry scenario. The knowledge under test is an ARBITRARY,
+ * unguessable project convention: after adding an export you must also register
+ * it in a specific file (e.g. `src/registry.ts`). Nothing in the code makes this
+ * rule re-derivable, so only a bundle whose memory recorded it will comply. The
+ * detector holds the convention iff the correct final-step diff MODIFIES
+ * `requiredFile`.
+ */
+export interface RegistryAnchor {
+  /** Discriminant. */
+  kind: "registry";
+  /** Workspace-relative path the correct step-2 diff must modify (the rule). */
+  requiredFile: string;
+  /** Step `id` the anchor is evaluated against (default: the last step). */
+  evaluatedStepId?: string;
+}
+
+/**
+ * Anchor for the generic rule scenario — the least scenario-specific member,
+ * intended for campaign tasks whose "did the memory hold?" test is simply the
+ * presence/absence of textual signals in the task's diff. Both fields are regex
+ * SOURCE strings compiled against the unified diff:
+ * - `required` — every pattern MUST be present for the convention to hold.
+ * - `forbidden` — no pattern may be present (each is a trap signal).
+ * The convention is HELD iff all `required` match AND no `forbidden` matches; an
+ * empty/omitted `required` is vacuously satisfied. Unlike {@link RegistryAnchor}
+ * (a single required post-image path) this expresses an arbitrary conjunction of
+ * must-appear / must-not-appear signals without a dedicated detector shape.
+ */
+export interface RuleAnchor {
+  /** Discriminant. */
+  kind: "rule";
+  /** Optional human-readable label for the rule (e.g. "uses shared logger"). */
+  label?: string;
+  /** Regex sources that must ALL match the diff for the rule to hold. */
+  required?: string[];
+  /** Regex sources that must NOT match the diff (each is a trap). */
+  forbidden?: string[];
+  /**
+   * Step `id` the anchor is evaluated against (default: the last step). Shared
+   * with the other {@link AnchorConfig} members so generic consumers can read
+   * `anchor.evaluatedStepId` without narrowing by `kind`.
+   */
+  evaluatedStepId?: string;
+}
+
+/**
+ * Deterministic anchor configuration for a task — a discriminated union keyed by
+ * `kind` so future anchor scenarios add a new member without touching existing
+ * consumers: {@link MoneyCentsAnchor} (re-derivable convention), plus those whose
+ * knowledge is NOT re-derivable from code — {@link SetupGotchaAnchor} (a runtime
+ * gotcha), {@link RegistryAnchor} (an arbitrary registry rule), and
+ * {@link RuleAnchor} (an arbitrary required/forbidden diff-signal conjunction).
+ */
+export type AnchorConfig =
+  | MoneyCentsAnchor
+  | SetupGotchaAnchor
+  | RegistryAnchor
+  | RuleAnchor;
+
+/**
+ * One task in a longitudinal CAMPAIGN — a chain of N related tasks run in one
+ * persistent workspace so that memory formed by an earlier task can compound
+ * into a later one. This is the RUNTIME shape the runner consumes: `prompt` is
+ * the fully-resolved text handed to the executor when this link's turn comes.
+ * (The on-disk meta.json DTO instead carries `{ id, file, anchor? }`; the loader
+ * reads `file` and resolves it to `prompt`.) Distinct from {@link TaskStep}:
+ * campaign links are independently JUDGED and ANCHORED, whereas steps are turns
+ * of a single scored task.
+ */
+export interface CampaignTask {
+  /** Optional human-readable label for this link (defaults to its index). */
+  id?: string;
+  /** The resolved prompt handed to the executor for this link. */
+  prompt: string;
+  /**
+   * Deterministic anchor for this link — a convention its diff must hold. When
+   * absent, no anchor verdict is computed for the link.
+   */
+  anchor?: AnchorConfig;
+}
+
 /** Task metadata from tasks/<id>/meta.json. */
 export interface TaskMeta {
   id: string;
@@ -85,6 +242,25 @@ export interface TaskMeta {
   successCriteria?: string;
   /** Optional seed files (relative paths) copied into the workspace. */
   seedFiles?: string[];
+  /**
+   * Ordered steps for a sequential-memory task. When absent, this is today's
+   * single-prompt task (unchanged behavior). When present, the harness runs each
+   * step's prompt in order against one accumulating workspace.
+   */
+  steps?: TaskStep[];
+  /**
+   * Deterministic anchor for this task — a convention the final step must hold.
+   * When absent, no anchor verdict is computed (today's default).
+   */
+  anchor?: AnchorConfig;
+  /**
+   * Ordered links of a longitudinal campaign — a chain of related tasks run in
+   * one persistent workspace to measure whether memory compounds across tasks.
+   * Distinct from {@link steps}: each link is independently judged AND anchored,
+   * where steps are turns of one scored task. When absent, this is today's
+   * single-task behavior (unchanged).
+   */
+  campaign?: CampaignTask[];
 }
 
 /** A resolved task: metadata + the prompt handed to the executor. */
@@ -235,6 +411,25 @@ export interface JudgeResult {
   summary: string;
 }
 
+/**
+ * Deterministic verdict produced by an anchor detector for one run. Independent
+ * of the judge's scores: a mechanical read of whether the run held the required
+ * convention on the anchored step and whether it fell into the known trap.
+ */
+export interface AnchorResult {
+  /** True if the final-step output used the anchor's `correctConvention`. */
+  conventionHeld: boolean;
+  /**
+   * For a sequential task, the number of steps taken to first satisfy the
+   * convention ("turn green"). Undefined when it never held.
+   */
+  turnsToGreen?: number;
+  /** True if the run adopted the anchor's `trapConvention` (fell for the trap). */
+  hitKnownTrap: boolean;
+  /** Human-readable justification for the verdict (what was observed). */
+  evidence: string;
+}
+
 /** Records a single deterministic cap that fired after judging. */
 export interface AppliedCap {
   dimension: "testingCoverage" | "securityQuality" | "total";
@@ -284,6 +479,12 @@ export interface VariantTaskResult {
    * degrade to `—` in the behavior comparison table.
    */
   behavior?: Behavior;
+  /**
+   * Deterministic anchor verdict for this run, when the task declared an
+   * `anchor`. Optional for backward-compat: results in old report.json files
+   * lack it. Never folded into the /100 score — a separate, mechanical signal.
+   */
+  anchors?: AnchorResult;
   /** Set when the executor failed; the run is scored as zero. */
   executorFailure?: string;
   /** Set when the judge failed (container error, timeout, or bad output). */
@@ -301,6 +502,45 @@ export interface VariantTaskResult {
   excludedReason?: string;
 }
 
+/**
+ * Scored outcome of ONE link in a campaign chain — the per-task record that lets
+ * a trajectory be read link-by-link. Lighter than {@link VariantTaskResult}: a
+ * single optional `score` (not the four-dimension breakdown) plus the link's
+ * deterministic `anchors` verdict and observed `metrics`, since a campaign's
+ * signal is the SHAPE of the curve across links, not each link's full rubric.
+ */
+export interface CampaignTaskResult {
+  /** The link's `id` (or its stringified index when the link had no `id`). */
+  taskId: string;
+  /** Zero-based position of this link within the campaign chain. */
+  index: number;
+  /** The link's judge score, when it was judged. Absent on failure. */
+  score?: number;
+  /** Deterministic anchor verdict for this link, when it declared an `anchor`. */
+  anchors?: AnchorResult;
+  /** Observed executor cost/time for this link (never scored). */
+  metrics: CallMetrics;
+  /** Set when the link failed (executor or judge); the link scores as zero. */
+  failure?: string;
+}
+
+/**
+ * The full trajectory of ONE campaign for one variant × executor model: the
+ * ordered per-link results in a single persistent workspace. Downstream report
+ * code reads `tasks` in order to chart whether persistent memory compounds
+ * (e.g. rising scores / falling turns-to-green across links).
+ */
+export interface CampaignResult {
+  /** The variant under test for this campaign run. */
+  variant: string;
+  /** The executor model alias this campaign ran under (a benchmark dimension). */
+  executorModel: string;
+  /** Identifier of the campaign chain (the `TaskMeta.id` that declared it). */
+  campaignId: string;
+  /** Per-link results in chain order. */
+  tasks: CampaignTaskResult[];
+}
+
 /** The full report payload written to <runDir>/report.json. */
 export interface Report {
   /** Per-execution GUID (crypto.randomUUID), one per `bench` invocation. */
@@ -313,4 +553,10 @@ export interface Report {
   /** The fixed judge model used for every run. */
   judgeModel: string;
   results: VariantTaskResult[];
+  /**
+   * Longitudinal campaign trajectories carried alongside `results`, when the run
+   * exercised any campaign task. Optional for backward-compat: single-task and
+   * single-shot runs omit it entirely (old report.json files lack the field).
+   */
+  campaigns?: CampaignResult[];
 }

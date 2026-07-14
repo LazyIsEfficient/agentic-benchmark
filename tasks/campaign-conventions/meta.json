@@ -1,0 +1,46 @@
+{
+  "id": "campaign-conventions",
+  "title": "Arbitrary conventions must stay consistent across a task chain",
+  "logicBearing": true,
+  "securityRelevant": false,
+  "campaign": [
+    { "id": "t1-search", "file": "t1.md" },
+    { "id": "t2-rename", "file": "t2.md" },
+    {
+      "id": "t3-created-at",
+      "file": "t3.md",
+      "anchor": {
+        "kind": "rule",
+        "label": "R1 epoch-seconds",
+        "required": ["Date\\.now\\(\\)\\s*/\\s*1000"],
+        "forbidden": ["toISOString", "new Date\\(", "date-fns|dayjs|moment"]
+      }
+    },
+    {
+      "id": "t4-attachments",
+      "file": "t4.md",
+      "anchor": {
+        "kind": "rule",
+        "label": "R2 ulid_ format",
+        "required": ["ulid_"],
+        "forbidden": ["\\brandomUUID\\b"]
+      }
+    },
+    {
+      "id": "t5-revisions",
+      "file": "t5.md",
+      "anchor": {
+        "kind": "rule",
+        "label": "R1+R2",
+        "required": ["Date\\.now\\(\\)\\s*/\\s*1000", "ulid_"],
+        "forbidden": ["toISOString", "new Date\\(", "date-fns|dayjs|moment", "\\brandomUUID\\b"]
+      }
+    }
+  ],
+  "seedFiles": [
+    "seed/package.json",
+    "seed/tsconfig.json",
+    "seed/src/note.ts",
+    "seed/src/store.ts"
+  ]
+}

@@ -2,11 +2,13 @@
 FROM node:22-slim
 
 # git is needed by claude for repo-aware operations; ca-certificates for TLS to
-# the API; the rest are runtime deps for the baked G-Stack toolchain (unzip for
-# bun's installer, curl/xz for asset fetches, python3 for a few skill helpers).
+# the API; unzip/curl/xz/python3 are runtime deps for the baked G-Stack toolchain
+# (unzip for bun's installer, curl/xz for asset fetches, python3 for a few skill
+# helpers); jq is required by the agentic-os v3.0.0 memory-extract Stop hook —
+# without it that hook fails open and silently no-ops (issue #217 fix wouldn't run).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git ca-certificates curl unzip xz-utils python3 \
+        git ca-certificates curl unzip xz-utils python3 jq \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g @anthropic-ai/claude-code@2.1.202

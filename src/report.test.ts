@@ -6,24 +6,37 @@ import { test } from "node:test";
 import {
   aggregateByVariant,
   aggregateMetrics,
+  buildCampaignMemoryEffect,
+  buildMemoryEffect,
+  buildReportJson,
   distinctModels,
   excludedReasonOf,
   formatScore,
+  hasMemoryEffect,
   isScored,
   orderResultsForDetail,
   rankVariants,
   regenerateReport,
   renderBehaviorComparison,
+  renderCampaignMemoryEffect,
   renderCrossModelTable,
   renderExcludedCells,
   renderMatrix,
+  renderMemoryEffect,
   renderPerModelMatrices,
   renderReportMarkdown,
   renderRunMetrics,
   renderStrengthsWeaknesses,
   renderVariantDetail,
 } from "./report.js";
-import type { Behavior, Report, RunMetrics, VariantTaskResult } from "./types.js";
+import type {
+  Behavior,
+  CampaignResult,
+  CampaignTaskResult,
+  Report,
+  RunMetrics,
+  VariantTaskResult,
+} from "./types.js";
 
 function result(
   variant: string,
@@ -491,6 +504,284 @@ test("renderBehaviorComparison groups by task; with-behavior shows counts, witho
   const t2Block = md.slice(md.indexOf("### Task: `t2`"));
   assert.match(t2Block, /\| alpha \| 0 \| 12 \|/);
   assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+// --- Memory effect (deterministic anchor readout) ---------------------------
+
+import type { AnchorResult } from "./types.js";
+
+function anchored(
+  variant: string,
+  taskId: string,
+  anchors: AnchorResult,
+  extra: Partial<VariantTaskResult> = {},
+): VariantTaskResult {
+  return result(
+    variant,
+    taskId,
+    { codeQuality: 20, testingCoverage: 30, securityQuality: 15, documentation: 5 }, // 70
+    { anchors, ...extra },
+  );
+}
+
+// One bundle helped on the "helping" task, hurt on the "poison" task — the whole
+// point of the section is making that contrast legible.
+const helpHeld = anchored("gstack", "memory-cents", {
+  conventionHeld: true,
+  turnsToGreen: 2,
+  hitKnownTrap: false,
+  evidence: "apply step emitted integer cents (subtotal * 100)",
+});
+const poisonTrap = anchored("gstack", "memory-cents-stale", {
+  conventionHeld: false,
+  hitKnownTrap: true,
+  evidence: "reused stale integer-cents memory against migrated Decimal code",
+});
+
+test("hasMemoryEffect: true iff some result carries .anchors", () => {
+  assert.equal(hasMemoryEffect([helpHeld, poisonTrap]), true);
+  assert.equal(hasMemoryEffect([a, b]), false); // single-shot fixtures, no anchors
+});
+
+test("renderMemoryEffect leads with a per-bundle contrast pivot + per-task detail", () => {
+  const md = renderMemoryEffect([helpHeld, poisonTrap]);
+  // Pivot: one row per bundle, one column per anchored task.
+  assert.match(md, /\| Variant \| `memory-cents` \| `memory-cents-stale` \|/);
+  assert.match(md, /\| gstack \| ✓ held \(2 turns\) \| ✗ hit trap \|/);
+  // Per-task detail carries conventionHeld / turns / trap / evidence + secondary score.
+  assert.match(md, /### Task: `memory-cents`/);
+  assert.match(md, /### Task: `memory-cents-stale`/);
+  assert.match(md, /Convention held \| Turns to green \| Hit known trap \| Score \/100 \| Evidence/);
+  assert.match(md, /apply step emitted integer cents/);
+  assert.match(md, /reused stale integer-cents memory/);
+  assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+test("renderReportMarkdown surfaces MEMORY EFFECT for sequence runs and buildReportJson structures it", () => {
+  const report: Report = {
+    runId: "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    generatedAt: "2026-07-08T00:00:00.000Z",
+    taskId: "memory-cents,memory-cents-stale",
+    taskTitle: "Sequential memory",
+    executorModels: ["sonnet"],
+    judgeModel: "opus",
+    results: [helpHeld, poisonTrap],
+  };
+  const md = renderReportMarkdown(report);
+  assert.match(md, /## Memory effect \(not scored\)/);
+  // Leads: the section appears before the /100 score matrix.
+  assert.ok(md.indexOf("## Memory effect") < md.indexOf("## Score matrix"));
+
+  const json = buildReportJson(report) as {
+    memoryEffect: {
+      tasks: string[];
+      cells: Array<{
+        taskId: string;
+        conventionHeld: boolean;
+        turnsToGreen: number | null;
+        hitKnownTrap: boolean;
+        total: number | null;
+      }>;
+    };
+  };
+  assert.deepEqual(json.memoryEffect.tasks, ["memory-cents", "memory-cents-stale"]);
+  const help = json.memoryEffect.cells.find((c) => c.taskId === "memory-cents")!;
+  assert.equal(help.conventionHeld, true);
+  assert.equal(help.turnsToGreen, 2);
+  assert.equal(help.hitKnownTrap, false);
+  assert.equal(help.total, 70); // /100 preserved as secondary context
+  const poison = json.memoryEffect.cells.find((c) => c.taskId === "memory-cents-stale")!;
+  assert.equal(poison.conventionHeld, false);
+  assert.equal(poison.turnsToGreen, null); // never turned green
+  assert.equal(poison.hitKnownTrap, true);
+});
+
+test("single-shot report: NO Memory effect section, json has no memoryEffect key", () => {
+  const report: Report = {
+    runId: "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    generatedAt: "2026-07-07T00:00:00.000Z",
+    taskId: "t1,t2",
+    taskTitle: "Tasks",
+    executorModels: ["sonnet"],
+    judgeModel: "opus",
+    results: multi, // no .anchors anywhere
+  };
+  const md = renderReportMarkdown(report);
+  assert.doesNotMatch(md, /Memory effect/);
+  assert.equal(buildMemoryEffect(multi), undefined);
+  const json = buildReportJson(report) as Record<string, unknown>;
+  assert.ok(!("memoryEffect" in json));
+});
+
+test("renderMemoryEffect: undefined turnsToGreen renders as — without throwing", () => {
+  const noTurns = anchored("gstack", "memory-cents", {
+    conventionHeld: false,
+    hitKnownTrap: false,
+    evidence: "never reached the convention",
+  }); // turnsToGreen omitted
+  const md = renderMemoryEffect([noTurns]);
+  assert.match(md, /### Task: `memory-cents`/);
+  // Detail row's Turns column shows an em dash, not "undefined".
+  assert.match(md, /\| gstack \| ✗ \| — \| no \|/);
+  assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+// --- Memory effect (campaign trajectory) ------------------------------------
+
+const CAMPAIGN_IDS = [
+  "t1-search",
+  "t2-rename",
+  "t3-created-at",
+  "t4-attachments",
+  "t5-revisions",
+];
+
+function ruleAnchor(held: boolean, trap = false): AnchorResult {
+  return {
+    conventionHeld: held,
+    hitKnownTrap: trap,
+    evidence: held ? "diff used Date.now()/1000 and newId(" : "diff used toISOString / randomUUID",
+  };
+}
+
+function campaignTaskResult(
+  index: number,
+  taskId: string,
+  extra: Partial<CampaignTaskResult> = {},
+): CampaignTaskResult {
+  return {
+    taskId,
+    index,
+    score: 80,
+    metrics: { wallMs: 10_000, numTurns: 3 },
+    ...extra,
+  };
+}
+
+/** Build a 5-link campaign; `anchored` covers links index 2/3/4 (true|false|"trap"). */
+function campaign(variant: string, anchored: (boolean | "trap")[]): CampaignResult {
+  const tasks = CAMPAIGN_IDS.map((taskId, index) => {
+    if (index < 2) return campaignTaskResult(index, taskId); // links 0/1 have no anchor
+    const v = anchored[index - 2]!;
+    return campaignTaskResult(index, taskId, {
+      anchors: ruleAnchor(v === true, v === "trap"),
+    });
+  });
+  return { variant, executorModel: "sonnet", campaignId: "campaign-conventions", tasks };
+}
+
+// agentic-os holds every convention; naked drifts (trap) on all 3; gstack 1/3.
+const agenticOs = campaign("agentic-os", [true, true, true]);
+const nakedCamp = campaign("naked", ["trap", "trap", "trap"]);
+const gstackCamp = campaign("gstack", [true, false, "trap"]);
+const campaigns = [agenticOs, nakedCamp, gstackCamp];
+
+test("renderCampaignMemoryEffect leads with the cumulative adherence delta + trajectory", () => {
+  const md = renderCampaignMemoryEffect(campaigns);
+  // Headline contrast: memory bundle adheres, memoryless drifts.
+  assert.match(md, /\*\*Cumulative adherence:\*\* agentic-os 3\/3 adhered \| naked 0\/3 \| gstack 1\/3/);
+  // Trajectory table: rows = link, one column per bundle.
+  assert.match(md, /\| Task \| agentic-os \| naked \| gstack \|/);
+  // Anchored link #2: held vs drift+trap, with secondary score/turns.
+  assert.match(md, /#2 `t3-created-at` \| ✓ held · 80 · 3t \| ✗ drift ⚠ trap · 80 · 3t \| ✓ held · 80 · 3t \|/);
+  // Un-anchored link #0 renders — for adherence (judged only).
+  assert.match(md, /#0 `t1-search` \| — · 80 · 3t \|/);
+  assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+test("renderReportMarkdown surfaces the campaign memory effect; buildReportJson structures it", () => {
+  const report: Report = {
+    runId: "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    generatedAt: "2026-07-08T00:00:00.000Z",
+    taskId: "campaign-conventions",
+    taskTitle: "Campaign",
+    executorModels: ["sonnet"],
+    judgeModel: "opus",
+    results: multi,
+    campaigns,
+  };
+  const md = renderReportMarkdown(report);
+  assert.match(md, /## Memory effect \(campaign, not scored\)/);
+  assert.match(md, /agentic-os 3\/3 adhered \| naked 0\/3 \| gstack 1\/3/);
+
+  const json = buildReportJson(report) as {
+    memoryEffectCampaign: {
+      bundles: Array<{
+        variant: string;
+        adheredCount: number;
+        anchoredCount: number;
+        tasks: Array<{
+          index: number;
+          conventionHeld: boolean | null;
+          hitKnownTrap: boolean;
+          score: number | null;
+          turns: number | null;
+        }>;
+      }>;
+    };
+  };
+  const os = json.memoryEffectCampaign.bundles.find((b) => b.variant === "agentic-os")!;
+  assert.equal(os.adheredCount, 3);
+  assert.equal(os.anchoredCount, 3);
+  const nk = json.memoryEffectCampaign.bundles.find((b) => b.variant === "naked")!;
+  assert.equal(nk.adheredCount, 0);
+  assert.equal(nk.anchoredCount, 3);
+  // Un-anchored link → conventionHeld null; score/turns preserved as secondary.
+  const link0 = os.tasks.find((t) => t.index === 0)!;
+  assert.equal(link0.conventionHeld, null);
+  assert.equal(link0.hitKnownTrap, false);
+  assert.equal(link0.score, 80);
+  assert.equal(link0.turns, 3);
+});
+
+test("report WITHOUT campaigns: no campaign section, json has no memoryEffectCampaign key", () => {
+  const report: Report = {
+    runId: "1e2f3a4b-5c6d-7e8f-9a0b-1c2d3e4f5a6b",
+    generatedAt: "2026-07-07T00:00:00.000Z",
+    taskId: "t1,t2",
+    taskTitle: "Tasks",
+    executorModels: ["sonnet"],
+    judgeModel: "opus",
+    results: multi, // no campaigns field
+  };
+  const md = renderReportMarkdown(report);
+  assert.doesNotMatch(md, /Memory effect \(campaign/);
+  const json = buildReportJson(report) as Record<string, unknown>;
+  assert.ok(!("memoryEffectCampaign" in json));
+});
+
+test("campaign trajectory: a failure loses only the score; a held anchor survives a judge failure", () => {
+  const broke = campaign("broke", [true, false, "trap"]);
+  // Executor-failed link: no anchor was computed → adherence —, score ✗fail.
+  broke.tasks[4] = {
+    taskId: "t5-revisions",
+    index: 4,
+    metrics: { wallMs: 5000 }, // no score, no turns
+    failure: "executor timed out",
+  };
+  // Judge-failed-but-executorOk link: the deterministic anchor still stands, so
+  // the cell must SHOW the adherence (not hide it behind "failed") — otherwise the
+  // trajectory disagrees with the cumulative-adherence headline that counts it.
+  broke.tasks[2] = {
+    taskId: "t3-created-at",
+    index: 2,
+    metrics: { wallMs: 3000, numTurns: 4 },
+    anchors: { conventionHeld: true, hitKnownTrap: false, evidence: "held" },
+    failure: "judge returned malformed output",
+  };
+  const md = renderCampaignMemoryEffect([broke]);
+  assert.match(md, /#4 `t5-revisions` \| — · ✗fail · — \|/); // executor-failed, no anchor
+  assert.match(md, /#2 `t3-created-at` \| ✓ held · ✗fail · 4t \|/); // judge-failed, anchor survives
+  assert.match(md, /#0 `t1-search` \| —/); // no-anchor link
+  assert.doesNotMatch(md, /undefined|NaN/);
+
+  // JSON degrades: score/turns/conventionHeld null; failure carried through.
+  const json = buildCampaignMemoryEffect([broke])!;
+  const failLink = json.bundles[0]!.tasks.find((t) => t.index === 4)!;
+  assert.equal(failLink.score, null);
+  assert.equal(failLink.turns, null);
+  assert.equal(failLink.conventionHeld, null);
+  assert.equal(failLink.failure, "executor timed out");
 });
 
 // --- --report regenerate (offline) ------------------------------------------

@@ -1,0 +1,23 @@
+{
+  "id": "memory-registry",
+  "title": "Arbitrary registration rule must carry across a reset",
+  "logicBearing": true,
+  "securityRelevant": false,
+  "steps": [
+    { "id": "establish", "file": "step-1.md" },
+    { "id": "apply", "file": "step-2.md" }
+  ],
+  "anchor": {
+    "kind": "registry",
+    "requiredFile": "src/registry.ts",
+    "evaluatedStepId": "apply"
+  },
+  "seedFiles": [
+    "seed/package.json",
+    "seed/tsconfig.json",
+    "seed/src/handler.ts",
+    "seed/src/registry.ts",
+    "seed/src/dispatch.ts",
+    "seed/src/handlers/ping.ts"
+  ]
+}
