@@ -43,7 +43,7 @@ export function resolveWithin(baseDir: string, relPath: string): string {
 }
 
 export interface PreparedWorkspace {
-  /** Per-(variant×task×model) id, unique within a run (no timestamp needed). */
+  /** Per-(variant×task×model[×repeat]) id, unique within a run (no timestamp needed). */
   cellId: string;
   /** <runResultsDir>/<cellId> — holds this cell's artifacts + workspace. */
   cellDir: string;
@@ -57,20 +57,55 @@ export function slugify(value: string): string {
 }
 
 /**
+ * Build the cellId for one (task × variant × model) cell, optionally tagged
+ * with a repeat index for cross-run reliability sweeps.
+ *
+ * Calling convention for `repeat` (enforced by the cli, not here): pass it
+ * ONLY when the run's REPEATS > 1, and then for ALL repeats including the
+ * first (r1..rN) — never mix tagged and untagged ids within one run, so
+ * grouping stays uniform. When `repeat` is undefined the output is
+ * byte-for-byte identical to the single-run format
+ * (`task__variant__modelSlug`), keeping default-run cellIds, dir names, and
+ * report keys unchanged.
+ *
+ * @throws {RangeError} when `repeat` is provided but not a positive integer —
+ *   a fractional or zero repeat is a harness bug, so fail loud.
+ */
+export function buildCellId(
+  taskId: string,
+  variantName: string,
+  executorModel: string,
+  repeat?: number,
+): string {
+  if (repeat !== undefined && (!Number.isInteger(repeat) || repeat < 1)) {
+    throw new RangeError(
+      `repeat must be a positive integer when provided; got ${repeat}`,
+    );
+  }
+  const cellId = `${taskId}__${variantName}__${slugify(executorModel)}`;
+  return repeat === undefined ? cellId : `${cellId}__r${repeat}`;
+}
+
+/**
  * Prepare an isolated workspace for one (variant × task × model) cell under the
  * run's results dir. The cellId is unique within a run, so no timestamp is
  * needed. Seed files are committed as the git baseline, then the variant's
  * CLAUDE.md is written and registered in .git/info/exclude — untracked AND
  * ignored, so it never appears in the diff yet is present for claude to read as
  * its system prompt.
+ *
+ * `repeat` follows the buildCellId calling convention: omit it for single-run
+ * benchmarks (output unchanged), pass r1..rN uniformly when REPEATS > 1 so two
+ * repeats of the same cell get distinct cellIds and directories.
  */
 export async function prepareWorkspace(
   variant: Variant,
   task: Task,
   executorModel: string,
   runResultsDir: string,
+  repeat?: number,
 ): Promise<PreparedWorkspace> {
-  const cellId = `${task.meta.id}__${variant.name}__${slugify(executorModel)}`;
+  const cellId = buildCellId(task.meta.id, variant.name, executorModel, repeat);
   const cellDir = path.join(runResultsDir, cellId);
   const workspaceDir = path.join(cellDir, "workspace");
   await fs.mkdir(workspaceDir, { recursive: true });

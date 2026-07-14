@@ -13,7 +13,8 @@
         "kind": "rule",
         "label": "R1 epoch-seconds",
         "required": ["Date\\.now\\(\\)\\s*/\\s*1000"],
-        "forbidden": ["toISOString", "new Date\\(", "date-fns|dayjs|moment"]
+        "forbidden": ["toISOString", "new Date\\(", "date-fns|dayjs|moment"],
+        "appliesIf": ["createdAt|updatedAt|timestamp", "\\bDate\\b"]
       }
     },
     {
@@ -23,7 +24,8 @@
         "kind": "rule",
         "label": "R2 ulid_ format",
         "required": ["ulid_"],
-        "forbidden": ["\\brandomUUID\\b"]
+        "forbidden": ["\\brandomUUID\\b"],
+        "appliesIf": ["\\bid\\b", "[a-z]Id\\b", "\\buuid|\\bUUID"]
       }
     },
     {
@@ -33,7 +35,8 @@
         "kind": "rule",
         "label": "R1+R2",
         "required": ["Date\\.now\\(\\)\\s*/\\s*1000", "ulid_"],
-        "forbidden": ["toISOString", "new Date\\(", "date-fns|dayjs|moment", "\\brandomUUID\\b"]
+        "forbidden": ["toISOString", "new Date\\(", "date-fns|dayjs|moment", "\\brandomUUID\\b"],
+        "appliesIf": ["createdAt|updatedAt|timestamp", "\\bDate\\b", "\\bid\\b", "[a-z]Id\\b", "\\buuid|\\bUUID", "\\bat\\s*[:=]"]
       }
     }
   ],

@@ -1,4 +1,11 @@
-import type { AnchorConfig, AnchorResult, CallMetrics, MoneyConvention } from "./types.js";
+import type {
+  AnchorConfig,
+  AnchorGrade,
+  AnchorResult,
+  CallMetrics,
+  MoneyConvention,
+  RuleAnchor,
+} from "./types.js";
 
 /**
  * The subset of a run's final step that the deterministic anchor detector needs.
@@ -215,7 +222,12 @@ export function diffTouchesFile(diff: string, requiredFile: string): boolean {
 
 /**
  * Deterministic, un-gameable verdict on whether a run's anchored step held the
- * required money convention — NO LLM judge involved. Pure over strings/numbers.
+ * required convention — NO LLM judge involved. Pure over strings/numbers.
+ *
+ * This is the INTERNAL grade-less detection engine: {@link detectAnchorGraded}
+ * (the harness entry point) delegates to it for every non-`rule` anchor kind
+ * and maps its booleans onto a grade. Exported so the per-kind detection logic
+ * stays directly unit-testable.
  *
  * `conventionHeld` is true iff the adopted convention equals the anchor's
  * `correctConvention`. `hitKnownTrap` is true iff a `trapConvention` is declared
@@ -381,4 +393,289 @@ export function detectAnchor(config: AnchorConfig, finalStep: FinalStep): Anchor
       throw new Error(`unsupported anchor kind: ${String((_never as AnchorConfig).kind)}`);
     }
   }
+}
+
+// --- The graded detector ------------------------------------------------------
+
+/** The two diff scopes a graded verdict is judged against. */
+export interface GradedDiffs {
+  /** The evaluated link's OWN unified diff (what THIS link changed). */
+  linkDiff: string;
+  /** Cumulative chain diff up to and including this link (campaign mode only). */
+  cumulativeDiff?: string;
+}
+
+/** True iff the regex source compiles. Used to spot legacy fail-closed paths. */
+function isValidRegExpSource(src: string): boolean {
+  try {
+    new RegExp(src);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// --- Linkage-evidence harvesting (held-by-abstraction support) ----------------
+
+/** Candidate identifiers for linkage evidence: 3+ chars, JS-identifier shaped. */
+const LINKAGE_IDENTIFIER_RE = /[A-Za-z_$][\w$]{2,}/g;
+
+/** JS keywords / common tokens that can never serve as linkage evidence. */
+const LINKAGE_STOPLIST: ReadonlySet<string> = new Set([
+  "const", "let", "var", "function", "return", "export", "import", "new",
+  "class", "type", "interface", "string", "number", "boolean", "true", "false",
+  "null", "undefined", "async", "await", "this",
+]);
+
+/**
+ * Added lines of a unified diff grouped by post-image file — same extraction as
+ * {@link extractAddedLines} (comments stripped, blank/comment-only lines
+ * dropped), but each `+++` header starts a new group so a linkage window can
+ * never straddle a file boundary. Lines before the first header (headerless
+ * fixture diffs) form their own group.
+ */
+function extractAddedLineGroups(diff: string): string[][] {
+  const groups: string[][] = [];
+  let current: string[] = [];
+  const flush = (): void => {
+    if (current.length > 0) groups.push(current);
+    current = [];
+  };
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++")) {
+      flush();
+      continue;
+    }
+    if (!line.startsWith("+")) continue;
+    const code = stripComments(line.slice(1));
+    if (code.trim() !== "") current.push(code);
+  }
+  flush();
+  return groups;
+}
+
+/**
+ * Harvest candidate linkage identifiers from a cumulative diff: for every added
+ * line matching ANY `required` marker, collect the identifiers appearing within
+ * ±3 added lines of it (same-file window, stoplist excluded), deduplicated in
+ * first-seen order. These are the names an abstraction built next to the marker
+ * plausibly travels under (e.g. the helper's own name); a later link consuming
+ * that abstraction re-emits one of them.
+ */
+function harvestLinkageIdentifiers(groups: string[][], required: RegExp[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const group of groups) {
+    for (let i = 0; i < group.length; i++) {
+      if (!required.some((re) => re.test(group[i]!))) continue;
+      const lo = Math.max(0, i - 3);
+      const hi = Math.min(group.length - 1, i + 3);
+      for (let j = lo; j <= hi; j++) {
+        for (const m of group[j]!.matchAll(LINKAGE_IDENTIFIER_RE)) {
+          const ident = m[0]!;
+          if (LINKAGE_STOPLIST.has(ident) || seen.has(ident)) continue;
+          seen.add(ident);
+          out.push(ident);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Map a legacy (non-rule) detector verdict onto an {@link AnchorGrade}. The
+ * detection logic itself is untouched — this only refines the booleans:
+ * held → `held-by-literal`, trap → `trap`, not-held-no-trap → `drift`, and the
+ * detector's fail-closed INDETERMINATE paths (it could not observe, as opposed
+ * to observing a break) → `unknown`. Registry has no indeterminate path: an
+ * untouched `requiredFile` is a definite break, so it never grades `unknown`.
+ */
+function gradeFromLegacy(
+  config: Exclude<AnchorConfig, RuleAnchor>,
+  step: FinalStep,
+  legacy: AnchorResult,
+): AnchorGrade {
+  if (legacy.hitKnownTrap) return "trap";
+  if (legacy.conventionHeld) return "held-by-literal";
+  switch (config.kind) {
+    case "money-cents":
+      if (classifyMoneyConvention(step.diff).convention === "unknown") return "unknown";
+      break;
+    case "setup-gotcha":
+      if (!step.trace) return "unknown";
+      if (!isValidRegExpSource(config.setupSignal) || !isValidRegExpSource(config.trapSignal)) {
+        return "unknown";
+      }
+      break;
+    case "registry":
+      break;
+  }
+  return "drift";
+}
+
+/**
+ * Graded verdict for the `rule` kind. Deterministic, evaluated in EXACT
+ * precedence order over the diff's added lines (same extraction as the legacy
+ * rule detector — comments stripped, `+` lines only):
+ *
+ *  1. any `forbidden` matches the LINK diff        → `trap`
+ *  2. all `required` match the LINK diff           → `held-by-literal`
+ *  3. `appliesIf` present, none match the LINK     → `held-by-inertia`
+ *     (covers an EMPTY link diff when appliesIf is defined — vacuous hold)
+ *  4. link diff has NO added lines                 → `unknown` (fail closed)
+ *  5. all `required` match the CUMULATIVE diff (when provided) — a cumulative
+ *     hold, adjudicated by LINK-LEVEL LINKAGE EVIDENCE. Candidate identifiers
+ *     are harvested from the cumulative diff's added lines within ±3 lines of
+ *     each required-matching line (same-file window, 3+ chars, JS keywords /
+ *     common tokens stoplisted); evidence = at least one harvested identifier
+ *     appears in the link diff's added lines (e.g. a `generateId` helper built
+ *     beside the `ulid_` marker earlier, and `generateId(` called here):
+ *      a. linkage evidence found                   → `held-by-abstraction`
+ *      b. no linkage, `appliesIf` defined          → `drift` (past rule 3, so
+ *         the link EXERCISED the rule surface and did wrong-way work)
+ *      c. no linkage, `appliesIf` NOT defined      → `held-by-chain` (the
+ *         convention persists chain-wide but this link's applicability cannot
+ *         be adjudicated; conventionHeld = true, honest weak label)
+ *  6. otherwise                                    → `drift`
+ *
+ * Deliberate ordering notes:
+ * - Inertia is checked BEFORE the cumulative hold so a link that never
+ *   exercised the rule's surface isn't spuriously credited via the chain.
+ * - Rule 4 precedes the cumulative hold: an empty link diff (no appliesIf to
+ *   vouch for it) is ungradable and must NOT inherit a chain-level hold.
+ * - `forbidden` is only ever tested against the LINK diff (rule 1). A
+ *   forbidden marker inherited from an earlier link's cumulative diff does NOT
+ *   poison this link's grade: per-link grading judges what THIS link did, not
+ *   inherited sins. So forbidden-in-cumulative + required-in-link is still
+ *   `held-by-literal`.
+ * - An empty `required` is vacuously satisfied (existing rule semantics): a
+ *   forbidden-only rule grades `held-by-literal` when clean.
+ */
+function detectRuleGraded(config: RuleAnchor, step: FinalStep, diffs: GradedDiffs): AnchorResult {
+  const timeoutNote = step.timedOut ? " (executor timed out)" : "";
+  const labelNote = config.label ? ` (${config.label})` : "";
+  const requiredSrc = config.required ?? [];
+  const forbiddenSrc = config.forbidden ?? [];
+  const appliesIfSrc = config.appliesIf;
+
+  const broke = (grade: "trap" | "drift" | "unknown", detail: string): AnchorResult => ({
+    conventionHeld: false,
+    hitKnownTrap: grade === "trap",
+    grade,
+    evidence: `${grade}${labelNote}: ${detail}${timeoutNote}`,
+  });
+  const held = (
+    grade: "held-by-literal" | "held-by-inertia" | "held-by-abstraction" | "held-by-chain",
+    detail: string,
+  ): AnchorResult => {
+    const result: AnchorResult = {
+      conventionHeld: true,
+      hitKnownTrap: false,
+      grade,
+      evidence: `${grade}${labelNote}: ${detail}${timeoutNote}`,
+    };
+    if (step.metrics.numTurns !== undefined) result.turnsToGreen = step.metrics.numTurns;
+    return result;
+  };
+
+  let required: RegExp[];
+  let forbidden: RegExp[];
+  let appliesIf: RegExp[] | undefined;
+  try {
+    required = requiredSrc.map((src) => new RegExp(src));
+    forbidden = forbiddenSrc.map((src) => new RegExp(src));
+    appliesIf = appliesIfSrc?.map((src) => new RegExp(src));
+  } catch {
+    // A malformed regex source must never throw the detector — fail closed.
+    return broke("unknown", "invalid rule pattern — cannot grade");
+  }
+
+  const linkAdded = extractAddedLines(diffs.linkDiff);
+  const matchesLink = (re: RegExp): boolean => linkAdded.some((line) => re.test(line));
+
+  // 1. A forbidden marker in the link's own diff is the trap, full stop.
+  const trapIdx = forbidden.findIndex(matchesLink);
+  if (trapIdx !== -1) {
+    return broke("trap", `forbidden /${forbiddenSrc[trapIdx]}/ matched link-diff added lines`);
+  }
+
+  // 2. All required markers re-emitted literally in this link.
+  const missingIdx = required.findIndex((re) => !matchesLink(re));
+  if (missingIdx === -1) {
+    const detail =
+      requiredSrc.length === 0
+        ? "no required markers (vacuously satisfied), no forbidden matched link diff"
+        : `all required (${requiredSrc.map((s) => `/${s}/`).join(", ")}) matched link-diff added lines`;
+    return held("held-by-literal", detail);
+  }
+
+  // 3. The link never exercised the rule's surface — a vacuous hold.
+  if (appliesIf !== undefined && !appliesIf.some(matchesLink)) {
+    const patterns = (appliesIfSrc ?? []).map((s) => `/${s}/`).join(", ");
+    return held(
+      "held-by-inertia",
+      `no appliesIf (${patterns}) matched link diff — rule never exercised by this link`,
+    );
+  }
+
+  // 4. No added code at all is ungradable — fail closed BEFORE the cumulative
+  // hold, so an empty link can never inherit a chain-level grade.
+  if (linkAdded.length === 0) {
+    return broke("unknown", "link diff has no added lines — nothing to grade");
+  }
+
+  // 5. The convention persists cumulatively (e.g. a helper built in a prior
+  // link) — but a cumulative hold needs LINK-LEVEL linkage evidence to earn
+  // `held-by-abstraction`; without it the grade degrades to drift (surface
+  // exercised, wrong-way work) or held-by-chain (applicability unknowable).
+  if (diffs.cumulativeDiff !== undefined) {
+    const cumulativeGroups = extractAddedLineGroups(diffs.cumulativeDiff);
+    const cumulativeAdded = cumulativeGroups.flat();
+    const matchesCumulative = (re: RegExp): boolean => cumulativeAdded.some((line) => re.test(line));
+    if (required.every(matchesCumulative)) {
+      const candidates = harvestLinkageIdentifiers(cumulativeGroups, required);
+      const linkage = candidates.find((ident) => linkAdded.some((line) => line.includes(ident)));
+      if (linkage !== undefined) {
+        return held(
+          "held-by-abstraction",
+          `required /${requiredSrc[missingIdx]}/ absent from link diff but all required matched cumulative-diff added lines; linkage via identifier "${linkage}" reused in this link's diff`,
+        );
+      }
+      if (appliesIf !== undefined) {
+        return broke(
+          "drift",
+          `required /${requiredSrc[missingIdx]}/ absent from link diff; cumulative markers exist but no linkage identifier appears in this link's diff, and the link exercised the rule surface (appliesIf matched)`,
+        );
+      }
+      return held(
+        "held-by-chain",
+        `all required matched cumulative-diff added lines but no linkage identifier appears in this link's diff; applicability unknown (no appliesIf)`,
+      );
+    }
+  }
+
+  // 6. Real added code without the convention is drift.
+  const cumulativeNote = diffs.cumulativeDiff !== undefined ? " and cumulative diff" : "";
+  return broke("drift", `required /${requiredSrc[missingIdx]}/ absent from link diff${cumulativeNote}`);
+}
+
+/**
+ * Graded refinement of {@link detectAnchor}: same deterministic, judge-free
+ * contract, but the returned {@link AnchorResult} ALWAYS carries a `grade`
+ * distinguishing HOW the convention held (abstraction > literal > inertia >
+ * chain > drift > trap; `unknown` fails closed). Only the `rule` kind consumes the
+ * link/cumulative diff split (see {@link detectRuleGraded}); every other kind
+ * runs the grade-less {@link detectAnchor} engine against `step` unchanged and
+ * maps its booleans onto a grade ({@link gradeFromLegacy}), so their boolean
+ * fields are byte-identical to `detectAnchor`'s.
+ */
+export function detectAnchorGraded(
+  config: AnchorConfig,
+  step: FinalStep,
+  diffs: GradedDiffs,
+): AnchorResult {
+  if (config.kind === "rule") return detectRuleGraded(config, step, diffs);
+  const legacy = detectAnchor(config, step);
+  return { ...legacy, grade: gradeFromLegacy(config, step, legacy) };
 }

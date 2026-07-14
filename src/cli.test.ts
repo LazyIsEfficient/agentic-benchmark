@@ -5,26 +5,40 @@ import path from "node:path";
 import { test } from "node:test";
 import {
   MAX_CONCURRENCY,
+  buildCells,
+  buildPairJobs,
+  formatTestResultsSummary,
   formatVariantListLine,
   loadTasks,
   loadVariants,
   parseConcurrency,
   parseDelayMs,
   parseModels,
+  parseRepeats,
+  resultSortComparator,
   runCampaignCell,
   runCell,
+  type Cell,
+  type CollectedDiff,
+  type CellDiffContext,
+  type CellDiffKey,
   type RunCampaignDeps,
   type RunCellDeps,
 } from "./cli.js";
-import { detectAnchor } from "./anchors.js";
+import { detectAnchorGraded } from "./anchors.js";
 import type { CampaignTaskArtifacts } from "./executor.js";
+import type { JudgeCellOutcome } from "./judge.js";
+import type { CellJudgePromptInputs } from "./rubric.js";
 import type {
   AnchorConfig,
   AnchorResult,
+  BlastRadiusEntry,
+  CellJudgeResult,
   CopyBundleVariant,
-  JudgeResult,
+  CraftScore,
   RunArtifacts,
   SetupBundleVariant,
+  SlopMetrics,
   Task,
   TaskMeta,
   Variant,
@@ -92,6 +106,39 @@ test("parseDelayMs: negative and non-numeric throw", () => {
   assert.throws(() => parseDelayMs("-1"), />= 0|non-negative/);
   assert.throws(() => parseDelayMs("abc"), /non-negative integer/);
   assert.throws(() => parseDelayMs("2.5"), /non-negative integer/);
+});
+
+test("parseRepeats: missing → the provided fallback (config default)", () => {
+  assert.equal(parseRepeats(undefined, 1), 1);
+  assert.equal(parseRepeats(undefined, 3), 3);
+});
+
+test("parseRepeats: valid positive integers pass through", () => {
+  assert.equal(parseRepeats("1"), 1);
+  assert.equal(parseRepeats(" 4 "), 4);
+});
+
+test("parseRepeats: zero, negative, and non-numeric throw", () => {
+  assert.throws(() => parseRepeats("0"), />= 1/);
+  assert.throws(() => parseRepeats("-2"), /positive integer|>= 1/);
+  assert.throws(() => parseRepeats("abc"), /positive integer/);
+  assert.throws(() => parseRepeats("2.5"), /positive integer/);
+});
+
+test("formatTestResultsSummary: none / pass / fail / counted", () => {
+  assert.equal(formatTestResultsSummary(undefined), "none");
+  assert.equal(formatTestResultsSummary({ command: "npm t", ok: true }), "pass");
+  assert.equal(formatTestResultsSummary({ command: "npm t", ok: false }), "fail");
+  assert.equal(
+    formatTestResultsSummary({ command: "npm t", ok: true, passed: 3, failed: 0 }),
+    "pass (3p/0f)",
+  );
+  assert.equal(
+    formatTestResultsSummary({ command: "npm t", ok: false, passed: 2, failed: 1 }),
+    "fail (2p/1f)",
+  );
+  // A half-parsed count never renders a fabricated number.
+  assert.equal(formatTestResultsSummary({ command: "npm t", ok: true, passed: 3 }), "pass");
 });
 
 // --- Variant loading (reads the real prompts/ corpus) -----------------------
@@ -223,9 +270,8 @@ test("loadTasks: a steps-less task still loads its prompt from task.md", async (
   }
 });
 
-// --- Cell dispatch + anchor threading (runCell) -----------------------------
+// --- Shared fakes for runCell / runCampaignCell -------------------------------
 
-type CellArg = Parameters<typeof runCell>[0];
 const PROGRESS = () => ({ completed: 0, total: 1, started: 0, running: 0 });
 const NAKED: Variant = { name: "naked", type: "claude-md", content: "" };
 
@@ -255,38 +301,29 @@ function makeArtifacts(overrides: Partial<RunArtifacts> = {}): RunArtifacts {
   };
 }
 
-const ZERO_DIM = { score: 0, justification: "" };
-function makeResult(overrides: Partial<VariantTaskResult> = {}): VariantTaskResult {
-  const raw: JudgeResult = {
-    codeQuality: ZERO_DIM,
-    testingCoverage: ZERO_DIM,
-    securityQuality: ZERO_DIM,
-    documentation: ZERO_DIM,
-    securityReviewPerformed: true,
-    summary: "",
-  };
+const craft = (score: 0 | 1 | 2 | 3 | 4 | "unknown" = 2): CraftScore =>
+  score === "unknown" ? { score, evidence: [] } : { score, evidence: ["a.ts:1 — x"] };
+
+function makeVerdict(over: Partial<CellJudgeResult> = {}): CellJudgeResult {
   return {
-    cellId: "c1",
-    variant: "naked",
-    taskId: "t",
-    executorModel: "sonnet",
-    judgeModel: "opus",
-    raw,
-    final: { codeQuality: 0, testingCoverage: 0, securityQuality: 0, documentation: 0 },
-    total: 42,
-    appliedCaps: [],
-    signals: { testFilesPresent: false, securityReviewPerformed: true, changedFiles: [] },
-    metrics: { executor: { wallMs: 0 } },
-    ...overrides,
+    craft: { naming: craft(), structure: craft(), consistency: craft(), economy: craft() },
+    blastRadius: [],
+    correctnessAssessment: null,
+    flags: [],
+    ...over,
   };
+}
+
+function makeOutcome(over: Partial<JudgeCellOutcome> = {}): JudgeCellOutcome {
+  return { result: makeVerdict(), evidenceTruncated: false, ...over };
 }
 
 /** runCell deps that never touch disk or containers; records which runner fired. */
 function stubDeps(over: Partial<RunCellDeps> = {}): {
   deps: RunCellDeps;
-  calls: { variant: number; sequence: number };
+  calls: { variant: number; sequence: number; judge: number };
 } {
-  const calls = { variant: 0, sequence: 0 };
+  const calls = { variant: 0, sequence: 0, judge: 0 };
   const deps: RunCellDeps = {
     runVariant: async () => {
       calls.variant++;
@@ -296,29 +333,36 @@ function stubDeps(over: Partial<RunCellDeps> = {}): {
       calls.sequence++;
       return makeArtifacts();
     },
-    judge: async () => makeResult(),
+    judge: async () => {
+      calls.judge++;
+      return makeOutcome();
+    },
     writeResult: async () => {},
     ...over,
   };
   return { deps, calls };
 }
 
+// --- Cell dispatch + anchor threading (runCell) -----------------------------
+
 test("runCell: a task WITH `steps` dispatches to runSequence, not runVariant", async () => {
   const { deps, calls } = stubDeps();
-  const cell: CellArg = {
+  const cell: Cell = {
     executorModel: "sonnet",
     task: makeTask({ steps: [{ prompt: "s1" }, { prompt: "s2" }] }),
     variant: NAKED,
   };
   await runCell(cell, false, PROGRESS(), "/tmp", deps);
-  assert.deepEqual(calls, { variant: 0, sequence: 1 });
+  assert.equal(calls.variant, 0);
+  assert.equal(calls.sequence, 1);
 });
 
 test("runCell: a task WITHOUT `steps` dispatches to runVariant, not runSequence", async () => {
   const { deps, calls } = stubDeps();
-  const cell: CellArg = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
   await runCell(cell, false, PROGRESS(), "/tmp", deps);
-  assert.deepEqual(calls, { variant: 1, sequence: 0 });
+  assert.equal(calls.variant, 1);
+  assert.equal(calls.sequence, 0);
 });
 
 test("runCell: attaches the anchor verdict when meta.anchor is present", async () => {
@@ -326,6 +370,7 @@ test("runCell: attaches the anchor verdict when meta.anchor is present", async (
     conventionHeld: true,
     hitKnownTrap: false,
     evidence: "held integer-cents",
+    grade: "held-by-literal",
   };
   let detectCalls = 0;
   const { deps } = stubDeps({
@@ -334,7 +379,7 @@ test("runCell: attaches the anchor verdict when meta.anchor is present", async (
       return anchor;
     },
   });
-  const cell: CellArg = {
+  const cell: Cell = {
     executorModel: "sonnet",
     task: makeTask({
       steps: [{ prompt: "s1" }, { prompt: "s2" }],
@@ -355,26 +400,264 @@ test("runCell: no anchor is attached (or detector called) when meta.anchor is ab
       return { conventionHeld: false, hitKnownTrap: false, evidence: "x" };
     },
   });
-  const cell: CellArg = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
   const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
   assert.equal(detectCalls, 0);
   assert.equal(result.anchors, undefined);
 });
 
+test("runCell: executorOk gating — a failed/demoted cell gets no anchor, no judge call, and carries executorFailure", async () => {
+  // runSequenceTask demotes a cell to executorOk=false when a non-final step
+  // failed while leaving the final diff intact — the anchor AND judge must skip.
+  let detectCalls = 0;
+  const { deps, calls } = stubDeps({
+    runSequence: async () =>
+      makeArtifacts({
+        executorOk: false,
+        diff: "+const looksFine = true;",
+        failureReason: "Earlier step 1 failed: executor error",
+      }),
+    detect: () => {
+      detectCalls++;
+      return { conventionHeld: true, hitKnownTrap: false, evidence: "would lie" };
+    },
+  });
+  const cell: Cell = {
+    executorModel: "sonnet",
+    task: makeTask({
+      steps: [{ prompt: "s1" }, { prompt: "s2" }],
+      anchor: { kind: "registry", requiredFile: "src/registry.ts" },
+    }),
+    variant: NAKED,
+  };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+
+  assert.equal(detectCalls, 0, "anchor must not be computed for a demoted cell");
+  assert.equal(calls.judge, 0, "no judge quota is spent on a failed executor");
+  assert.match(result.executorFailure ?? "", /Earlier step 1 failed/);
+  assert.equal(result.anchors, undefined);
+  assert.equal(result.judge, undefined, "no five-axis verdict on a failed cell");
+  assert.equal(result.slop, undefined, "no zero-slop masquerading as measured-clean");
+});
+
+test("runCell: threads the anchor grade, tests, slop, and out-of-scope list into the judge inputs", async () => {
+  const diff = "+// TODO: fix later\n+const x = 1;";
+  let seen: CellJudgePromptInputs | undefined;
+  const { deps } = stubDeps({
+    runVariant: async () =>
+      makeArtifacts({
+        diff,
+        changedFiles: [
+          { path: "src/a.ts", kind: "source" },
+          { path: "scripts/rogue.sh", kind: "source" },
+        ],
+        testResults: { command: "npm test", ok: true, passed: 4, failed: 0 },
+      }),
+    detect: () => ({
+      conventionHeld: true,
+      hitKnownTrap: false,
+      evidence: "held",
+      grade: "held-by-literal",
+    }),
+    judge: async (inputs) => {
+      seen = inputs;
+      return makeOutcome();
+    },
+  });
+  const cell: Cell = {
+    executorModel: "sonnet",
+    task: makeTask({
+      anchor: { kind: "rule", required: ["x"] },
+      expectedSurface: ["src/**"],
+      testCommand: "npm test",
+    }),
+    variant: NAKED,
+  };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+
+  assert.ok(seen, "judge received inputs");
+  assert.equal(seen.taskPrompt, "final");
+  assert.equal(seen.conventionsList, "none", "single cells have no standing conventions");
+  assert.equal(seen.anchorVerdict, "held-by-literal", "anchor grade is judge INPUT");
+  assert.equal(seen.testResultsSummary, "pass (4p/0f)");
+  assert.equal(seen.diff, diff);
+  assert.deepEqual(seen.outOfScopeFiles, ["scripts/rogue.sh"]);
+  const slop = JSON.parse(seen.slopMetricsJson) as SlopMetrics;
+  assert.equal(slop.residue.todos, 1, "slop is computed from the diff");
+  assert.equal(slop.churnRatio, null, "single-shot cells have no churn baseline");
+
+  // The assembled result carries the five-axis fields.
+  assert.deepEqual(result.judge, makeVerdict());
+  assert.deepEqual(result.slop, slop);
+  assert.deepEqual(result.testResults, { command: "npm test", ok: true, passed: 4, failed: 0 });
+  assert.deepEqual(result.filesOutsideExpectedSurface, ["scripts/rogue.sh"]);
+  assert.equal(result.disqualified, undefined);
+});
+
+test("runCell: no expectedSurface ⇒ filesOutsideExpectedSurface stays absent; no testCommand ⇒ summary 'none'", async () => {
+  let seen: CellJudgePromptInputs | undefined;
+  const { deps } = stubDeps({
+    runVariant: async () =>
+      makeArtifacts({ diff: "+a", changedFiles: [{ path: "src/a.ts", kind: "source" }] }),
+    judge: async (inputs) => {
+      seen = inputs;
+      return makeOutcome();
+    },
+  });
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+
+  assert.equal(seen!.testResultsSummary, "none");
+  assert.deepEqual(seen!.outOfScopeFiles, []);
+  assert.equal(result.filesOutsideExpectedSurface, undefined);
+  assert.equal(result.testResults, undefined);
+});
+
+test("runCell: a judge failure is absorbed — fail-closed verdict, judgeFailure set, cell survives", async () => {
+  const failedOutcome = makeOutcome({
+    result: makeVerdict({
+      craft: {
+        naming: craft("unknown"),
+        structure: craft("unknown"),
+        consistency: craft("unknown"),
+        economy: craft("unknown"),
+      },
+      flags: ["judge-transport-failure"],
+    }),
+    judgeFailure: "Judge failed after 3 attempts: container exit 1",
+  });
+  const { deps } = stubDeps({ judge: async () => failedOutcome });
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+
+  assert.match(result.judgeFailure ?? "", /Judge failed after 3 attempts/);
+  assert.deepEqual(result.judge, failedOutcome.result, "the fail-closed verdict is kept");
+  assert.equal(result.executorFailure, undefined);
+});
+
+test("runCell: a THROWING judge seam is absorbed, never aborts the cell", async () => {
+  const { deps } = stubDeps({
+    judge: async () => {
+      throw new Error("judge container died");
+    },
+  });
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+
+  assert.match(result.judgeFailure ?? "", /judge container died/);
+  assert.equal(result.judge?.craft.naming.score, "unknown", "fail-closed verdict attached");
+  assert.deepEqual(result.judge?.flags, ["judge-threw"]);
+});
+
+test("runCell: an adversarial blast-radius entry disqualifies the cell", async () => {
+  const adversarial: BlastRadiusEntry = {
+    file: "test/tamper.ts",
+    classification: "adversarial",
+    evidence: "edited the test to pass",
+  };
+  const { deps } = stubDeps({
+    judge: async () => makeOutcome({ result: makeVerdict({ blastRadius: [adversarial] }) }),
+  });
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+  assert.equal(result.disqualified, true);
+
+  // Non-adversarial classifications never disqualify.
+  const { deps: benignDeps } = stubDeps({
+    judge: async () =>
+      makeOutcome({
+        result: makeVerdict({
+          blastRadius: [{ file: "docs/x.md", classification: "overreach", evidence: "" }],
+        }),
+      }),
+  });
+  const benign = await runCell(cell, false, PROGRESS(), "/tmp", benignDeps);
+  assert.equal(benign.disqualified, undefined);
+});
+
+test("runCell: judge metrics land in metrics.judge; evidenceTruncated is carried", async () => {
+  const { deps } = stubDeps({
+    judge: async () =>
+      makeOutcome({ metrics: { wallMs: 123, costUsd: 0.5 }, evidenceTruncated: true }),
+  });
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+  assert.deepEqual(result.metrics.judge, { wallMs: 123, costUsd: 0.5 });
+  assert.equal(result.evidenceTruncated, true);
+});
+
+test("runCell: threads cell.repeat into the runner and stamps result.repeat", async () => {
+  const seenRepeats: (number | undefined)[] = [];
+  const { deps } = stubDeps({
+    runVariant: async (_v, _t, _m, _dir, _deps, repeat) => {
+      seenRepeats.push(repeat);
+      return makeArtifacts();
+    },
+  });
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED, repeat: 2 };
+  const result = await runCell(cell, false, PROGRESS(), "/tmp", deps);
+  assert.deepEqual(seenRepeats, [2], "repeat reaches the executor (→ prepareWorkspace __rN)");
+  assert.equal(result.repeat, 2);
+
+  // A repeat-less cell threads undefined and stamps nothing — byte-identical
+  // single-run behavior.
+  const single = await runCell(
+    { executorModel: "sonnet", task: makeTask(), variant: NAKED },
+    false,
+    PROGRESS(),
+    "/tmp",
+    deps,
+  );
+  assert.deepEqual(seenRepeats, [2, undefined]);
+  assert.equal(single.repeat, undefined);
+});
+
+test("runCell: invokes onDiff once with the cell's key, diff, and eligibility context", async () => {
+  const collected: CollectedDiff[] = [];
+  const { deps } = stubDeps({
+    runVariant: async () => makeArtifacts({ diff: "+x" }),
+    onDiff: (key, diff, context) => collected.push({ key, diff, context }),
+  });
+  const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED, repeat: 1 };
+  await runCell(cell, false, PROGRESS(), "/tmp", deps);
+
+  assert.equal(collected.length, 1);
+  assert.deepEqual(collected[0]!.key, {
+    taskId: "t",
+    variant: "naked",
+    executorModel: "sonnet",
+    repeat: 1,
+  });
+  assert.equal(collected[0]!.diff, "+x");
+  assert.deepEqual(collected[0]!.context, {
+    anchor: "none",
+    tests: "none",
+    taskPrompt: "final",
+    disqualified: false,
+    ok: true,
+  });
+});
+
 // --- setup-gotcha trace threading (runCell) ---------------------------------
 
-const OK_ANCHOR: AnchorResult = { conventionHeld: true, hitKnownTrap: false, evidence: "ok" };
+const OK_ANCHOR: AnchorResult = {
+  conventionHeld: true,
+  hitKnownTrap: false,
+  evidence: "ok",
+  grade: "held-by-literal",
+};
 
 /** Capture the `finalStep` handed to `detect` so a test can assert `.trace`. */
 function captureDetectDeps(): {
   deps: RunCellDeps;
-  captured: { trace?: string; called: number };
+  captured: { trace?: string; linkDiff?: string; called: number };
 } {
-  const captured: { trace?: string; called: number } = { called: 0 };
+  const captured: { trace?: string; linkDiff?: string; called: number } = { called: 0 };
   const { deps } = stubDeps({
-    detect: (_config, finalStep) => {
+    detect: (_config, finalStep, diffs) => {
       captured.called++;
       captured.trace = finalStep.trace;
+      captured.linkDiff = diffs.linkDiff;
       return OK_ANCHOR;
     },
   });
@@ -404,7 +687,7 @@ test("runCell: setup-gotcha reads the FINAL step's trace and passes it to detect
     await fs.writeFile(path.join(cellDir, "trace-step-2.ndjson"), trace);
 
     const { deps, captured } = captureDetectDeps();
-    const cell: CellArg = { executorModel: "sonnet", task: gotchaTask(), variant: NAKED };
+    const cell: Cell = { executorModel: "sonnet", task: gotchaTask(), variant: NAKED };
     const result = await runCell(cell, false, PROGRESS(), runDir, deps);
 
     assert.equal(captured.called, 1);
@@ -420,7 +703,7 @@ test("runCell: setup-gotcha with a MISSING trace does not throw; trace is undefi
   try {
     // No trace file on disk — the read must resolve undefined, not throw.
     const { deps, captured } = captureDetectDeps();
-    const cell: CellArg = { executorModel: "sonnet", task: gotchaTask(), variant: NAKED };
+    const cell: Cell = { executorModel: "sonnet", task: gotchaTask(), variant: NAKED };
     const result = await runCell(cell, false, PROGRESS(), runDir, deps);
 
     assert.equal(captured.called, 1);
@@ -435,13 +718,14 @@ test("runCell: a diff-based anchor (registry) does NOT read a trace even when on
   const runDir = await fs.mkdtemp(path.join(os.tmpdir(), "registry-notrace-"));
   try {
     // A trace file exists on disk, but a registry anchor is diff-based and must
-    // never read it — the finalStep handed to detect has trace undefined.
+    // never read it — the finalStep handed to detect has trace undefined. The
+    // graded detector also receives the final diff as the linkDiff scope.
     const cellDir = path.join(runDir, "c1");
     await fs.mkdir(cellDir, { recursive: true });
     await fs.writeFile(path.join(cellDir, "trace-step-2.ndjson"), "SHOULD NOT BE READ");
 
     const { deps, captured } = captureDetectDeps();
-    const cell: CellArg = {
+    const cell: Cell = {
       executorModel: "sonnet",
       task: makeTask({
         steps: [{ prompt: "s1" }, { prompt: "s2" }],
@@ -453,6 +737,7 @@ test("runCell: a diff-based anchor (registry) does NOT read a trace even when on
 
     assert.equal(captured.called, 1);
     assert.equal(captured.trace, undefined);
+    assert.equal(captured.linkDiff, "", "the final diff is the graded linkDiff scope");
     assert.deepEqual(result.anchors, OK_ANCHOR);
   } finally {
     await fs.rm(runDir, { recursive: true, force: true });
@@ -556,18 +841,23 @@ test("runCampaignCell: routes to runCampaign and assembles a CampaignResult per 
       campaignCalls++;
       return [makeLink(0), makeLink(1)];
     },
-    // Score each link against ITS OWN prompt — proves the judge sees the link ask.
-    judge: async (_artifacts, t) => {
-      judged.push(t.prompt);
-      return makeResult({ total: t.prompt === "ask 0" ? 10 : 90 });
+    // The judge sees each link's OWN ask — proves the per-link prompt threading.
+    judge: async (inputs) => {
+      judged.push(inputs.taskPrompt);
+      return makeOutcome();
     },
     detect: (config) => {
       detected.push(config);
-      return { conventionHeld: true, hitKnownTrap: false, evidence: "held" };
+      return {
+        conventionHeld: true,
+        hitKnownTrap: false,
+        evidence: "held",
+        grade: "held-by-literal",
+      };
     },
   };
 
-  const cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const cell: Cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
   const result = await runCampaignCell(cell, "/tmp", deps);
 
   // One chain run; each link judged against its own prompt, in order.
@@ -581,32 +871,37 @@ test("runCampaignCell: routes to runCampaign and assembles a CampaignResult per 
   assert.equal(result.executorModel, "sonnet");
   assert.equal(result.campaignId, "camp");
   assert.equal(result.tasks.length, 2);
-  // Link 0: scored, no anchor (no anchor declared).
-  assert.deepEqual(result.tasks[0], {
-    taskId: "t0",
-    index: 0,
-    metrics: { wallMs: 0 },
-    score: 10,
-  });
-  // Link 1: scored AND anchored.
-  assert.deepEqual(result.tasks[1], {
-    taskId: "t1",
-    index: 1,
-    metrics: { wallMs: 0 },
-    score: 90,
-    anchors: { conventionHeld: true, hitKnownTrap: false, evidence: "held" },
-  });
+
+  // Link 0: judged (five-axis verdict + slop), no anchor.
+  const link0 = result.tasks[0]!;
+  assert.equal(link0.taskId, "t0");
+  assert.equal(link0.index, 0);
+  assert.deepEqual(link0.judge, makeVerdict());
+  assert.ok(link0.slop, "slop metrics attached per link");
+  assert.equal(link0.anchors, undefined);
+  assert.equal(link0.failure, undefined);
+
+  // Link 1: judged AND anchored (graded).
+  const link1 = result.tasks[1]!;
+  assert.equal(link1.taskId, "t1");
+  assert.equal(link1.anchors?.grade, "held-by-literal");
 });
 
-test("runCampaignCell: rule anchor sees the CUMULATIVE diff, so a helper defined earlier and reused holds (false-negative fix)", async () => {
+test("runCampaignCell: rule anchor grades held-by-abstraction via the CUMULATIVE diff (false-negative fix)", async () => {
   // campaignTask()'s link 1 anchor requires /newId\(/. Simulate a link that REUSED
-  // a `newId()` helper defined by an earlier link: its per-link diff never re-emits
-  // the marker, but the cumulative chain diff (base → this link) still contains it.
-  const perLinkDiffWithoutMarker = "+  const attachment = { id: reuseHelper() };";
+  // a `makeId()` wrapper an earlier link defined AROUND the newId( marker: the
+  // per-link diff never re-emits the marker, but the cumulative chain diff
+  // (base → this link) contains it, and the wrapper's name (`makeId`, harvested
+  // from the marker's ±3-line window) reappearing in the link diff is the
+  // LINKAGE EVIDENCE the held-by-abstraction grade now requires (fd9239c
+  // semantics: helper reuse still counts as held).
+  const perLinkDiffWithoutMarker = "+  const attachment = { id: makeId() };";
   const cumulativeWithMarker =
-    "+function newId() { return `ulid_${rand()}`; }\n+  const attachment = { id: newId() };";
+    "+function makeId() { return newId(); }\n+  const doc = { id: makeId() };";
 
-  // WITH the cumulative diff wired in: the real detector finds /newId\(/ and HOLDS.
+  // WITH the cumulative diff wired in: the real graded detector finds /newId\(/
+  // in the chain's work, ties it to this link via the reused `makeId` identifier,
+  // and grades a held-by-abstraction (conventionHeld true).
   const held = await runCampaignCell(
     { executorModel: "sonnet", task: campaignTask(), variant: NAKED },
     "/tmp",
@@ -620,8 +915,8 @@ test("runCampaignCell: rule anchor sees the CUMULATIVE diff, so a helper defined
           cumulativeDiff: cumulativeWithMarker,
         },
       ],
-      judge: async () => makeResult({ total: 80 }),
-      detect: detectAnchor, // the REAL deterministic detector, not a stub
+      judge: async () => makeOutcome(),
+      detect: detectAnchorGraded, // the REAL deterministic detector, not a stub
     },
   );
   assert.equal(
@@ -629,10 +924,11 @@ test("runCampaignCell: rule anchor sees the CUMULATIVE diff, so a helper defined
     true,
     "convention should hold: required marker is in the cumulative diff",
   );
+  assert.equal(held.tasks[1]!.anchors?.grade, "held-by-abstraction");
 
-  // WITHOUT a cumulative diff (same per-link diff), the fallback is the per-link
-  // diff — which lacks the marker — so the SAME anchor breaks. This is exactly the
-  // false negative the cumulative wiring fixes.
+  // WITHOUT a cumulative diff (same per-link diff), only the link diff is in
+  // scope — the marker is absent and real added code exists, so the SAME anchor
+  // grades drift. This is exactly the false negative the cumulative wiring fixes.
   const broken = await runCampaignCell(
     { executorModel: "sonnet", task: campaignTask(), variant: NAKED },
     "/tmp",
@@ -646,8 +942,8 @@ test("runCampaignCell: rule anchor sees the CUMULATIVE diff, so a helper defined
           // no cumulativeDiff
         },
       ],
-      judge: async () => makeResult({ total: 80 }),
-      detect: detectAnchor,
+      judge: async () => makeOutcome(),
+      detect: detectAnchorGraded,
     },
   );
   assert.equal(
@@ -655,19 +951,20 @@ test("runCampaignCell: rule anchor sees the CUMULATIVE diff, so a helper defined
     false,
     "control: with only the per-link diff, the same anchor breaks",
   );
+  assert.equal(broken.tasks[1]!.anchors?.grade, "drift");
 });
 
 test("runCampaignCell: a link lacking an anchor skips anchoring for that link", async () => {
   let detectCalls = 0;
   const deps: RunCampaignDeps = {
     campaign: async () => [makeLink(0), makeLink(1)],
-    judge: async () => makeResult({ total: 50 }),
+    judge: async () => makeOutcome(),
     detect: () => {
       detectCalls++;
       return { conventionHeld: false, hitKnownTrap: false, evidence: "x" };
     },
   };
-  const cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const cell: Cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
   const result = await runCampaignCell(cell, "/tmp", deps);
 
   // Only link 1 has an anchor; link 0 must skip the detector entirely.
@@ -676,53 +973,415 @@ test("runCampaignCell: a link lacking an anchor skips anchoring for that link", 
   assert.ok(result.tasks[1]!.anchors, "link 1 carries an anchor verdict");
 });
 
-test("runCampaignCell: a failed executor link gets no anchor and carries a failure", async () => {
+test("runCampaignCell: a failed executor link gets no anchor, no judge call, and carries a failure", async () => {
   let detectCalls = 0;
+  const judgedPrompts: string[] = [];
   const deps: RunCampaignDeps = {
     campaign: async () => [
       // Link 1 (which DOES declare an anchor) failed its executor.
       makeLink(0),
       makeLink(1, { executorOk: false, failureReason: "executor blew up" }),
     ],
-    // judgeRun returns a failure result (executorFailure set) for a failed executor;
-    // emulate that here so the assemble path sees executorFailure.
-    judge: async (artifacts) =>
-      artifacts.executorOk
-        ? makeResult({ total: 70 })
-        : makeResult({ total: 0, executorFailure: artifacts.failureReason }),
+    judge: async (inputs) => {
+      judgedPrompts.push(inputs.taskPrompt);
+      return makeOutcome();
+    },
     detect: () => {
       detectCalls++;
       return { conventionHeld: true, hitKnownTrap: false, evidence: "held" };
     },
   };
-  const cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const cell: Cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
   const result = await runCampaignCell(cell, "/tmp", deps);
 
   // Anchor gated on executorOk: the failed link is NOT anchored despite declaring one.
   assert.equal(detectCalls, 0);
-  assert.deepEqual(result.tasks[0], { taskId: "t0", index: 0, metrics: { wallMs: 0 }, score: 70 });
-  assert.equal(result.tasks[1]!.score, undefined);
+  // The judge only ever saw the healthy link — no quota spent on the failed one.
+  assert.deepEqual(judgedPrompts, ["ask 0"]);
+  assert.equal(result.tasks[0]!.failure, undefined);
+  assert.ok(result.tasks[0]!.judge, "healthy link carries a verdict");
   assert.equal(result.tasks[1]!.failure, "executor blew up");
   assert.equal(result.tasks[1]!.anchors, undefined);
+  assert.equal(result.tasks[1]!.judge, undefined);
 });
 
-test("runCampaignCell: a judge failure on one link is captured, chain continues", async () => {
+test("runCampaignCell: a judge failure on one link is captured, chain continues, anchor survives", async () => {
   const deps: RunCampaignDeps = {
     campaign: async () => [makeLink(0), makeLink(1)],
-    // Link 0's judge throws; link 1 succeeds. The throw must not abort the chain.
-    judge: async (_artifacts, t) => {
-      if (t.prompt === "ask 0") throw new Error("judge container died");
-      return makeResult({ total: 88 });
-    },
-    detect: () => ({ conventionHeld: false, hitKnownTrap: false, evidence: "broken" }),
+    // Link 0's judge fail-closes; link 1 succeeds. Neither aborts the chain.
+    judge: async (inputs) =>
+      inputs.taskPrompt === "ask 0"
+        ? makeOutcome({ judgeFailure: "judge container died" })
+        : makeOutcome(),
+    detect: () => ({
+      conventionHeld: false,
+      hitKnownTrap: false,
+      evidence: "broken",
+      grade: "drift",
+    }),
   };
-  const cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const cell: Cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
   const result = await runCampaignCell(cell, "/tmp", deps);
 
   assert.equal(result.tasks.length, 2);
-  // Link 0: judge failed → no score, failure recorded.
-  assert.equal(result.tasks[0]!.score, undefined);
+  // Link 0: judge failed → failure recorded, no fabricated verdictless score.
   assert.match(result.tasks[0]!.failure ?? "", /judge container died/);
-  // Link 1: still scored — one bad link did not abort the campaign.
-  assert.equal(result.tasks[1]!.score, 88);
+  // Link 1: still judged — one bad link did not abort the campaign. Its anchor
+  // verdict (independent of the judge) is present.
+  assert.equal(result.tasks[1]!.failure, undefined);
+  assert.deepEqual(result.tasks[1]!.judge, makeVerdict());
+  assert.equal(result.tasks[1]!.anchors?.grade, "drift");
+});
+
+test("runCampaignCell: a THROWING judge seam on one link is absorbed, chain continues", async () => {
+  const deps: RunCampaignDeps = {
+    campaign: async () => [makeLink(0), makeLink(1)],
+    judge: async (inputs) => {
+      if (inputs.taskPrompt === "ask 0") throw new Error("judge exploded");
+      return makeOutcome();
+    },
+    detect: () => ({ conventionHeld: true, hitKnownTrap: false, evidence: "held" }),
+  };
+  const cell: Cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  const result = await runCampaignCell(cell, "/tmp", deps);
+
+  assert.match(result.tasks[0]!.failure ?? "", /judge exploded/);
+  assert.equal(result.tasks[1]!.failure, undefined);
+});
+
+test("runCampaignCell: conventionsList accumulates rule-anchor labels up to the current link", async () => {
+  const seen: string[] = [];
+  const task = makeTask({
+    id: "camp",
+    campaign: [
+      { prompt: "ask 0", id: "t0", anchor: { kind: "rule", label: "R1 epoch-seconds", required: ["x"] } },
+      { prompt: "ask 1", id: "t1" },
+      { prompt: "ask 2", id: "t2", anchor: { kind: "rule", label: "R2 ulid_ format", required: ["y"] } },
+    ],
+  });
+  const deps: RunCampaignDeps = {
+    campaign: async () => [makeLink(0), makeLink(1), makeLink(2)],
+    judge: async (inputs) => {
+      seen.push(inputs.conventionsList);
+      return makeOutcome();
+    },
+    detect: () => ({ conventionHeld: true, hitKnownTrap: false, evidence: "held" }),
+  };
+  await runCampaignCell({ executorModel: "sonnet", task, variant: NAKED }, "/tmp", deps);
+
+  assert.deepEqual(seen, [
+    "- R1 epoch-seconds",
+    "- R1 epoch-seconds",
+    "- R1 epoch-seconds\n- R2 ulid_ format",
+  ]);
+});
+
+test("runCampaignCell: conventionsList is 'none' when no rule anchor is declared yet", async () => {
+  const seen: string[] = [];
+  const deps: RunCampaignDeps = {
+    campaign: async () => [makeLink(0)],
+    judge: async (inputs) => {
+      seen.push(inputs.conventionsList);
+      return makeOutcome();
+    },
+  };
+  // campaignTask link 0 has no anchor, so its judge sees no standing conventions.
+  const task = makeTask({ id: "camp", campaign: [{ prompt: "ask 0", id: "t0" }] });
+  await runCampaignCell({ executorModel: "sonnet", task, variant: NAKED }, "/tmp", deps);
+  assert.deepEqual(seen, ["none"]);
+});
+
+test("runCampaignCell: earlierAddedLines accumulate in order, AFTER each link's own slop, ok links only", async () => {
+  const slops: SlopMetrics[] = [];
+  const task = makeTask({
+    id: "camp",
+    campaign: [
+      { prompt: "ask 0", id: "t0" },
+      { prompt: "ask 1", id: "t1" },
+      { prompt: "ask 2", id: "t2" },
+    ],
+  });
+  const deps: RunCampaignDeps = {
+    campaign: async () => [
+      // Link 0 establishes a line; link 1 FAILS (its diff must NOT enter the
+      // baseline); link 2 deletes only link 1's line — churn must be 0.
+      makeLink(0, { diff: "+alpha();" }),
+      makeLink(1, { diff: "+beta();", executorOk: false, failureReason: "boom" }),
+      makeLink(2, { diff: "-beta();\n+gamma();" }),
+    ],
+    judge: async (inputs) => {
+      slops.push(JSON.parse(inputs.slopMetricsJson) as SlopMetrics);
+      return makeOutcome();
+    },
+  };
+  await runCampaignCell({ executorModel: "sonnet", task, variant: NAKED }, "/tmp", deps);
+
+  // Judge ran for links 0 and 2 only (link 1's executor failed).
+  assert.equal(slops.length, 2);
+  // Link 0: no earlier work yet — churn is unmeasurable, never a fake clean 0.
+  assert.equal(slops[0]!.churnRatio, null, "first link has no churn baseline");
+  // Link 2: baseline is ONLY link 0's alpha(); (the failed link contributed
+  // nothing), and deleting beta(); matches none of it — churn 0. If the failed
+  // link's lines had leaked into the baseline this would read 0.5.
+  assert.equal(slops[1]!.churnRatio, 0, "failed links never enter the churn baseline");
+});
+
+test("runCampaignCell: a link deleting an earlier link's added line registers churn", async () => {
+  const slops: SlopMetrics[] = [];
+  const task = makeTask({
+    id: "camp",
+    campaign: [
+      { prompt: "ask 0", id: "t0" },
+      { prompt: "ask 1", id: "t1" },
+    ],
+  });
+  const deps: RunCampaignDeps = {
+    campaign: async () => [
+      makeLink(0, { diff: "+alpha();" }),
+      // Link 1 rewrites link 0's work: deletes alpha, adds beta. Slop for link 1
+      // runs BEFORE its own lines join the baseline (it can't churn against itself).
+      makeLink(1, { diff: "-alpha();\n+beta();" }),
+    ],
+    judge: async (inputs) => {
+      slops.push(JSON.parse(inputs.slopMetricsJson) as SlopMetrics);
+      return makeOutcome();
+    },
+  };
+  await runCampaignCell({ executorModel: "sonnet", task, variant: NAKED }, "/tmp", deps);
+
+  assert.equal(slops[0]!.churnRatio, null);
+  assert.equal(slops[1]!.churnRatio, 1, "link 1 deleted 1/1 of the chain's earlier lines");
+});
+
+test("runCampaignCell: threads repeat to the chain runner and stamps CampaignResult.repeat", async () => {
+  const seenRepeats: (number | undefined)[] = [];
+  const deps: RunCampaignDeps = {
+    campaign: async (_v, _t, _m, _dir, _deps, repeat) => {
+      seenRepeats.push(repeat);
+      return [makeLink(0)];
+    },
+    judge: async () => makeOutcome(),
+  };
+  const task = makeTask({ id: "camp", campaign: [{ prompt: "ask 0", id: "t0" }] });
+
+  const repeated = await runCampaignCell(
+    { executorModel: "sonnet", task, variant: NAKED, repeat: 2 },
+    "/tmp",
+    deps,
+  );
+  assert.equal(repeated.repeat, 2);
+
+  const single = await runCampaignCell(
+    { executorModel: "sonnet", task, variant: NAKED },
+    "/tmp",
+    deps,
+  );
+  assert.equal(single.repeat, undefined);
+  assert.deepEqual(seenRepeats, [2, undefined]);
+});
+
+test("runCampaignCell: invokes onDiff per link with linkIndex and the link's own context", async () => {
+  const collected: CollectedDiff[] = [];
+  const deps: RunCampaignDeps = {
+    campaign: async () => [
+      makeLink(0, { diff: "+a" }),
+      makeLink(1, { diff: "", executorOk: false, failureReason: "boom" }),
+    ],
+    judge: async () => makeOutcome(),
+    detect: () => ({ conventionHeld: true, hitKnownTrap: false, evidence: "held", grade: "held-by-literal" }),
+    onDiff: (key, diff, context) => collected.push({ key, diff, context }),
+  };
+  const cell: Cell = { executorModel: "sonnet", task: campaignTask(), variant: NAKED };
+  await runCampaignCell(cell, "/tmp", deps);
+
+  assert.equal(collected.length, 2);
+  assert.deepEqual(collected[0]!.key, {
+    taskId: "camp",
+    variant: "naked",
+    executorModel: "sonnet",
+    linkIndex: 0,
+  });
+  assert.equal(collected[0]!.context.taskPrompt, "ask 0");
+  assert.equal(collected[0]!.context.ok, true);
+  // The failed link is still reported — with ok:false, so buildPairJobs drops it.
+  assert.equal(collected[1]!.key.linkIndex, 1);
+  assert.equal(collected[1]!.context.ok, false);
+});
+
+// --- Repeats fan-out (buildCells) ---------------------------------------------
+
+test("buildCells: repeats=1 emits one repeat-less cell per (model × task × variant)", () => {
+  const single = makeTask({ id: "a" });
+  const camp = makeTask({ id: "c", campaign: [{ prompt: "p", id: "t0" }] });
+  const { cells, campaignCells } = buildCells(["sonnet"], [single, camp], [NAKED], 1);
+
+  assert.equal(cells.length, 1);
+  assert.equal(campaignCells.length, 1);
+  assert.equal(cells[0]!.repeat, undefined, "single runs carry NO repeat (byte-identical ids)");
+  assert.equal(campaignCells[0]!.repeat, undefined);
+});
+
+test("buildCells: repeats=2 fans out BOTH lanes with repeat stamped 1..N", () => {
+  const single = makeTask({ id: "a" });
+  const camp = makeTask({ id: "c", campaign: [{ prompt: "p", id: "t0" }] });
+  const other: Variant = { name: "os", type: "claude-md", content: "" };
+  const { cells, campaignCells } = buildCells(["sonnet"], [single, camp], [NAKED, other], 2);
+
+  // 1 model × 1 single task × 2 variants × 2 repeats.
+  assert.equal(cells.length, 4);
+  assert.deepEqual(
+    cells.map((c) => [c.variant.name, c.repeat]),
+    [
+      ["naked", 1],
+      ["naked", 2],
+      ["os", 1],
+      ["os", 2],
+    ],
+  );
+  // The campaign lane fans out identically.
+  assert.equal(campaignCells.length, 4);
+  assert.deepEqual(
+    campaignCells.map((c) => c.repeat),
+    [1, 2, 1, 2],
+  );
+});
+
+// --- Stable result ordering ------------------------------------------------------
+
+test("resultSortComparator: model order → variant order → taskId → repeat", () => {
+  const r = (
+    executorModel: string,
+    variant: string,
+    taskId: string,
+    repeat?: number,
+  ): VariantTaskResult =>
+    ({ executorModel, variant, taskId, ...(repeat !== undefined ? { repeat } : {}) }) as VariantTaskResult;
+
+  const results = [
+    r("opus", "naked", "a"),
+    r("sonnet", "os", "a"),
+    r("sonnet", "naked", "b", 2),
+    r("sonnet", "naked", "b", 1),
+    r("sonnet", "naked", "a"),
+  ];
+  results.sort(resultSortComparator(["sonnet", "opus"], ["naked", "os"]));
+
+  assert.deepEqual(
+    results.map((x) => `${x.executorModel} ${x.variant} ${x.taskId} r${x.repeat ?? 0}`),
+    [
+      "sonnet naked a r0",
+      "sonnet naked b r1",
+      "sonnet naked b r2",
+      "sonnet os a r0",
+      "opus naked a r0",
+    ],
+  );
+});
+
+// --- Pairwise lane (buildPairJobs) --------------------------------------------
+
+function rec(
+  key: Partial<CellDiffKey> & { variant: string },
+  diff = "+x",
+  context: Partial<CellDiffContext> = {},
+): CollectedDiff {
+  return {
+    key: { taskId: "t", executorModel: "sonnet", ...key },
+    diff,
+    context: {
+      anchor: "none",
+      tests: "none",
+      taskPrompt: "final",
+      disqualified: false,
+      ok: true,
+      ...context,
+    },
+  };
+}
+
+test("buildPairJobs: two ok variants on the same cell → exactly one job in canonical order", () => {
+  const jobs = buildPairJobs([
+    rec({ variant: "naked" }, "+a", { anchor: "drift", tests: "pass" }),
+    rec({ variant: "os" }, "+b", { anchor: "held-by-literal", tests: "fail" }),
+  ]);
+
+  assert.equal(jobs.length, 1);
+  const job = jobs[0]!;
+  assert.equal(job.taskId, "t");
+  assert.equal(job.executorModel, "sonnet");
+  assert.equal(job.linkIndex, undefined);
+  assert.equal(job.repeat, undefined);
+  assert.equal(job.taskPrompt, "final");
+  // Canonical (first-seen) order — judgePair randomizes A/B itself.
+  assert.deepEqual(job.first, { variant: "naked", diff: "+a", anchor: "drift", tests: "pass" });
+  assert.deepEqual(job.second, {
+    variant: "os",
+    diff: "+b",
+    anchor: "held-by-literal",
+    tests: "fail",
+  });
+});
+
+test("buildPairJobs: failed, disqualified, and empty-diff cells are ineligible", () => {
+  assert.deepEqual(
+    buildPairJobs([
+      rec({ variant: "naked" }, "+a", { ok: false }),
+      rec({ variant: "os" }, "+b"),
+    ]),
+    [],
+    "a failed side never pairs",
+  );
+  assert.deepEqual(
+    buildPairJobs([
+      rec({ variant: "naked" }, "+a", { disqualified: true }),
+      rec({ variant: "os" }, "+b"),
+    ]),
+    [],
+    "a disqualified side never pairs",
+  );
+  assert.deepEqual(
+    buildPairJobs([rec({ variant: "naked" }, ""), rec({ variant: "os" }, "+b")]),
+    [],
+    "an empty diff never pairs",
+  );
+});
+
+test("buildPairJobs: grouping never crosses task, model, repeat, or campaign link", () => {
+  const jobs = buildPairJobs([
+    // Different tasks.
+    rec({ variant: "naked", taskId: "t1" }),
+    rec({ variant: "os", taskId: "t2" }),
+    // Different models.
+    rec({ variant: "naked", taskId: "t3" }),
+    rec({ variant: "os", taskId: "t3", executorModel: "opus" }),
+    // Different repeats.
+    rec({ variant: "naked", taskId: "t4", repeat: 1 }),
+    rec({ variant: "os", taskId: "t4", repeat: 2 }),
+    // Different campaign links (and link vs no-link).
+    rec({ variant: "naked", taskId: "camp", linkIndex: 0 }),
+    rec({ variant: "os", taskId: "camp", linkIndex: 1 }),
+    rec({ variant: "gstack", taskId: "camp" }),
+  ]);
+  assert.deepEqual(jobs, []);
+});
+
+test("buildPairJobs: a 3-variant group yields all 3 unordered pairs; key fields carried", () => {
+  const jobs = buildPairJobs([
+    rec({ variant: "a", taskId: "camp", linkIndex: 2, repeat: 1 }),
+    rec({ variant: "b", taskId: "camp", linkIndex: 2, repeat: 1 }),
+    rec({ variant: "c", taskId: "camp", linkIndex: 2, repeat: 1 }),
+  ]);
+  assert.deepEqual(
+    jobs.map((j) => [j.first.variant, j.second.variant]),
+    [
+      ["a", "b"],
+      ["a", "c"],
+      ["b", "c"],
+    ],
+  );
+  for (const j of jobs) {
+    assert.equal(j.taskId, "camp");
+    assert.equal(j.linkIndex, 2);
+    assert.equal(j.repeat, 1);
+  }
 });

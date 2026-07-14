@@ -5,7 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { runCampaign } from "./executor.js";
 import type { ExecutorRunner } from "./executor.js";
-import { detectAnchor } from "./anchors.js";
+import { detectAnchorGraded } from "./anchors.js";
 import { loadTasks } from "./cli.js";
 import { renderReportMarkdown } from "./report.js";
 import type { ContainerResult } from "./docker.js";
@@ -16,8 +16,9 @@ import type { AnchorResult, CampaignResult, Report, Task, Variant } from "./type
  * live only at the executor boundary: a memory-carrying agent records the two
  * conventions (R1 epoch-seconds, R2 ulid_ format) on links 1-2 and APPLIES them on links
  * 3-5; a memoryless agent writes the natural DEFAULT that DRIFTS. The verdict is
- * the REAL `detectAnchor` on the REAL fixture anchors, driven by the REAL
- * `runCampaign` (one persistent workspace, memory accumulating across links).
+ * the REAL GRADED detector (`detectAnchorGraded`, link + cumulative diff scopes)
+ * on the REAL fixture anchors, driven by the REAL `runCampaign` (one persistent
+ * workspace, memory accumulating across links).
  */
 
 const V_CARRYING: Variant = { name: "agentic-os", type: "claude-md", content: "# memory discipline" };
@@ -126,7 +127,9 @@ interface LinkRow {
   verdict?: AnchorResult;
 }
 
-/** Drive the REAL runCampaign with a fake executor, then apply the REAL detector. */
+/** Drive the REAL runCampaign with a fake executor, then apply the REAL GRADED
+ *  detector — the link's own diff plus the chain's cumulative diff, exactly as
+ *  runCampaignCell wires it. */
 async function runAndAnchor(
   variant: Variant,
   task: Task,
@@ -139,11 +142,20 @@ async function runAndAnchor(
     const anchor = campaign[link.index]?.anchor;
     const verdict =
       anchor && link.artifacts.executorOk
-        ? detectAnchor(anchor, {
-            diff: link.artifacts.diff,
-            metrics: link.artifacts.executorMetrics,
-            timedOut: link.artifacts.executorTimedOut,
-          })
+        ? detectAnchorGraded(
+            anchor,
+            {
+              diff: link.artifacts.diff,
+              metrics: link.artifacts.executorMetrics,
+              timedOut: link.artifacts.executorTimedOut,
+            },
+            {
+              linkDiff: link.artifacts.diff,
+              ...(link.cumulativeDiff !== undefined
+                ? { cumulativeDiff: link.cumulativeDiff }
+                : {}),
+            },
+          )
         : undefined;
     return {
       index: link.index,
@@ -169,6 +181,12 @@ test("campaign: memory-carrying adheres on every anchored link, memory persists,
     assert.equal(adheredCount(rows), 3, "memory-carrying adheres on all three");
     for (const r of rows.filter((x) => x.hasAnchor)) {
       assert.equal(r.verdict?.conventionHeld, true, `link ${r.index} (${r.campaignTaskId}) held`);
+      // Each link re-emits the convention markers in its OWN diff → literal hold.
+      assert.equal(
+        r.verdict?.grade,
+        "held-by-literal",
+        `link ${r.index} (${r.campaignTaskId}) grades a literal hold`,
+      );
     }
 
     // Per-link isolation: link 3's diff is its OWN change, not link 1's committed work.
@@ -194,8 +212,11 @@ test("campaign: memoryless drifts on every anchored link (0/3), hits the id trap
     for (const r of rows.filter((x) => x.hasAnchor)) {
       assert.equal(r.verdict?.conventionHeld, false, `link ${r.index} (${r.campaignTaskId}) drifts`);
     }
+    // t3 (index 2): bare Date.now() misses R1 but trips no forbidden marker → drift.
+    assert.equal(rows[2]!.verdict?.grade, "drift", "bare-ms timestamp grades drift");
     // t4 (index 3) reached for crypto.randomUUID → the R2 known trap fires.
     assert.equal(rows[3]!.verdict?.hitKnownTrap, true, "randomUUID trips the R2 trap");
+    assert.equal(rows[3]!.verdict?.grade, "trap", "randomUUID grades trap");
   });
 });
 
@@ -210,6 +231,8 @@ test("campaign: the 3/3-vs-0/3 divergence renders in the Memory effect (campaign
     assert.equal(adheredCount(memless), 0);
     assert.notEqual(adheredCount(carry), adheredCount(memless));
 
+    // Five-axis shape: links carry only identity + metrics + anchors, exactly
+    // as runCampaignCell assembles them.
     const toResult = (variant: string, rows: LinkRow[]): CampaignResult => ({
       variant,
       executorModel: "sonnet",
@@ -218,7 +241,6 @@ test("campaign: the 3/3-vs-0/3 divergence renders in the Memory effect (campaign
         taskId: r.campaignTaskId,
         index: r.index,
         metrics: { wallMs: 1 },
-        score: 75,
         ...(r.verdict ? { anchors: r.verdict } : {}),
       })),
     });
@@ -238,5 +260,9 @@ test("campaign: the 3/3-vs-0/3 divergence renders in the Memory effect (campaign
     assert.match(md, /Memory effect \(campaign/, "campaign memory-effect section renders");
     assert.match(md, /3\/3/, "agentic-os cumulative 3/3 shown");
     assert.match(md, /0\/3/, "naked cumulative 0/3 shown");
+    // Graded verdicts render grade symbols (with the legend), not the legacy strings.
+    assert.match(md, /✓L = held-by-literal/, "grade legend renders for graded links");
+    assert.match(md, /✓L/, "carrying links render the literal-hold symbol");
+    assert.match(md, /⚠/, "the memoryless trap link renders the trap symbol");
   });
 });

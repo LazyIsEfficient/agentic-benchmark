@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { captureArtifacts } from "./capture.js";
-import { prepareWorkspace, resolveWithin, slugify } from "./workspace.js";
+import { buildCellId, prepareWorkspace, resolveWithin, slugify } from "./workspace.js";
 import type { BundleVariant, Task, Variant } from "./types.js";
 
 const base = "/tmp/base";
@@ -32,6 +32,69 @@ test("prepareWorkspace cellIds carry the model slug (no timestamp) and are uniqu
     assert.equal(b.cellId, "tid__v__opus");
     assert.notEqual(a.cellId, b.cellId);
     assert.equal(a.cellDir, path.join(runResultsDir, "tid__v__sonnet"));
+  } finally {
+    await fs.rm(runResultsDir, { recursive: true, force: true });
+  }
+});
+
+test("buildCellId without repeat matches today's single-run format byte-for-byte", () => {
+  // Snapshot of the pre-repeats format: default runs must produce unchanged
+  // cellIds, dir names, and report keys.
+  assert.equal(buildCellId("tid", "v", "sonnet"), "tid__v__sonnet");
+  assert.equal(buildCellId("tid", "v", "sonnet", undefined), "tid__v__sonnet");
+  assert.equal(
+    buildCellId("campaign-01", "baseline", "claude-opus-4-8"),
+    "campaign-01__baseline__claude-opus-4-8",
+  );
+});
+
+test("buildCellId with repeat appends __r<N>, distinct per repeat", () => {
+  assert.equal(buildCellId("tid", "v", "opus", 1), "tid__v__opus__r1");
+  assert.equal(buildCellId("tid", "v", "opus", 2), "tid__v__opus__r2");
+  assert.notEqual(buildCellId("tid", "v", "opus", 1), buildCellId("tid", "v", "opus", 2));
+});
+
+test("buildCellId throws RangeError on a non-positive-integer repeat", () => {
+  assert.throws(() => buildCellId("tid", "v", "opus", 0), RangeError);
+  assert.throws(() => buildCellId("tid", "v", "opus", -1), RangeError);
+  assert.throws(() => buildCellId("tid", "v", "opus", 1.5), RangeError);
+});
+
+test("prepareWorkspace threads repeat into cellId and gives repeats distinct dirs", async () => {
+  const variant: Variant = { name: "v", type: "claude-md", content: "# CLAUDE\n" };
+  const task: Task = {
+    meta: { id: "tid", title: "t", logicBearing: true, securityRelevant: false },
+    dir: "/nonexistent",
+    prompt: "x",
+  };
+  const runResultsDir = await tmpResultsDir();
+  try {
+    const r1 = await prepareWorkspace(variant, task, "opus", runResultsDir, 1);
+    const r2 = await prepareWorkspace(variant, task, "opus", runResultsDir, 2);
+    assert.equal(r1.cellId, "tid__v__opus__r1");
+    assert.equal(r2.cellId, "tid__v__opus__r2");
+    assert.equal(r1.cellDir, path.join(runResultsDir, "tid__v__opus__r1"));
+    assert.equal(r2.cellDir, path.join(runResultsDir, "tid__v__opus__r2"));
+    assert.notEqual(r1.workspaceDir, r2.workspaceDir);
+    // Both repeat workspaces really exist on disk as separate directories.
+    assert.ok((await fs.stat(r1.workspaceDir)).isDirectory());
+    assert.ok((await fs.stat(r2.workspaceDir)).isDirectory());
+  } finally {
+    await fs.rm(runResultsDir, { recursive: true, force: true });
+  }
+});
+
+test("prepareWorkspace rejects an invalid repeat before touching disk", async () => {
+  const variant: Variant = { name: "v", type: "claude-md", content: "# CLAUDE\n" };
+  const task: Task = {
+    meta: { id: "tid", title: "t", logicBearing: true, securityRelevant: false },
+    dir: "/nonexistent",
+    prompt: "x",
+  };
+  const runResultsDir = await tmpResultsDir();
+  try {
+    await assert.rejects(prepareWorkspace(variant, task, "opus", runResultsDir, 0), RangeError);
+    assert.deepEqual(await fs.readdir(runResultsDir), [], "no cell dir created on failure");
   } finally {
     await fs.rm(runResultsDir, { recursive: true, force: true });
   }

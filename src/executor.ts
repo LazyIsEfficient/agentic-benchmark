@@ -3,7 +3,7 @@ import path from "node:path";
 import { createWriteStream } from "node:fs";
 import { captureArtifacts } from "./capture.js";
 import { EXECUTOR_MAX_ATTEMPTS, RETRY_BASE_MS, WORKSPACE_CONFIG_DIR } from "./config.js";
-import { runExecutor, runSetup } from "./docker.js";
+import { runExecutor, runSetup, runTests } from "./docker.js";
 import type { ContainerResult } from "./docker.js";
 import { extractLastResultEvent, parseCallMetrics } from "./metrics.js";
 import { withRetry } from "./retry.js";
@@ -13,6 +13,7 @@ import type {
   RunArtifacts,
   SetupBundleVariant,
   Task,
+  TestResults,
   Variant,
 } from "./types.js";
 
@@ -78,12 +79,18 @@ async function runOnce(
   task: Task,
   executorModel: string,
   runResultsDir: string,
+  deps: SequenceDeps = {},
+  repeat?: number,
 ): Promise<RunArtifacts> {
-  const { cellId, cellDir, workspaceDir } = await prepareWorkspace(
+  const prepare = deps.prepare ?? prepareWorkspace;
+  const runExecutorFn = deps.runExecutorFn ?? runExecutor;
+  const runTestsFn = deps.runTestsFn ?? runTests;
+  const { cellId, cellDir, workspaceDir } = await prepare(
     variant,
     task,
     executorModel,
     runResultsDir,
+    repeat,
   );
 
   // Setup-bundle pre-step: register skills into <workspace>/.claude BEFORE the
@@ -119,7 +126,7 @@ async function runOnce(
   let wallMs = 0;
 
   try {
-    const result = await runExecutor({
+    const result = await runExecutorFn({
       workspaceDir,
       taskPrompt: task.prompt,
       model: executorModel,
@@ -152,7 +159,7 @@ async function runOnce(
   // error or an oversized diff. A capture failure must degrade only this one run
   // to failed, never abort the whole matrix, so it is guarded here.
   try {
-    return await captureArtifacts({
+    const artifacts = await captureArtifacts({
       cellId,
       variant: variant.name,
       taskId: task.meta.id,
@@ -165,6 +172,14 @@ async function runOnce(
       executorMetrics,
       ...(failureReason ? { failureReason } : {}),
     });
+    // Deterministic Correctness axis: run the task's testCommand against the
+    // finished workspace. Skipped when there is no command OR the executor
+    // failed (nothing meaningful to test) — leaving testResults undefined,
+    // which downstream reads as "no executable tests".
+    if (executorOk && task.meta.testCommand) {
+      artifacts.testResults = await runTestsSafe(runTestsFn, workspaceDir, task.meta.testCommand);
+    }
+    return artifacts;
   } catch (err) {
     return {
       cellId,
@@ -243,8 +258,10 @@ export async function runVariantTask(
   task: Task,
   executorModel: string,
   runResultsDir: string,
+  deps: SequenceDeps = {},
+  repeat?: number,
 ): Promise<RunArtifacts> {
-  return runWithExecutorRetry(() => runOnce(variant, task, executorModel, runResultsDir), {
+  return runWithExecutorRetry(() => runOnce(variant, task, executorModel, runResultsDir, deps, repeat), {
     maxAttempts: EXECUTOR_MAX_ATTEMPTS,
     baseMs: RETRY_BASE_MS,
     onRetry: (failedAttempt, err) =>
@@ -260,10 +277,33 @@ export async function runVariantTask(
  *  without spawning real containers. */
 export type ExecutorRunner = typeof runExecutor;
 
-/** Injectable seams for {@link runSequenceTask} (tests only; real deps default). */
+/** The test runner shape — injectable so testCommand wiring is unit-testable
+ *  without spawning real containers. */
+export type TestRunner = typeof runTests;
+
+/** Injectable seams for the single/sequence/campaign runners (tests only; real
+ *  deps default). */
 export interface SequenceDeps {
   prepare?: typeof prepareWorkspace;
   runExecutorFn?: ExecutorRunner;
+  runTestsFn?: TestRunner;
+}
+
+/**
+ * Run a testCommand against the workspace, never throwing: a docker/spawn crash
+ * degrades to ok:false with the error message in raw. Correctness must fail
+ * loudly on a broken harness — but it must never kill the cell.
+ */
+async function runTestsSafe(
+  runTestsFn: TestRunner,
+  workspaceDir: string,
+  command: string,
+): Promise<TestResults> {
+  try {
+    return await runTestsFn({ workspaceDir, command });
+  } catch (err) {
+    return { command, ok: false, raw: (err as Error).message };
+  }
 }
 
 /** Build a failed-cell RunArtifacts (no diff/transcript) — the sequence path's
@@ -432,9 +472,11 @@ export async function runSequenceTask(
   executorModel: string,
   runResultsDir: string,
   deps: SequenceDeps = {},
+  repeat?: number,
 ): Promise<RunArtifacts> {
   const prepare = deps.prepare ?? prepareWorkspace;
   const runExecutorFn = deps.runExecutorFn ?? runExecutor;
+  const runTestsFn = deps.runTestsFn ?? runTests;
 
   // ONCE: any re-prepare between steps would wipe accumulated memory.
   const { cellId, cellDir, workspaceDir } = await prepare(
@@ -442,6 +484,7 @@ export async function runSequenceTask(
     task,
     executorModel,
     runResultsDir,
+    repeat,
   );
 
   // Exclude the ENTIRE `.claude/` tree from every step commit UNCONDITIONALLY
@@ -540,6 +583,17 @@ export async function runSequenceTask(
     };
   }
 
+  // Deterministic Correctness axis: run the task's testCommand ONCE against the
+  // FINAL workspace state (every step's work is present on the bind mount).
+  // Skipped when there is no command or the cell already failed — including the
+  // prior-step demotion above, whose whole point is "this result is unreliable".
+  if (finalArtifacts.executorOk && task.meta.testCommand) {
+    finalArtifacts = {
+      ...finalArtifacts,
+      testResults: await runTestsSafe(runTestsFn, workspaceDir, task.meta.testCommand),
+    };
+  }
+
   return finalArtifacts;
 }
 
@@ -569,6 +623,13 @@ export interface CampaignTaskArtifacts {
    * (the anchor then falls back to `artifacts.diff`).
    */
   cumulativeDiff?: string;
+  /**
+   * Deterministic testCommand verdict for THIS link (`link.testCommand ??
+   * meta.testCommand`), run against the workspace state after the link finished.
+   * Absent when no command applies or the link's executor failed — downstream
+   * that absence means "no executable tests", never a failure.
+   */
+  testResults?: TestResults;
 }
 
 /**
@@ -597,9 +658,11 @@ export async function runCampaign(
   executorModel: string,
   runResultsDir: string,
   deps: SequenceDeps = {},
+  repeat?: number,
 ): Promise<CampaignTaskArtifacts[]> {
   const prepare = deps.prepare ?? prepareWorkspace;
   const runExecutorFn = deps.runExecutorFn ?? runExecutor;
+  const runTestsFn = deps.runTestsFn ?? runTests;
 
   // ONCE: any re-prepare between links would wipe accumulated memory.
   const { cellId, cellDir, workspaceDir } = await prepare(
@@ -607,6 +670,7 @@ export async function runCampaign(
     task,
     executorModel,
     runResultsDir,
+    repeat,
   );
 
   // Exclude the ENTIRE `.claude/` tree from every link commit UNCONDITIONALLY
@@ -696,7 +760,22 @@ export async function runCampaign(
       () => undefined,
     );
 
-    results.push({ campaignTaskId: id, index: i, artifacts, ...(cumulativeDiff !== undefined && { cumulativeDiff }) });
+    // Deterministic Correctness axis, per link: the link-level command overrides
+    // the chain-wide one (later links accrete code and often need a wider suite).
+    // Skipped for a failed link — nothing meaningful to test.
+    const testCommand = campaign[i]!.testCommand ?? task.meta.testCommand;
+    const testResults =
+      artifacts.executorOk && testCommand
+        ? await runTestsSafe(runTestsFn, workspaceDir, testCommand)
+        : undefined;
+
+    results.push({
+      campaignTaskId: id,
+      index: i,
+      artifacts,
+      ...(cumulativeDiff !== undefined && { cumulativeDiff }),
+      ...(testResults !== undefined && { testResults }),
+    });
   }
 
   return results;
