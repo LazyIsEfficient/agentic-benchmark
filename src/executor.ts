@@ -559,6 +559,16 @@ export interface CampaignTaskArtifacts {
   index: number;
   /** The link's captured artifacts (executorOk=false on failure). */
   artifacts: RunArtifacts;
+  /**
+   * Unified diff of ALL campaign work from the chain's base commit through this
+   * link — the cumulative counterpart to the per-link `artifacts.diff`. A `rule`
+   * anchor is evaluated against THIS so a convention encoded in a helper defined by
+   * an earlier link and reused here (e.g. a `generateId()` that returns a `ulid_`)
+   * still counts as held instead of false-negativing because the per-link diff
+   * lacks the literal. Undefined if the cumulative `git diff` could not be captured
+   * (the anchor then falls back to `artifacts.diff`).
+   */
+  cumulativeDiff?: string;
 }
 
 /**
@@ -644,6 +654,9 @@ export async function runCampaign(
   // First link diffs against the prepareWorkspace baseline commit; each later
   // link diffs against the commit the previous link produced.
   let baselineRef = (await git(workspaceDir, ["rev-parse", "HEAD"])).trim();
+  // Fixed chain base for the cumulative anchor diff: never advances across links,
+  // so the cumulative diff always spans base → the current link's commit.
+  const campaignBaseRef = baselineRef;
   const results: CampaignTaskArtifacts[] = [];
 
   for (let i = 0; i < campaign.length; i++) {
@@ -674,7 +687,16 @@ export async function runCampaign(
     // does NOT stage `.claude/` (excluded), so memory persists uncommitted.
     baselineRef = await commitStep(workspaceDir, `task ${taskNum}`);
 
-    results.push({ campaignTaskId: id, index: i, artifacts });
+    // Cumulative diff (chain base → this link's commit) for the anchor: lets a
+    // convention encoded in an earlier link's helper and reused here still count as
+    // held. Best-effort — a git failure leaves it undefined and the anchor falls
+    // back to the per-link diff. `.claude/` is excluded from commits, so memory
+    // never appears here.
+    const cumulativeDiff = await git(workspaceDir, ["diff", campaignBaseRef, baselineRef]).catch(
+      () => undefined,
+    );
+
+    results.push({ campaignTaskId: id, index: i, artifacts, ...(cumulativeDiff !== undefined && { cumulativeDiff }) });
   }
 
   return results;

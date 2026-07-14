@@ -607,8 +607,21 @@ export async function runCampaignCell(
     // diff must not read as "held"). Skip entirely when the link has no anchor.
     const anchorConfig = linkMeta?.anchor;
     if (anchorConfig && link.artifacts.executorOk) {
+      // Anchor against the CUMULATIVE campaign diff (chain base → this link) when
+      // available, so a convention encoded in an earlier link's helper and reused
+      // here still counts as held; fall back to the per-link diff (`||`, so an empty
+      // cumulative diff falls back too). The judge still scores the per-link
+      // `artifacts.diff` — only the deterministic anchor widens its view.
+      //
+      // Semantic: a `required` marker holds if the convention PERSISTS anywhere in
+      // the chain's cumulative work — not that THIS link re-touched it. That is the
+      // intended "convention stays consistent across the chain" reading; the cost is
+      // that a required-only anchor can't flag a later link that does new
+      // convention-relevant work the wrong way. Campaign `rule` anchors therefore
+      // pair every `required` with a `forbidden` complement (the known-wrong form),
+      // which is ALSO evaluated cumulatively and fires on an active violation.
       result.anchors = detect(anchorConfig, {
-        diff: link.artifacts.diff,
+        diff: link.cumulativeDiff || link.artifacts.diff,
         metrics: link.artifacts.executorMetrics,
         timedOut: link.artifacts.executorTimedOut,
       });

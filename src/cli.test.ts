@@ -16,6 +16,7 @@ import {
   type RunCampaignDeps,
   type RunCellDeps,
 } from "./cli.js";
+import { detectAnchor } from "./anchors.js";
 import type { CampaignTaskArtifacts } from "./executor.js";
 import type {
   AnchorConfig,
@@ -595,6 +596,65 @@ test("runCampaignCell: routes to runCampaign and assembles a CampaignResult per 
     score: 90,
     anchors: { conventionHeld: true, hitKnownTrap: false, evidence: "held" },
   });
+});
+
+test("runCampaignCell: rule anchor sees the CUMULATIVE diff, so a helper defined earlier and reused holds (false-negative fix)", async () => {
+  // campaignTask()'s link 1 anchor requires /newId\(/. Simulate a link that REUSED
+  // a `newId()` helper defined by an earlier link: its per-link diff never re-emits
+  // the marker, but the cumulative chain diff (base → this link) still contains it.
+  const perLinkDiffWithoutMarker = "+  const attachment = { id: reuseHelper() };";
+  const cumulativeWithMarker =
+    "+function newId() { return `ulid_${rand()}`; }\n+  const attachment = { id: newId() };";
+
+  // WITH the cumulative diff wired in: the real detector finds /newId\(/ and HOLDS.
+  const held = await runCampaignCell(
+    { executorModel: "sonnet", task: campaignTask(), variant: NAKED },
+    "/tmp",
+    {
+      campaign: async () => [
+        makeLink(0),
+        {
+          campaignTaskId: "t1",
+          index: 1,
+          artifacts: makeArtifacts({ diff: perLinkDiffWithoutMarker }),
+          cumulativeDiff: cumulativeWithMarker,
+        },
+      ],
+      judge: async () => makeResult({ total: 80 }),
+      detect: detectAnchor, // the REAL deterministic detector, not a stub
+    },
+  );
+  assert.equal(
+    held.tasks[1]!.anchors?.conventionHeld,
+    true,
+    "convention should hold: required marker is in the cumulative diff",
+  );
+
+  // WITHOUT a cumulative diff (same per-link diff), the fallback is the per-link
+  // diff — which lacks the marker — so the SAME anchor breaks. This is exactly the
+  // false negative the cumulative wiring fixes.
+  const broken = await runCampaignCell(
+    { executorModel: "sonnet", task: campaignTask(), variant: NAKED },
+    "/tmp",
+    {
+      campaign: async () => [
+        makeLink(0),
+        {
+          campaignTaskId: "t1",
+          index: 1,
+          artifacts: makeArtifacts({ diff: perLinkDiffWithoutMarker }),
+          // no cumulativeDiff
+        },
+      ],
+      judge: async () => makeResult({ total: 80 }),
+      detect: detectAnchor,
+    },
+  );
+  assert.equal(
+    broken.tasks[1]!.anchors?.conventionHeld,
+    false,
+    "control: with only the per-link diff, the same anchor breaks",
+  );
 });
 
 test("runCampaignCell: a link lacking an anchor skips anchoring for that link", async () => {
