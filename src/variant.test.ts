@@ -17,14 +17,14 @@ test("parseVariantManifest: full copy-bundle manifest passes through", () => {
       type: "bundle",
       claudeMd: "CLAUDE.md",
       configDir: "claude",
-      description: "agentic-os v2.6.0",
+      description: "agentic-os v3.0.1",
     }),
     {
       type: "bundle",
       claudeMd: "CLAUDE.md",
       configDir: "claude",
       install: "copy",
-      description: "agentic-os v2.6.0",
+      description: "agentic-os v3.0.1",
     },
   );
 });

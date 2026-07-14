@@ -112,7 +112,7 @@ test("loadVariants: agentic-os loads as a copy bundle with resolved config paths
   const b = bundle as CopyBundleVariant;
   assert.match(b.claudeMdPath, /prompts\/agentic-os\/CLAUDE\.md$/);
   assert.match(b.configDirPath, /prompts\/agentic-os\/claude$/);
-  assert.match(b.description ?? "", /agentic-os v2\.6\.0/);
+  assert.match(b.description ?? "", /agentic-os v3\.0\.1/);
 });
 
 test("loadVariants: gstack loads as a setup bundle with a setupCommand", async () => {
@@ -138,9 +138,9 @@ test("formatVariantListLine: shows the type (and description for bundles)", () =
       install: "copy",
       claudeMdPath: "/x/CLAUDE.md",
       configDirPath: "/x/claude",
-      description: "agentic-os v2.6.0",
+      description: "agentic-os v3.0.1",
     }),
-    "  - agentic-os [bundle] — agentic-os v2.6.0",
+    "  - agentic-os [bundle] — agentic-os v3.0.1",
   );
 });
 

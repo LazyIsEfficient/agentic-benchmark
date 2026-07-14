@@ -352,9 +352,9 @@ A variant is a `prompts/<name>/` directory. Its shape is declared by an optional
 - `tdd-first` — mandates a real testing framework and thorough tests.
 - `security-first` — mandates an explicit security review, threat modeling,
   secure defaults, and docs.
-- `agentic-os` — **copy bundle**: the full agentic-os v2.6.0 harness
+- `agentic-os` — **copy bundle**: the full agentic-os v3.0.1 harness
   ([github.com/LazyIsEfficient/agentic-os](https://github.com/LazyIsEfficient/agentic-os))
-  — CLAUDE.md + a vendored `.claude/` (37 skills, agents, commands, hooks, rules,
+  — CLAUDE.md + a vendored `.claude/` (38 skills, agents, commands, hooks, rules,
   settings), copied in at project scope.
 - `gstack` — **setup bundle**: Garry's Stack 1.58.5.0 `@11de390`
   ([github.com/garrytan/gstack](https://github.com/garrytan/gstack)) — Bun-native.
@@ -374,13 +374,24 @@ test whether a full skills/agents harness beats a plain prompt.
   `--models` batches when benchmarking bundles.
 - **Global-path hooks/scripts.** A bundle's hooks/scripts that assume a global
   `~/.claude` (or a `~/.cursor`) path won't resolve under a project-scope install
-  and may no-op. For agentic-os v2.6.0 the auto-run hooks in `settings.json` are
+  and may no-op. For agentic-os v3.0.1 the auto-run hooks in `settings.json` are
   all project-relative (`bash .claude/hooks/*.sh`) and self-contained, so they
   run; but some **agent/command instruction docs** reference repo-root
   `scripts/*.sh` and a `$HOME/.cursor/.../ledger.py` findings-ledger that do not
   exist at project scope — if an agent tries to invoke those they will fail/no-op
   (a benign degradation, not a correctness issue). Repo-root `scripts/` is
   deliberately NOT vendored because no hook references it.
+- **v3.0.1 memory loop — write hook needs `jq` (now in the image), read hook
+  doesn't.** agentic-os **writes** durable facts via a `Stop` hook
+  (`.claude/hooks/memory-extract.sh`, the `memory-extraction` skill) — the fix for
+  upstream issue #217 — and, as of v3.0.1, **reads them back** via a `SessionStart`
+  hook (`.claude/hooks/memory-inject.sh`) that injects the `.claude/memory/MEMORY.md`
+  index into each fresh session — the fix for issue #225. The write hook is
+  **fail-open on `jq`**: with no `jq` on `PATH` it emits `{}` and silently no-ops, so
+  the benchmark `Dockerfile` installs `jq`; strip it and recording stops. The read
+  hook needs no `jq` (grep + cat). In **campaign mode** (where `.claude/memory/`
+  persists across the chain) these two hooks together are what let a convention
+  recorded in one link actually influence a later, context-reset link.
 - **MCP-dependent skills.** Skills that rely on MCP servers are unavailable
   inside the container.
 
