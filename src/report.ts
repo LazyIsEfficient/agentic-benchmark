@@ -251,6 +251,20 @@ export interface CorrectnessAggregate {
   legacy: boolean;
   /** True when any member cell was disqualified (☠ marker in the table). */
   hasDisqualified: boolean;
+  /**
+   * Untested cells that are NOT {@link TaskMeta.judgeOnly} — a genuinely
+   * un-armed correctness cell. A judgeOnly task legitimately has no
+   * deterministic verdict, so it is excluded here; only these cells arm the
+   * issue-#9 all-fallback coverage warning.
+   */
+  nonJudgeOnlyUntestedCount: number;
+  /**
+   * Cells whose task is {@link TaskMeta.judgeOnly} — intentionally judge-graded
+   * because their harness cannot run in-container. Surfaced as a distinct
+   * `judge-only` token in the Tests column so a reader can tell design intent
+   * from a forgotten `testCommand` (which stays `—`).
+   */
+  judgeOnlyCount: number;
 }
 
 /**
@@ -285,6 +299,8 @@ export function aggregateCorrectness(
         (r) => r.testResults === undefined && r.judge === undefined,
       ),
       hasDisqualified: members.some((r) => r.disqualified === true),
+      nonJudgeOnlyUntestedCount: untested.filter((r) => r.judgeOnly !== true).length,
+      judgeOnlyCount: eligible.filter((r) => r.judgeOnly === true).length,
     };
   });
 }
@@ -308,18 +324,30 @@ export function renderCorrectness(
   const rows = aggregates.map((c) => {
     const name = variantLabelWithDisqualification(c.variant, c.hasDisqualified);
     if (c.legacy) return `| ${name} | ${c.executorModel} | — | — |`;
+    // Tests column: deterministic verdict when armed; else distinguish an
+    // INTENTIONAL judge-only grade (harness can't run in-container) from a
+    // forgotten testCommand (`—`). A row mixing both keeps the base token and
+    // annotates the judge-only tail so neither signal is hidden.
     const tests =
-      c.testedCount > 0 ? `${c.testedPassCount}/${c.testedCount} pass` : "—";
+      c.testedCount > 0
+        ? `${c.testedPassCount}/${c.testedCount} pass`
+        : c.judgeOnlyCount > 0 && c.nonJudgeOnlyUntestedCount === 0
+          ? "judge-only"
+          : "—";
+    const testsCell =
+      c.judgeOnlyCount > 0 && tests !== "judge-only"
+        ? `${tests} (${c.judgeOnlyCount} judge-only)`
+        : tests;
     const untestedTotal =
       c.fallback.likelyCorrect + c.fallback.likelyIncorrect + c.fallback.unknown;
     const fb =
       untestedTotal > 0
         ? `likely_correct: ${c.fallback.likelyCorrect} · likely_incorrect: ${c.fallback.likelyIncorrect} · unknown: ${c.fallback.unknown}`
         : "—";
-    return `| ${name} | ${c.executorModel} | ${tests} | ${fb} |`;
+    return `| ${name} | ${c.executorModel} | ${testsCell} | ${fb} |`;
   });
   return [
-    "_Tested cells report the deterministic testCommand verdict; untested cells report the judge's hedged read. Two different evidence classes — never blended into one number._",
+    "_Tested cells report the deterministic testCommand verdict; `judge-only` cells have no in-container harness and are graded by the judge BY DESIGN (distinct from a `—` cell that is simply missing a testCommand); untested cells report the judge's hedged read. Different evidence classes — never blended into one number._",
     ...correctnessCoverageWarning(aggregates),
     "",
     [header, ...rows].join("\n"),
@@ -333,12 +361,16 @@ export function renderCorrectness(
  * report last time and shipped unnoticed. Surface it loudly instead: if there is
  * scored (non-legacy) correctness evidence but not a single deterministic test
  * verdict anywhere, prepend a warning. Returns [] (no warning) when the axis is
- * armed (some cell tested) or when there is nothing to score yet.
+ * armed (some cell tested), when there is nothing to score yet, or when every
+ * untested cell is {@link TaskMeta.judgeOnly} — a task that legitimately cannot
+ * run deterministic tests in-container, so its empty verdict is expected, not a
+ * missing-testCommand defect.
  */
 function correctnessCoverageWarning(aggregates: CorrectnessAggregate[]): string[] {
   const scored = aggregates.some((c) => !c.legacy);
   const anyTested = aggregates.some((c) => c.testedCount > 0);
-  if (!scored || anyTested) return [];
+  const anyGenuinelyUntested = aggregates.some((c) => c.nonJudgeOnlyUntestedCount > 0);
+  if (!scored || anyTested || !anyGenuinelyUntested) return [];
   return [
     "",
     "> ⚠️ **No deterministic test verdict ran in this matrix** — every Correctness cell fell back to the judge's hedged read. Declare a `testCommand` in the task's `meta.json` to arm the deterministic axis before trusting these numbers.",

@@ -22,5 +22,6 @@
     "src/services/webhookService.mjs",
     "test/harness.test.mjs",
     "test/helpers/sign.mjs"
-  ]
+  ],
+  "judgeOnly": true
 }

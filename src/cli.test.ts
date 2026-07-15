@@ -289,6 +289,40 @@ test("loadTasks: a steps-less task still loads its prompt from task.md", async (
   }
 });
 
+test("loadTasks: parses testCommand and judgeOnly off meta.json (issue #22)", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "detmeta-"));
+  try {
+    await writeTaskDir(root, "tested", {
+      "meta.json": JSON.stringify({
+        id: "tested",
+        title: "Tested",
+        logicBearing: true,
+        securityRelevant: false,
+        testCommand: "npm test",
+      }),
+      "task.md": "prompt",
+    });
+    await writeTaskDir(root, "judge-only", {
+      "meta.json": JSON.stringify({
+        id: "judge-only",
+        title: "Judge only",
+        logicBearing: true,
+        securityRelevant: true,
+        judgeOnly: true,
+      }),
+      "task.md": "prompt",
+    });
+
+    const byId = Object.fromEntries((await loadTasks(root)).map((t) => [t.meta.id, t]));
+    assert.equal(byId["tested"]!.meta.testCommand, "npm test");
+    assert.equal(byId["tested"]!.meta.judgeOnly, undefined);
+    assert.equal(byId["judge-only"]!.meta.judgeOnly, true);
+    assert.equal(byId["judge-only"]!.meta.testCommand, undefined);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 // --- Shared fakes for runCell / runCampaignCell -------------------------------
 
 const PROGRESS = () => ({ completed: 0, total: 1, started: 0, running: 0 });

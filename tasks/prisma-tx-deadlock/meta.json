@@ -21,5 +21,6 @@
     "src/routes/orders.mjs",
     "src/services/orderService.mjs",
     "test/harness.test.mjs"
-  ]
+  ],
+  "judgeOnly": true
 }

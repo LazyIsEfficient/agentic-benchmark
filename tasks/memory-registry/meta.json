@@ -19,5 +19,6 @@
     "seed/src/registry.ts",
     "seed/src/dispatch.ts",
     "seed/src/handlers/ping.ts"
-  ]
+  ],
+  "judgeOnly": true
 }

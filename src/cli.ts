@@ -735,6 +735,7 @@ export async function runCell(
     executorModel: artifacts.executorModel,
     judgeModel: JUDGE_MODEL,
     ...(cell.repeat !== undefined ? { repeat: cell.repeat } : {}),
+    ...(cell.task.meta.judgeOnly ? { judgeOnly: true } : {}),
     ...(artifacts.behavior ? { behavior: artifacts.behavior } : {}),
   };
 
