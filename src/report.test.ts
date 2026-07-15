@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
   aggregateCorrectness,
   aggregateCraft,
+  aggregateCraftScore,
   aggregateMetrics,
   aggregatePairwise,
   aggregateReliability,
@@ -27,6 +28,7 @@ import {
   renderCampaignMemoryEffect,
   renderCorrectness,
   renderCraft,
+  renderCraftScore,
   renderExcludedCells,
   renderJudgeCraft,
   renderMemoryEffect,
@@ -990,12 +992,153 @@ test("renderPairwise: ties-only variant renders — win rate; absent pairwise is
   assert.match(renderPairwise([]), /No pairwise comparisons ran/);
 });
 
-test("renderCraft collapses to a one-liner for legacy results; renders all three subsections otherwise", () => {
+test("renderCraft collapses to a one-liner for legacy results; renders all four subsections otherwise", () => {
   assert.match(renderCraft(multi), /No craft data/);
   const md = renderCraft([cell("v", "t", { slop: slopMetrics() })]);
   assert.match(md, /### Slop \(deterministic\)/);
   assert.match(md, /### Judge craft \(medians\)/);
   assert.match(md, /### Pairwise \(cross-bundle\)/);
+  assert.match(md, /### Craft Score \(ranking summary\)/);
+});
+
+// --- Axis 3: Craft — deterministic slop: helper reuse / literal density (#16) ---
+
+test("aggregateSlop sums helperReuse and literalDensity across cells; renderSlop shows both columns", () => {
+  const s1 = cell("v", "t1", {
+    slop: slopMetrics({ helperReuse: 2, literalDensity: 3 }),
+  });
+  const s2 = cell("v", "t2", {
+    slop: slopMetrics({ helperReuse: 1, literalDensity: 4 }),
+  });
+  // Legacy cell without the new fields must contribute 0, not NaN.
+  const legacy = cell("v", "t3", { slop: slopMetrics() });
+  delete (legacy.slop as { helperReuse?: number }).helperReuse;
+  delete (legacy.slop as { literalDensity?: number }).literalDensity;
+
+  const [agg] = aggregateSlop([s1, s2, legacy]);
+  assert.equal(agg!.helperReuse, 3);
+  assert.equal(agg!.literalDensity, 7);
+
+  const md = renderSlop([s1, s2, legacy]);
+  assert.match(md, /Helper reuse \| Literal density/);
+  assert.match(md, /\| 3 \| 7 \|/); // the two summed columns close the row
+  assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+// --- Axis 3: Craft — byte-identical slop rows regression (#10) ------------------
+
+test("aggregateSlop keys each variant into its OWN bucket: different diffs → distinct residue sums", () => {
+  // #10: agentic-os and gstack showed byte-identical slop rows despite distinct
+  // diffs. This asserts the aggregator never collapses two variants into one
+  // bucket or double-counts one — distinct residue inputs must stay distinct.
+  const os = cell("agentic-os", "t1", {
+    slop: slopMetrics({ residue: { todos: 0, debugLogging: 3, commentedOutCode: 1 } }),
+  });
+  const gstack = cell("gstack", "t1", {
+    slop: slopMetrics({ residue: { todos: 1, debugLogging: 2, commentedOutCode: 0 } }),
+  });
+  const aggs = aggregateSlop([os, gstack]);
+  const osAgg = aggs.find((a) => a.variant === "agentic-os")!;
+  const gsAgg = aggs.find((a) => a.variant === "gstack")!;
+  assert.equal(aggs.length, 2); // two buckets, not one shared bucket
+  assert.deepEqual(osAgg.residue, { todos: 0, debugLogging: 3, commentedOutCode: 1 });
+  assert.deepEqual(gsAgg.residue, { todos: 1, debugLogging: 2, commentedOutCode: 0 });
+  assert.notDeepEqual(osAgg.residue, gsAgg.residue);
+});
+
+// --- Axis 3: Craft — composite Craft Score (#17) --------------------------------
+
+const cs = (variant: string, slop: Partial<SlopMetrics>) =>
+  cell(variant, "t", { slop: slopMetrics(slop) });
+
+/** 6 balanced comparisons → gstack 3W-1L (.75), agentic-os 2W-1L (.667), naked 1W-4L (.20). */
+const csPairwise: PairwiseResult[] = [
+  pairwiseResult("gstack", "naked", "A"),
+  pairwiseResult("gstack", "naked", "A"),
+  pairwiseResult("gstack", "agentic-os", "A"),
+  pairwiseResult("agentic-os", "naked", "A"),
+  pairwiseResult("agentic-os", "naked", "A"),
+  pairwiseResult("naked", "gstack", "A"),
+];
+
+test("aggregateCraftScore: winRate×SlopHealth composite, ranked, matching the locked formula", () => {
+  const results = [
+    cs("gstack", {}), // clean: SlopHealth 1.0
+    cs("agentic-os", { residue: { todos: 0, debugLogging: 1, commentedOutCode: 0 } }), // 0.90
+    cs("naked", { duplicationDelta: 12 }), // dup saturates → SlopHealth 0
+  ];
+  const aggs = aggregateCraftScore(results, csPairwise);
+  // Ranked highest-first.
+  assert.deepEqual(aggs.map((a) => a.variant), ["gstack", "agentic-os", "naked"]);
+  const g = aggs.find((a) => a.variant === "gstack")!;
+  const a = aggs.find((a) => a.variant === "agentic-os")!;
+  const n = aggs.find((a) => a.variant === "naked")!;
+  assert.equal(g.slopHealth, 1);
+  assert.equal(g.score, 83); // round(100·(0.7·0.75 + 0.3·1.0))
+  assert.equal(a.slopHealth, 0.9);
+  assert.equal(a.score, 74); // round(100·(0.7·0.667 + 0.3·0.90))
+  assert.equal(n.slopHealth, 0);
+  assert.equal(n.score, 14); // round(100·(0.7·0.20 + 0.3·0))
+  assert.equal(g.slopOnly, false);
+
+  const md = renderCraftScore(results, csPairwise);
+  assert.match(md, /\| 1 \| gstack \| sonnet \| 83 \| 75% \| 1\.00 \|/);
+  assert.match(md, /\| 2 \| agentic-os \| sonnet \| 74 \| 67% \| 0\.90 \|/);
+  assert.match(md, /\| 3 \| naked \| sonnet \| 14 \| 20% \| 0\.00 \|/);
+});
+
+test("aggregateCraftScore: missing pairwise drops the winRate term → round(100·SlopHealth), flagged slop-only", () => {
+  const results = [cs("solo", {})]; // SlopHealth 1.0, no pairwise
+  const [agg] = aggregateCraftScore(results, undefined);
+  assert.equal(agg!.slopOnly, true);
+  assert.equal(agg!.winRate, null);
+  assert.equal(agg!.score, 100); // 100·SlopHealth, winRate never imputed
+  const md = renderCraftScore(results, undefined);
+  assert.match(md, /\(slop-only\)/);
+  assert.match(md, /\| 1 \| solo \| sonnet \| 100 \| _\(slop-only\)_ \| 1\.00 \|/);
+});
+
+test("aggregateCraftScore: a win rate below the min-decisive threshold is untrusted → slop-only", () => {
+  // "lo" has only 2 decisive comparisons (< 3) → its 100% rate is not trusted.
+  const results = [cs("lo", {}), cs("hi", {})];
+  const pw = [pairwiseResult("lo", "hi", "A"), pairwiseResult("lo", "hi", "A")];
+  const lo = aggregateCraftScore(results, pw).find((a) => a.variant === "lo")!;
+  assert.equal(lo.slopOnly, true);
+  assert.equal(lo.winRate, null);
+  assert.equal(lo.score, 100);
+});
+
+test("aggregateCraftScore: testTamper is a SOFT penalty via SlopHealth, never a disqualifier", () => {
+  const results = [cs("t", { testTamper: { hits: 1, evidence: [] } })];
+  const [agg] = aggregateCraftScore(results, undefined);
+  // SlopHealth = 1 − 0.5·(1/1) = 0.5 → score 50; the cell still competes (not null).
+  assert.equal(agg!.slopHealth, 0.5);
+  assert.equal(agg!.score, 50);
+  assert.equal(agg!.disqualified, false);
+});
+
+test("aggregateCraftScore: disqualified cells are excluded from inputs but the variant keeps ☠; all-disqualified → no score", () => {
+  const partial = [
+    cell("part", "t1", { slop: slopMetrics({ duplicationDelta: 0 }) }),
+    cell("part", "t2", {
+      slop: slopMetrics({ duplicationDelta: 100, testTamper: { hits: 9, evidence: [] } }),
+      disqualified: true,
+    }),
+  ];
+  const [pAgg] = aggregateCraftScore(partial, undefined);
+  assert.equal(pAgg!.disqualified, true); // ☠ mark retained
+  assert.equal(pAgg!.allDisqualified, false);
+  assert.equal(pAgg!.slopHealth, 1); // the disqualified cell never entered SlopHealth
+  assert.equal(pAgg!.score, 100);
+
+  const allDq = [
+    cell("gone", "t1", { slop: slopMetrics({ duplicationDelta: 5 }), disqualified: true }),
+  ];
+  const [aAgg] = aggregateCraftScore(allDq, undefined);
+  assert.equal(aAgg!.allDisqualified, true);
+  assert.equal(aAgg!.score, null);
+  const md = renderCraftScore(allDq, undefined);
+  assert.match(md, /\| — \| gone ☠ DISQUALIFIED \| sonnet \| ☠ \| — \| — \|/);
 });
 
 // --- Axis 4: Efficiency (run metrics) -------------------------------------------
