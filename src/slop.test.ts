@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { addedLines, computeSlopMetrics, isTestFile, removedLines } from "./slop.js";
+import {
+  addedLines,
+  computeSlopMetrics,
+  isGeneratedFile,
+  isTestFile,
+  removedLines,
+} from "./slop.js";
 
 // --- Fixture diffs (unified git diff strings) --------------------------------
 
@@ -338,6 +344,98 @@ test("isTestFile matches infix and directory-segment forms, case-insensitively",
   // its slop must stay measured (reviewer should-fix on #43).
   assert.equal(isTestFile("spec/openapi.yaml"), false);
   assert.equal(isTestFile("api/spec/user.schema.ts"), false);
+});
+
+// --- generated lockfile exclusion from production-code hygiene (#45) ---------------
+
+/** The duplicated block twice in a GENERATED lockfile — must NOT inflate duplication. */
+const DUP_IN_LOCKFILE = `diff --git a/package-lock.json b/package-lock.json
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,2 +1,11 @@
+${BLOCK}
++"separatorBetweenCopies": {},
+${BLOCK}
+`;
+
+/** The same block twice in a lockfile nested under a subdirectory path. */
+const DUP_IN_NESTED_LOCKFILE = `diff --git a/packages/api/package-lock.json b/packages/api/package-lock.json
+--- a/packages/api/package-lock.json
++++ b/packages/api/package-lock.json
+@@ -1,2 +1,11 @@
+${BLOCK}
++"separatorBetweenCopies": {},
+${BLOCK}
+`;
+
+/** The same block twice in an UPPERCASE lockfile name — matching is case-insensitive. */
+const DUP_IN_UPPERCASE_LOCKFILE = `diff --git a/PACKAGE-LOCK.JSON b/PACKAGE-LOCK.JSON
+--- a/PACKAGE-LOCK.JSON
++++ b/PACKAGE-LOCK.JSON
+@@ -1,2 +1,11 @@
+${BLOCK}
++"separatorBetweenCopies": {},
+${BLOCK}
+`;
+
+/** The same block twice in package.json — AUTHORED, so it MUST stay counted. */
+const DUP_IN_PACKAGE_JSON = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -1,2 +1,11 @@
+${BLOCK}
++"separatorBetweenCopies": {},
+${BLOCK}
+`;
+
+test("a repetitive lockfile does not inflate duplication (and records no evidence)", () => {
+  const m = computeSlopMetrics({ diff: DUP_IN_LOCKFILE });
+  assert.equal(m.duplicationDelta, 0);
+  assert.deepEqual(m.duplicationEvidence, []);
+});
+
+test("a lockfile nested under a subdirectory path is also excluded", () => {
+  const m = computeSlopMetrics({ diff: DUP_IN_NESTED_LOCKFILE });
+  assert.equal(m.duplicationDelta, 0);
+  assert.deepEqual(m.duplicationEvidence, []);
+});
+
+test("lockfile matching is case-insensitive (PACKAGE-LOCK.JSON)", () => {
+  const m = computeSlopMetrics({ diff: DUP_IN_UPPERCASE_LOCKFILE });
+  assert.equal(m.duplicationDelta, 0);
+  assert.deepEqual(m.duplicationEvidence, []);
+});
+
+test("a lockfile-only diff has zero production lines → SlopHealth guard (#43) still holds", () => {
+  // No production lines were added; downstream this yields a null SlopHealth,
+  // never a fake-clean 100.
+  const m = computeSlopMetrics({ diff: DUP_IN_LOCKFILE });
+  assert.equal(m.productionAddedLineCount, 0);
+  assert.deepEqual(m.residue, { todos: 0, debugLogging: 0, commentedOutCode: 0 });
+});
+
+test("a repetitive package.json STILL inflates duplication (authored, not generated)", () => {
+  const m = computeSlopMetrics({ diff: DUP_IN_PACKAGE_JSON });
+  assert.equal(m.duplicationDelta, 1);
+  assert.equal(m.productionAddedLineCount, 9); // two 4-line blocks + the separator, all counted
+});
+
+test("a repetitive PRODUCTION .ts file STILL inflates duplication alongside the lockfile carve-out", () => {
+  assert.equal(computeSlopMetrics({ diff: DUP_TWICE_ONE_FILE }).duplicationDelta, 1);
+});
+
+test("isGeneratedFile matches lockfiles by basename, case-insensitively; authored config stays counted", () => {
+  assert.equal(isGeneratedFile("package-lock.json"), true);
+  assert.equal(isGeneratedFile("packages/api/package-lock.json"), true);
+  assert.equal(isGeneratedFile("PACKAGE-LOCK.JSON"), true);
+  assert.equal(isGeneratedFile("npm-shrinkwrap.json"), true);
+  assert.equal(isGeneratedFile("yarn.lock"), true);
+  assert.equal(isGeneratedFile("pnpm-lock.yaml"), true);
+  assert.equal(isGeneratedFile("bun.lockb"), true);
+  // Authored files are NOT generated — they stay measured.
+  assert.equal(isGeneratedFile("package.json"), false);
+  assert.equal(isGeneratedFile("tsconfig.json"), false);
+  assert.equal(isGeneratedFile("src/package-lock.json.ts"), false); // not the basename
 });
 
 // --- churnRatio -------------------------------------------------------------------
