@@ -506,20 +506,23 @@ export interface AnchorResult {
 }
 
 /**
- * The five craft dimensions the cell judge scores. Craft is the qualitative
+ * The six craft dimensions the cell judge scores. Craft is the qualitative
  * residual the deterministic axes can't measure: naming (do identifiers say
  * what things mean), structure (is the change shaped like the codebase),
  * consistency (does it match surrounding conventions), economy (no more code
  * than the task needs), documentation (does the change explain its intent —
  * useful docstrings, README/DATA_MODEL/ADR updates, intent-explaining comments
- * — scored on VALUE, not volume; redundant restatement scores LOW).
+ * — scored on VALUE, not volume; redundant restatement scores LOW), testing
+ * (does the change add meaningful tests exercising the NEW behavior — scored on
+ * VALUE, not volume; a logic-bearing change with no tests scores LOW).
  */
 export type CraftDimension =
   | "naming"
   | "structure"
   | "consistency"
   | "economy"
-  | "documentation";
+  | "documentation"
+  | "testing";
 
 /**
  * One craft dimension's value on a 0–4 ordinal scale. `"unknown"` is the
@@ -541,7 +544,7 @@ export interface CraftScore {
   evidence: string[];
 }
 
-/** All five craft dimensions for one cell — the judge must score every one. */
+/** All six craft dimensions for one cell — the judge must score every one. */
 export interface CellCraft {
   naming: CraftScore;
   structure: CraftScore;
@@ -555,6 +558,17 @@ export interface CellCraft {
    * NOT the "verbosity" the anti-verbosity rule penalizes.
    */
   documentation: CraftScore;
+  /**
+   * Testing discipline — scored on VALUE, not volume. Meaningful tests that
+   * exercise the NEW behavior (especially edge cases / the hard path the change
+   * introduces) score HIGH; a logic-bearing change shipped with NO tests, or
+   * trivial/padding/duplicate tests that don't cover the new logic, score LOW,
+   * so the dimension cannot be gamed by test COUNT. Distinct from the
+   * deterministic test-tamper slop signal (which penalizes WEAKENING existing
+   * tests): this rewards ADDING good ones. Like `documentation`, meaningful
+   * tests are NOT the "verbosity" the anti-verbosity rule penalizes.
+   */
+  testing: CraftScore;
 }
 
 /**
@@ -753,9 +767,10 @@ export interface PairwiseResult {
     consistency: PairwiseDimension;
     economy: PairwiseDimension;
     documentation: PairwiseDimension;
+    testing: PairwiseDimension;
   };
   /**
-   * The judge's overall call across the five dimensions, with its reasoning and
+   * The judge's overall call across the six dimensions, with its reasoning and
    * a severity signal. `severity` is `soundness` only when the winning edge
    * implicates correctness/security/robustness; it degrades to `style` (the
    * ordinary weight) fail-closed, so a malformed field never inflates a

@@ -121,6 +121,7 @@ const CRAFT: CellCraft = {
   consistency: UNKNOWN(),
   economy: UNKNOWN(),
   documentation: UNKNOWN(),
+  testing: UNKNOWN(),
 };
 
 function judgeWith(blastRadius: BlastRadiusEntry[]): CellJudgeResult {

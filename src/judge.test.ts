@@ -120,6 +120,7 @@ const validCellPayload = {
     consistency: { score: 4, evidence: ["src/a.ts:5 — matches existing import style"] },
     economy: { score: 3, evidence: ["src/a.ts:1 — 14-line diff for the task"] },
     documentation: { score: 3, evidence: ["src/a.ts:2 — docstring explains the retry budget"] },
+    testing: { score: 3, evidence: ["src/a.test.ts:5 — covers the exhausted-budget path"] },
   },
   blast_radius: [],
   correctness_assessment: null,
@@ -170,6 +171,33 @@ test("parseCellJudgeResult fails a missing/malformed documentation dimension clo
   );
   assert.equal(noEvidence.craft.documentation.score, "unknown");
   assert.ok(noEvidence.flags.includes("invalid:documentation"));
+});
+
+test("parseCellJudgeResult parses the testing dimension like any other craft score", () => {
+  const r = parseCellJudgeResult(JSON.stringify(validCellPayload));
+  assert.equal(r.craft.testing.score, 3);
+  assert.deepEqual(r.craft.testing.evidence, [
+    "src/a.test.ts:5 — covers the exhausted-budget path",
+  ]);
+});
+
+test("parseCellJudgeResult fails a missing/malformed testing dimension closed to unknown", () => {
+  // Missing entirely → unknown + invalid:testing flag (fail-closed); siblings intact.
+  const { testing: _t, ...craftNoTesting } = validCellPayload.craft;
+  const missing = parseCellJudgeResult(
+    JSON.stringify({ ...validCellPayload, craft: craftNoTesting }),
+  );
+  assert.equal(missing.craft.testing.score, "unknown");
+  assert.deepEqual(missing.craft.testing.evidence, []);
+  assert.ok(missing.flags.includes("invalid:testing"));
+  assert.equal(missing.craft.documentation.score, 3);
+
+  // Out-of-range numeric → unknown, never clamped.
+  const outOfRange = parseCellJudgeResult(
+    JSON.stringify(withCraftDim("testing", { score: 9, evidence: ["src/a.test.ts:1 — q"] })),
+  );
+  assert.equal(outOfRange.craft.testing.score, "unknown");
+  assert.ok(outOfRange.flags.includes("invalid:testing"));
 });
 
 test("parseCellJudgeResult parses fence-wrapped JSON with surrounding prose", () => {

@@ -65,15 +65,26 @@ test("buildCellJudgePrompt embeds the evidence quote-word cap and the output sch
 
 test("buildCellJudgePrompt scores documentation on value and reconciles it with economy", () => {
   const p = buildCellJudgePrompt(cellPromptInputs);
-  // Five dimensions incl. the documentation definition (value, not volume).
-  assert.ok(p.includes("CRAFT (five dimensions"));
+  // Six dimensions incl. the documentation definition (value, not volume).
+  assert.ok(p.includes("CRAFT (six dimensions"));
   assert.ok(p.includes("- documentation: does the change explain its intent"));
   assert.ok(p.includes("scored on VALUE, not volume"));
   assert.ok(p.includes('"documentation":{…}')); // in the JSON schema
-  // Economy and documentation must not double-penalize the same lines.
-  assert.ok(p.includes("This is NOT a penalty on documentation"));
+  // Economy and documentation/tests must not double-penalize the same lines.
+  assert.ok(p.includes("This is NOT a penalty on documentation or tests"));
   // Proactive docs are not blast-radius overreach.
   assert.ok(p.includes('default such an excursion to "necessary" or "defensible", never "overreach"'));
+});
+
+test("buildCellJudgePrompt scores testing on value, reconciles economy, and separates test-tamper", () => {
+  const p = buildCellJudgePrompt(cellPromptInputs);
+  assert.ok(p.includes("- testing: does the change add MEANINGFUL tests"));
+  assert.ok(p.includes("Never reward test COUNT"));
+  assert.ok(p.includes('"testing":{…}')); // in the JSON schema
+  // Rewards ADDING tests; NOT the deterministic test-tamper (weakening) signal.
+  assert.ok(p.includes("it is NOT the deterministic test-tamper signal, which separately penalizes WEAKENING"));
+  // Meaningful tests are not economy verbosity.
+  assert.ok(p.includes("tests that exercise the change are NOT padding"));
 });
 
 test("buildCellJudgePrompt neutralizes </diff> breakout sequences and pins the data-not-instructions rule", () => {

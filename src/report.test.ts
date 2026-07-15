@@ -100,6 +100,7 @@ function craftScores(
     consistency: score(overrides.consistency ?? 3),
     economy: score(overrides.economy ?? 3),
     documentation: score(overrides.documentation ?? 3),
+    testing: score(overrides.testing ?? 3),
   };
 }
 
@@ -155,6 +156,7 @@ function pairwiseResult(
       consistency: dim(),
       economy: dim(),
       documentation: dim(),
+      testing: dim(),
     },
     overall: { winner, rationale: "why", severity },
     ...extra,
@@ -811,8 +813,8 @@ test("campaign links fold into judge-craft medians; disqualified and failed link
   ]);
   const md = renderJudgeCraft([single], [camp]);
   // Contributing: single cell (naming 2) + link 0 (naming 4) → lower median 2 over 2 cells.
-  // Columns: naming | structure | consistency | economy | documentation | unknown | cells.
-  assert.match(md, /\| v \| sonnet \| 2 \| 3 \| 3 \| 3 \| 3 \| 0 \| 2 \|/);
+  // Columns: naming | structure | consistency | economy | documentation | testing | unknown | cells.
+  assert.match(md, /\| v \| sonnet \| 2 \| 3 \| 3 \| 3 \| 3 \| 3 \| 0 \| 2 \|/);
   assert.doesNotMatch(md, /No judge craft verdicts/);
 });
 
@@ -959,14 +961,14 @@ test("aggregateCraft: lower median — odd count, even count, unknowns excluded-
       judge: judgeResult({
         craft: craftScores({
           naming: "unknown", structure: "unknown", consistency: "unknown",
-          economy: "unknown", documentation: "unknown",
+          economy: "unknown", documentation: "unknown", testing: "unknown",
         }),
       }),
     }),
   ];
   const agg2 = aggregateCraft(allUnknown)[0]!;
   assert.equal(agg2.median.naming, null);
-  assert.equal(agg2.unknownCount, 5);
+  assert.equal(agg2.unknownCount, 6);
 });
 
 test("renderJudgeCraft renders — for all-unknown dimensions and reports the unknown count", () => {
@@ -975,12 +977,12 @@ test("renderJudgeCraft renders — for all-unknown dimensions and reports the un
       judge: judgeResult({
         craft: craftScores({
           naming: "unknown", structure: "unknown", consistency: "unknown",
-          economy: "unknown", documentation: "unknown",
+          economy: "unknown", documentation: "unknown", testing: "unknown",
         }),
       }),
     }),
   ]);
-  assert.match(md, /\| m \| sonnet \| — \| — \| — \| — \| — \| 5 \| 1 \|/);
+  assert.match(md, /\| m \| sonnet \| — \| — \| — \| — \| — \| — \| 6 \| 1 \|/);
   assert.doesNotMatch(md, /undefined|NaN/);
 });
 
@@ -1099,10 +1101,24 @@ test("aggregateCraft folds in the documentation dimension median", () => {
   ];
   const agg = aggregateCraft(cells)[0]!;
   assert.equal(agg.median.documentation, 3); // median of [2,3,4]
-  // The documentation median also reaches the rendered table (6th score column).
+  // The documentation median also reaches the rendered table (5th score column).
   const md = renderJudgeCraft(cells);
   assert.match(md, /\| Documentation \|/);
-  assert.match(md, /\| v \| sonnet \| 3 \| 3 \| 3 \| 3 \| 3 \| 0 \| 3 \|/);
+  assert.match(md, /\| v \| sonnet \| 3 \| 3 \| 3 \| 3 \| 3 \| 3 \| 0 \| 3 \|/);
+});
+
+test("aggregateCraft folds in the testing dimension median", () => {
+  const cells = [
+    cell("v", "t1", { judge: judgeResult({ craft: craftScores({ testing: 1 }) }) }),
+    cell("v", "t2", { judge: judgeResult({ craft: craftScores({ testing: 4 }) }) }),
+    cell("v", "t3", { judge: judgeResult({ craft: craftScores({ testing: 2 }) }) }),
+  ];
+  const agg = aggregateCraft(cells)[0]!;
+  assert.equal(agg.median.testing, 2); // lower median of [1,2,4]
+  // The testing median also reaches the rendered table (6th score column).
+  const md = renderJudgeCraft(cells);
+  assert.match(md, /\| Testing \|/);
+  assert.match(md, /\| v \| sonnet \| 3 \| 3 \| 3 \| 3 \| 3 \| 2 \| 0 \| 3 \|/);
 });
 
 test("aggregatePairwise: shuffled orientations fold into one pair; ties excluded from win rate; bias audited", () => {
@@ -1446,16 +1462,16 @@ test("aggregateReliability: stddev + craft ranges + anchor agreement on a 3-repe
   assert.deepEqual(g!.craftRange.structure, { min: 3, max: 3 });
   assert.equal(g!.craftUnknowns, 1);
   assert.deepEqual(g!.anchorGrades, ["held-by-literal", "held-by-literal", "held-by-literal"]);
-  // Per-run mean-of-dimensions dispersion (documentation=3 now folds in): rep1
-  // [2,3,3,3]=2.75, rep2 [4,3,3,3,3]=3.2, rep3 [3,3,3,3,3]=3.0.
-  assert.ok(Math.abs(g!.craftScore!.min - 2.75) < 0.001);
-  assert.ok(Math.abs(g!.craftScore!.max - 3.2) < 0.001);
+  // Per-run mean-of-dimensions dispersion (documentation=3 + testing=3 fold in):
+  // rep1 [2,3,3,3,3]=2.8, rep2 [4,3,3,3,3,3]=3.167, rep3 [3,3,3,3,3,3]=3.0.
+  assert.ok(Math.abs(g!.craftScore!.min - 2.8) < 0.001);
+  assert.ok(Math.abs(g!.craftScore!.max - 3.16667) < 0.001);
   // No testResults and no judge correctness assessment → no correctness verdict.
   assert.equal(g!.verdictRuns, 0);
 
   const md = renderReliability(rs);
-  // Columns: … | Naming | Structure | Consistency | Economy | Documentation | Craft unknowns | Anchor grades.
-  assert.match(md, /\| `t` × v \[sonnet\] \| 3 \| — \| 2\.8 \/ 3\.0 \/ 3\.2 \| \$0\.0082 \| 1\.6s \| 2–4 \| 3 \| 3 \| 3 \| 3 \| 1 \| 3\/3 identical \|/);
+  // Columns: … | Naming | Structure | Consistency | Economy | Documentation | Testing | Craft unknowns | Anchor grades.
+  assert.match(md, /\| `t` × v \[sonnet\] \| 3 \| — \| 2\.8 \/ 3\.0 \/ 3\.2 \| \$0\.0082 \| 1\.6s \| 2–4 \| 3 \| 3 \| 3 \| 3 \| 3 \| 1 \| 3\/3 identical \|/);
   assert.match(md, /Craft score \(min\/mean\/max\)/);
   assert.match(md, /Targeting: spend repeats on the high-variance/);
   assert.match(md, /prisma-tx-deadlock/);

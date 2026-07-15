@@ -184,6 +184,7 @@ test("CellJudgeResult constructs with craft, blast radius, and the no-tests fall
       consistency: { score: "unknown", evidence: [] },
       economy: { score: 2, evidence: ["src/cart.ts:40 — re-implements existing sum helper"] },
       documentation: { score: 3, evidence: ["src/cart.ts:1 — docstring states the money invariant"] },
+      testing: { score: 3, evidence: ["src/cart.test.ts:8 — covers the rounding edge case"] },
     },
     blastRadius: [
       {
@@ -320,6 +321,7 @@ test("PairwiseResult records the resolved A/B mapping and rides on Report.pairwi
       consistency: dim,
       economy: dim,
       documentation: dim,
+      testing: dim,
     },
     overall: {
       winner: "A",

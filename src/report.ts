@@ -379,13 +379,14 @@ function correctnessCoverageWarning(aggregates: CorrectnessAggregate[]): string[
 
 // --- Axis 3: Craft --------------------------------------------------------------
 
-/** The five craft dimensions in table-column order. */
+/** The six craft dimensions in table-column order. */
 const CRAFT_DIMENSIONS = [
   "naming",
   "structure",
   "consistency",
   "economy",
   "documentation",
+  "testing",
 ] as const;
 
 /**
@@ -537,12 +538,12 @@ export function renderJudgeCraft(
     return "_No judge craft verdicts recorded (legacy results)._";
   }
   const header =
-    `| Variant | Model | Naming | Structure | Consistency | Economy | Documentation | Unknown scores | Cells |\n` +
-    `| --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
+    `| Variant | Model | Naming | Structure | Consistency | Economy | Documentation | Testing | Unknown scores | Cells |\n` +
+    `| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
   const cell = (m: number | null) => (m === null ? "—" : String(m));
   const rows = aggs.map(
     (a) =>
-      `| ${a.variant} | ${a.executorModel} | ${cell(a.median.naming)} | ${cell(a.median.structure)} | ${cell(a.median.consistency)} | ${cell(a.median.economy)} | ${cell(a.median.documentation)} | ${a.unknownCount} | ${a.cellCount} |`,
+      `| ${a.variant} | ${a.executorModel} | ${cell(a.median.naming)} | ${cell(a.median.structure)} | ${cell(a.median.consistency)} | ${cell(a.median.economy)} | ${cell(a.median.documentation)} | ${cell(a.median.testing)} | ${a.unknownCount} | ${a.cellCount} |`,
   );
   return [
     "_Lower median (ordinal 0–4) over scored, non-disqualified cells. `unknown` scores never enter a median — they are counted instead (fail-closed)._",
@@ -1268,11 +1269,11 @@ export function renderReliability(results: VariantTaskResult[]): string {
       ? "—"
       : `${g.craftScore.min.toFixed(1)} / ${g.craftScore.mean.toFixed(1)} / ${g.craftScore.max.toFixed(1)}`;
   const header =
-    `| Cell | Runs | Correctness | Craft score (min/mean/max) | Exec cost σ | Wall time σ | Naming | Structure | Consistency | Economy | Documentation | Craft unknowns | Anchor grades |\n` +
-    `| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
+    `| Cell | Runs | Correctness | Craft score (min/mean/max) | Exec cost σ | Wall time σ | Naming | Structure | Consistency | Economy | Documentation | Testing | Craft unknowns | Anchor grades |\n` +
+    `| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
   const rows = groups.map(
     (g) =>
-      `| \`${g.taskId}\` × ${g.variant} [${g.executorModel}] | ${g.runCount} | ${correctness(g)} | ${craftScore(g)} | ${g.costStddevUsd === null ? "—" : fmtCost(g.costStddevUsd)} | ${fmtSeconds(g.wallMsStddev)} | ${range(g.craftRange.naming)} | ${range(g.craftRange.structure)} | ${range(g.craftRange.consistency)} | ${range(g.craftRange.economy)} | ${range(g.craftRange.documentation)} | ${unknowns(g)} | ${agreement(g.anchorGrades)} |`,
+      `| \`${g.taskId}\` × ${g.variant} [${g.executorModel}] | ${g.runCount} | ${correctness(g)} | ${craftScore(g)} | ${g.costStddevUsd === null ? "—" : fmtCost(g.costStddevUsd)} | ${fmtSeconds(g.wallMsStddev)} | ${range(g.craftRange.naming)} | ${range(g.craftRange.structure)} | ${range(g.craftRange.consistency)} | ${range(g.craftRange.economy)} | ${range(g.craftRange.documentation)} | ${range(g.craftRange.testing)} | ${unknowns(g)} | ${agreement(g.anchorGrades)} |`,
   );
   return [
     "_Dispersion across --repeats runs of the same (task × variant × model) cell — the three major axes plus per-dimension craft ranges. Correctness = correct runs / runs with a verdict; Craft score = per-run mean-of-dimensions as min/mean/max; σ = population standard deviation of cost/time. Executor-failed repeats are excluded (coverage gaps, not variance). Observed, never a score component._",
