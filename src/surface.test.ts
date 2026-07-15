@@ -163,30 +163,39 @@ test("files matching any pattern are in scope; the rest are returned (docs never
 
 // --- isDocFile + blast-radius doc exemption (issue #38) ------------------------
 
-test("isDocFile recognizes markdown/reST/asciidoc and anything under docs/", () => {
-  // Doc file extensions (case-insensitive).
+test("isDocFile recognizes doc EXTENSIONS only — location under docs/ never qualifies code", () => {
+  // Doc file extensions (case-insensitive), any location incl. under docs/.
   for (const p of ["README.md", "a.MD", "notes.mdx", "guide.markdown", "x.rst", "y.adoc"]) {
     assert.equal(isDocFile(p), true, `${p} should be a doc file`);
   }
-  // Any docs/ directory segment, regardless of the file's own extension.
-  assert.equal(isDocFile("docs/adr/0001.ts"), true);
-  assert.equal(isDocFile("packages/api/docs/schema.json"), true);
+  assert.equal(isDocFile("docs/guide.md"), true);
+  assert.equal(isDocFile("Docs/guide.MD"), true); // case-insensitive path + ext
   assert.equal(isDocFile("./docs/b.md"), true); // leading ./ normalized
-  // NOT documentation: source/config/data files outside a docs/ tree.
-  for (const p of ["src/a.ts", "config.json", "README.ts", "mdx/loader.ts", "documents/x.ts"]) {
+  // NOT documentation: a code/config file is still code/config even under docs/.
+  // It MUST remain visible to blast-radius (could be overreach/adversarial).
+  for (const p of [
+    "docs/evil.ts",
+    "docs/adr/0001.ts",
+    "packages/api/docs/schema.json",
+    "docs/build.sh",
+    "src/a.ts",
+    "config.json",
+    "README.ts",
+    "mdx/loader.ts",
+  ]) {
     assert.equal(isDocFile(p), false, `${p} should NOT be a doc file`);
   }
 });
 
-test("filesOutsideExpectedSurface never flags a proactive doc as an excursion", () => {
-  // A DATA_MODEL.md volunteered outside the surface is not scope risk (issue
-  // #38): it must not reach blast-radius classification, while an unrequested
-  // CODE file still does.
+test("filesOutsideExpectedSurface skips proactive docs but still flags code hidden under docs/", () => {
+  // A DATA_MODEL.md / docs/*.md volunteered outside the surface is not scope
+  // risk (issue #38) → skipped. But an unrequested CODE file still reaches
+  // blast-radius — including a build script hidden in docs/ (docs/evil.ts).
   const got = filesOutsideExpectedSurface(
-    ["src/handler.ts", "DATA_MODEL.md", "docs/adr/0002.md", "src/sneaky.ts"],
+    ["src/handler.ts", "DATA_MODEL.md", "docs/adr/0002.md", "docs/evil.ts", "src/sneaky.ts"],
     ["src/handler.ts"],
   );
-  assert.deepEqual(got, ["src/sneaky.ts"]);
+  assert.deepEqual(got, ["docs/evil.ts", "src/sneaky.ts"]);
 });
 
 test("first-seen order is preserved", () => {
