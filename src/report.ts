@@ -443,7 +443,7 @@ export function renderSlop(
     return `| ${a.variant} | ${a.executorModel} | ${dup} | ${churn} | ${a.residue.todos} | ${a.residue.debugLogging} | ${a.residue.commentedOutCode} | ${a.testTamperHits} | ${a.helperReuse} | ${a.literalDensity} |`;
   });
   return [
-    "_Mechanical diff signals — re-derivable by hand. Churn applies to campaign links only. Helper reuse (higher = shared helpers reused) and Literal density (higher = magic literals inlined) are summed over cells. Disqualified cells excluded._",
+    "_Mechanical diff signals — re-derivable by hand. Churn applies to campaign links only. Helper reuse (higher = shared helpers reused) and Literal density (higher = magic literals inlined) are summed over cells. Literal density is OBSERVATIONAL only — it never feeds SlopHealth/Craft Score, and legitimately literal-heavy code (HTTP status codes, string messages) can raise it. Disqualified cells excluded._",
     "",
     [header, ...rows].join("\n"),
   ].join("\n");
