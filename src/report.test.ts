@@ -390,6 +390,42 @@ test("renderMemoryEffect renders grade symbols + legend when grades are present"
   assert.match(md, /\| os \| ✓A \| 2 \| no \|/);
 });
 
+test("#13: renderMemoryEffect fires a ✓A headline callout ONLY when an anchor grades held-by-abstraction, before the legend", () => {
+  const abstraction = anchored("os", "reg", {
+    conventionHeld: true, turnsToGreen: 2, hitKnownTrap: false, evidence: "e",
+    grade: "held-by-abstraction",
+  });
+  const md = renderMemoryEffect([abstraction]);
+  assert.match(md, /✓A held-by-abstraction:.*os on `reg`/);
+  assert.match(md, /strongest memory signal/);
+  // Callout precedes the grade legend/grid.
+  assert.ok(md.indexOf("✓A held-by-abstraction:") < md.indexOf("Grades:"), "callout before the legend");
+  assert.ok(md.indexOf("✓A held-by-abstraction:") < md.indexOf("| Variant |"), "callout before the grid");
+
+  // No abstraction hold → no callout (literal hold only).
+  const literal = anchored("os", "reg", {
+    conventionHeld: true, turnsToGreen: 2, hitKnownTrap: false, evidence: "e",
+    grade: "held-by-literal",
+  });
+  assert.doesNotMatch(renderMemoryEffect([literal]), /✓A held-by-abstraction:/);
+});
+
+test("#14: memory-registry is flagged non-discriminating (✝ marker + footnote), other tasks are not", () => {
+  const held = anchored("naked", "memory-registry", {
+    conventionHeld: true, turnsToGreen: 15, hitKnownTrap: false, evidence: "e",
+    grade: "held-by-literal",
+  });
+  const md = renderMemoryEffect([held]);
+  assert.match(md, /\| `memory-registry` ✝ \|/); // dagger on the pivot column
+  assert.match(md, /✝ non-discriminating:.*not a memory win/);
+  // A different task carries no dagger.
+  const other = anchored("naked", "memory-cents", {
+    conventionHeld: true, hitKnownTrap: false, evidence: "e", grade: "held-by-literal",
+  });
+  const md2 = renderMemoryEffect([other]);
+  assert.doesNotMatch(md2, /✝/);
+});
+
 test("held-by-chain renders ~C with its legend entry in strength order", () => {
   const chain = anchored("os", "reg", {
     conventionHeld: true, hitKnownTrap: false,
@@ -509,13 +545,27 @@ const campaigns = [agenticOs, nakedCamp, gstackCamp];
 
 test("renderCampaignMemoryEffect leads with the cumulative adherence delta + legacy trajectory strings", () => {
   const md = renderCampaignMemoryEffect(campaigns);
-  assert.match(md, /\*\*Cumulative adherence:\*\* agentic-os 3\/3 adhered \| naked 0\/3 \| gstack 1\/3/);
+  // Keeps the adhered/anchored fraction, now with the held/drift/trap breakdown (#15).
+  assert.match(
+    md,
+    /\*\*Cumulative adherence:\*\* agentic-os 3\/3 adhered \(3 held · 0 drift · 0 trap\) \| naked 0\/3 \(0 held · 0 drift · 3 trap\) \| gstack 1\/3 \(1 held · 1 drift · 1 trap\)/,
+  );
   assert.match(md, /\| Task \| agentic-os \| naked \| gstack \|/);
   // Byte-exact legacy cells (grade-less anchors) — integration tests depend on these.
   assert.match(md, /#2 `t3-created-at` \| ✓ held · 3t \| ✗ drift ⚠ trap · 3t \| ✓ held · 3t \|/);
   assert.match(md, /#0 `t1-search` \| — · 3t \|/);
   assert.doesNotMatch(md, /Grades:/); // legend only when graded verdicts exist
   assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+test("#15: the cumulative headline distinguishes drift from trap at the aggregate level", () => {
+  // naked hit the trap 3× (adopted the known-wrong convention); a drifting bundle
+  // that wrote something-else-but-not-the-trap must read differently.
+  const driftCamp = campaign("drifter", [false, false, false]); // anchored, not held, no trap
+  const md = renderCampaignMemoryEffect([nakedCamp, driftCamp]);
+  assert.match(md, /naked 0\/3 adhered \(0 held · 0 drift · 3 trap\)/);
+  assert.match(md, /drifter 0\/3 \(0 held · 3 drift · 0 trap\)/);
+  // Same 0/3 adhered, opposite failure mode — the whole point of the split.
 });
 
 test("campaign trajectory cells show grade symbols + legend when graded", () => {
@@ -551,7 +601,8 @@ test("renderReportMarkdown surfaces the campaign memory effect; buildReportJson 
   });
   const md = renderReportMarkdown(report);
   assert.match(md, /## Memory effect \(campaign, not scored\)/);
-  assert.match(md, /agentic-os 3\/3 adhered \| naked 0\/3 \| gstack 1\/3/);
+  assert.match(md, /agentic-os 3\/3 adhered \(3 held · 0 drift · 0 trap\)/);
+  assert.match(md, /naked 0\/3 \(0 held · 0 drift · 3 trap\)/);
 
   const json = buildReportJson(report) as {
     memoryEffectCampaign: {

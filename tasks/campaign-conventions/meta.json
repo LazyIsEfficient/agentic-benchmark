@@ -34,9 +34,9 @@
       "anchor": {
         "kind": "rule",
         "label": "R1+R2",
-        "required": ["Date\\.now\\(\\)\\s*/\\s*1000", "ulid_"],
-        "forbidden": ["toISOString", "new Date\\(", "date-fns|dayjs|moment", "\\brandomUUID\\b"],
-        "appliesIf": ["createdAt|updatedAt|timestamp", "\\bDate\\b", "\\bid\\b", "[a-z]Id\\b", "\\buuid|\\bUUID", "\\bat\\s*[:=]"]
+        "required": ["ulid_", "Date\\.now\\(\\)\\s*/\\s*1000"],
+        "forbidden": ["\\brandomUUID\\b", "toISOString", "new Date\\(", "date-fns|dayjs|moment"],
+        "appliesIf": ["\\bid\\b", "[a-z]Id\\b", "\\buuid|\\bUUID", "createdAt|updatedAt|timestamp", "\\bDate\\b", "\\bat\\s*[:=]"]
       }
     }
   ],

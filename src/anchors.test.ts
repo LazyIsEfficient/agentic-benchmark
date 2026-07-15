@@ -620,6 +620,38 @@ test("graded rule: abstraction hold — required in the cumulative diff WITH lin
   assert.match(r.evidence, /linkage via identifier "generateId"/, "evidence names the linking identifier");
 });
 
+test("graded rule: abstraction hold survives a helper whose NAME is far from the ulid_ literal (widened window)", () => {
+  // The helper's NAME sits on its declaration line; the ulid_ literal lives 6
+  // comment-stripped lines down in the body. The old ±3 window dropped `mintId`
+  // and degraded this genuine ✓A to ✗ drift. The widened window keeps the name.
+  const farHelperCumulative = `diff --git a/src/ids.ts b/src/ids.ts
+--- a/src/ids.ts
++++ b/src/ids.ts
+@@ -1,1 +1,8 @@
++export function mintId(): string {
++  const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz";
++  let suffix = "";
++  for (let n = 0; n < 8; n++) {
++    suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
++  }
++  return "ulid_" + suffix;
++}
+`;
+  const linkDiff = `diff --git a/src/revision.ts b/src/revision.ts
+--- a/src/revision.ts
++++ b/src/revision.ts
+@@ -1,1 +1,2 @@
++const id = mintId();
+`;
+  const r = detectAnchorGraded(ULID_RULE, step(linkDiff), {
+    linkDiff,
+    cumulativeDiff: farHelperCumulative,
+  });
+  assert.equal(r.grade, "held-by-abstraction");
+  assert.equal(r.conventionHeld, true);
+  assert.match(r.evidence, /linkage via identifier "mintId"/, "the far-off helper name is still harvested");
+});
+
 test("graded rule: cumulative hold WITHOUT linkage grades drift when the link exercised the surface", () => {
   // The rev_/Math.random repro: the link mints an id (appliesIf matches) using a
   // wrong-way scheme; the ulid_ marker exists only in an earlier link's diff and

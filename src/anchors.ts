@@ -420,6 +420,21 @@ function isValidRegExpSource(src: string): boolean {
 /** Candidate identifiers for linkage evidence: 3+ chars, JS-identifier shaped. */
 const LINKAGE_IDENTIFIER_RE = /[A-Za-z_$][\w$]{2,}/g;
 
+/**
+ * Half-height (in added CODE lines) of the linkage-harvest window around a
+ * required-matching line. Widened from the original ±3 because the identifier
+ * that carries an abstraction — a helper's NAME — sits on its DECLARATION line
+ * (`function mintId()` / `const mintId =`), while the convention literal
+ * (`ulid_`) lives further down in the helper BODY. A realistic id-minting helper
+ * (signature → alphabet/loop → `return 'ulid_' + …`) puts those ~5-7 comment-
+ * stripped lines apart, so a ±3 window silently dropped the name and degraded a
+ * genuine ✓A hold to ✗ drift / ~C chain. ±10 spans a full such helper end-to-end
+ * while staying well inside one function, so it never reaches an unrelated
+ * declaration; the stoplist plus the "identifier must ALSO appear in the LINK
+ * diff" gate keep the wider net from manufacturing false linkage.
+ */
+const LINKAGE_WINDOW = 10;
+
 /** JS keywords / common tokens that can never serve as linkage evidence. */
 const LINKAGE_STOPLIST: ReadonlySet<string> = new Set([
   "const", "let", "var", "function", "return", "export", "import", "new",
@@ -457,10 +472,11 @@ function extractAddedLineGroups(diff: string): string[][] {
 /**
  * Harvest candidate linkage identifiers from a cumulative diff: for every added
  * line matching ANY `required` marker, collect the identifiers appearing within
- * ±3 added lines of it (same-file window, stoplist excluded), deduplicated in
- * first-seen order. These are the names an abstraction built next to the marker
- * plausibly travels under (e.g. the helper's own name); a later link consuming
- * that abstraction re-emits one of them.
+ * ±{@link LINKAGE_WINDOW} added lines of it (same-file window, stoplist
+ * excluded), deduplicated in first-seen order. These are the names an
+ * abstraction built next to the marker plausibly travels under (e.g. the
+ * helper's own name, which sits on its declaration line — above the literal in
+ * the body); a later link consuming that abstraction re-emits one of them.
  */
 function harvestLinkageIdentifiers(groups: string[][], required: RegExp[]): string[] {
   const seen = new Set<string>();
@@ -468,8 +484,8 @@ function harvestLinkageIdentifiers(groups: string[][], required: RegExp[]): stri
   for (const group of groups) {
     for (let i = 0; i < group.length; i++) {
       if (!required.some((re) => re.test(group[i]!))) continue;
-      const lo = Math.max(0, i - 3);
-      const hi = Math.min(group.length - 1, i + 3);
+      const lo = Math.max(0, i - LINKAGE_WINDOW);
+      const hi = Math.min(group.length - 1, i + LINKAGE_WINDOW);
       for (let j = lo; j <= hi; j++) {
         for (const m of group[j]!.matchAll(LINKAGE_IDENTIFIER_RE)) {
           const ident = m[0]!;
@@ -526,8 +542,9 @@ function gradeFromLegacy(
  *  4. link diff has NO added lines                 → `unknown` (fail closed)
  *  5. all `required` match the CUMULATIVE diff (when provided) — a cumulative
  *     hold, adjudicated by LINK-LEVEL LINKAGE EVIDENCE. Candidate identifiers
- *     are harvested from the cumulative diff's added lines within ±3 lines of
- *     each required-matching line (same-file window, 3+ chars, JS keywords /
+ *     are harvested from the cumulative diff's added lines within
+ *     ±LINKAGE_WINDOW lines of each required-matching line (same-file window,
+ *     wide enough to reach a helper's declaration line from its body; 3+ chars, JS keywords /
  *     common tokens stoplisted); evidence = at least one harvested identifier
  *     appears in the link diff's added lines (e.g. a `generateId` helper built
  *     beside the `ulid_` marker earlier, and `generateId(` called here):

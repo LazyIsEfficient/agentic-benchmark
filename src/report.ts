@@ -1036,6 +1036,19 @@ export function gradeSymbol(grade: AnchorGrade): string {
 const GRADE_LEGEND =
   "_Grades: ✓A = held-by-abstraction · ✓L = held-by-literal · ~I = held-by-inertia · ~C = held-by-chain · ✗ = drift · ⚠ = trap · ? = unknown._";
 
+/**
+ * Tasks whose deterministic anchor is NON-DISCRIMINATING for memory: a
+ * MEMORYLESS bundle recovered the same rule from repo/task context alone, so a
+ * hold here is NOT evidence of carried memory. `memory-registry` is the case
+ * from issue #14 — in run `5e89e754` the `naked` bundle HELD the "register every
+ * handler in registry.ts" rule (same as agentic-os), because the seed registry
+ * already demonstrates the pattern. We flag it in the readout (a ✝ marker + a
+ * footnote) rather than hardening the task: the rule is inherent to the fixture's
+ * shape, so making it unrecoverable would mean re-designing the task mid-flight.
+ * The readout section is not scored, so this only guides interpretation.
+ */
+const NON_DISCRIMINATING_TASKS: ReadonlySet<string> = new Set(["memory-registry"]);
+
 /** A result carrying a deterministic anchor verdict (a sequential-memory run). */
 type AnchoredResult = VariantTaskResult & { anchors: AnchorResult };
 
@@ -1108,6 +1121,36 @@ export function renderMemoryEffect(results: VariantTaskResult[]): string {
   const tasks = distinctTasks(anchored);
   const anyGraded = anchored.some((r) => r.anchors.grade !== undefined);
 
+  // ✓A headline: held-by-abstraction is the strongest memory signal (the bundle
+  // GENERALIZED the convention instead of re-emitting the literal). Called out
+  // before the legend/grid when — and only when — it occurred. Mechanical text;
+  // this section is not scored.
+  const abstractionWins = anchored.filter(
+    (r) => r.anchors.grade === "held-by-abstraction",
+  );
+  const abstractionCallout =
+    abstractionWins.length === 0
+      ? []
+      : [
+          `> **✓A held-by-abstraction:** ${abstractionWins
+            .map((r) => `${label(r)} on \`${r.taskId}\``)
+            .join(", ")} reused a prior abstraction rather than re-emitting the convention literal — the strongest memory signal. Mechanical, not scored.`,
+          "",
+        ];
+
+  // #14: some tasks' anchors don't discriminate memory (a memoryless bundle
+  // recovers the rule from context). Mark their columns and footnote the reason.
+  const nonDiscriminating = tasks.filter((t) => NON_DISCRIMINATING_TASKS.has(t));
+  const taskHeader = (t: string): string =>
+    `\`${t}\`${NON_DISCRIMINATING_TASKS.has(t) ? " ✝" : ""}`;
+  const nonDiscriminatingNote =
+    nonDiscriminating.length === 0
+      ? []
+      : [
+          `_✝ non-discriminating: a memoryless bundle also recovers this rule from repo/task context (issue #14) — a hold here is not a memory win._`,
+          "",
+        ];
+
   // Contrast pivot: one row per variant, one column per anchored task.
   const rowOrder: string[] = [];
   const byRow = new Map<string, Map<string, AnchoredResult>>();
@@ -1121,7 +1164,7 @@ export function renderMemoryEffect(results: VariantTaskResult[]): string {
   }
 
   const pivotHeader =
-    `| Variant | ${tasks.map((t) => `\`${t}\``).join(" | ")} |\n` +
+    `| Variant | ${tasks.map((t) => taskHeader(t)).join(" | ")} |\n` +
     `| --- | ${tasks.map(() => "---").join(" | ")} |`;
   const pivotRows = rowOrder.map((row) => {
     const cells = tasks.map((t) => {
@@ -1153,11 +1196,13 @@ export function renderMemoryEffect(results: VariantTaskResult[]): string {
   return [
     "_Deterministic readout: did each bundle hold the required convention across a context reset? Anchors are mechanical (not the judge)._",
     "",
+    ...abstractionCallout,
     ...(anyGraded ? [GRADE_LEGEND, ""] : []),
     "#### Contrast — memory helped vs hurt (per bundle)",
     "",
     "_✓ held = kept the required convention; ✗ hit trap = adopted the known wrong convention._",
     "",
+    ...nonDiscriminatingNote,
     pivot,
     "",
     ...details,
@@ -1214,6 +1259,30 @@ export function campaignAdherence(c: CampaignResult): {
   const anchored = c.tasks.filter((t) => t.anchors !== undefined);
   const adhered = anchored.filter((t) => t.anchors!.conventionHeld).length;
   return { adhered, anchored: anchored.length };
+}
+
+/**
+ * Partition a campaign's anchored links into the three cumulative failure/hold
+ * modes (issue #15): `held` (kept the convention), `trap` (adopted the
+ * known-wrong convention), and `drift` (broke it some OTHER way — everything
+ * anchored that neither held nor tripped the trap, incl. fail-closed unknowns).
+ * The buckets are mutually exclusive (a graded verdict is at most one of held /
+ * trap) and sum to `anchored`. Distinguishing drift from trap matters because
+ * they are different diagnoses at different costs: a drift wrote something else
+ * (often burning turns to still be wrong), a trap blindly re-applied a stale
+ * memory. The plain `1/3 vs 0/3` cumulative line collapsed the two.
+ */
+export function campaignAdherenceBreakdown(c: CampaignResult): {
+  held: number;
+  drift: number;
+  trap: number;
+  anchored: number;
+} {
+  const anchored = c.tasks.filter((t) => t.anchors !== undefined);
+  const held = anchored.filter((t) => t.anchors!.conventionHeld).length;
+  const trap = anchored.filter((t) => !t.anchors!.conventionHeld && t.anchors!.hitKnownTrap).length;
+  const drift = anchored.length - held - trap;
+  return { held, drift, trap, anchored: anchored.length };
 }
 
 /** Distinct executor models across campaigns, first-seen order. */
@@ -1289,11 +1358,14 @@ export function renderCampaignMemoryEffect(campaigns: CampaignResult[]): string 
   );
 
   // Headline cumulative adherence delta — the memory-vs-memoryless contrast.
+  // Keeps the `adhered/anchored` fraction, then breaks the rest into drift vs
+  // trap (issue #15) so the summary never collapses "wrote something else" and
+  // "adopted the known-wrong convention" into one number.
   const headline = campaigns
     .map((c, i) => {
-      const { adhered, anchored } = campaignAdherence(c);
-      const base = `${label(c)} ${adhered}/${anchored}`;
-      return i === 0 ? `${base} adhered` : base;
+      const { held, drift, trap, anchored } = campaignAdherenceBreakdown(c);
+      const suffix = i === 0 ? " adhered" : "";
+      return `${label(c)} ${held}/${anchored}${suffix} (${held} held · ${drift} drift · ${trap} trap)`;
     })
     .join(" | ");
 
