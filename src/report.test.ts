@@ -1058,17 +1058,22 @@ test("aggregatePairwise: shuffled orientations fold into one pair; ties excluded
   ]);
   const alpha = agg.variants.find((v) => v.variant === "alpha")!;
   assert.equal(alpha.winRate, 0.5); // 1/(1+1) — the tie never enters
+  // One opponent (bravo), split 1–1 → head-to-head macro-average is also 0.5.
+  assert.equal(alpha.headToHeadWinRate, 0.5);
+  assert.deepEqual(alpha.headToHead, [{ opponent: "bravo", wins: 1, losses: 1 }]);
   assert.deepEqual(agg.positionBias, { aSlotWins: 2, decisive: 2 });
 
   const md = renderPairwise(comparisons);
   assert.match(md, /- alpha vs bravo: 1–1 \(1 ties\)/);
-  assert.match(md, /\| alpha \| 50% \| 1–1–1 \|/);
+  assert.match(md, /\| alpha \| 50% \| 50% \| 2 \| 1–1–1 \|/);
   assert.match(md, /A-slot won 2 of 2 decisive comparisons \(expected ≈50%\)/);
 });
 
 test("renderPairwise: ties-only variant renders — win rate; absent pairwise is a one-liner", () => {
+  const agg = aggregatePairwise([pairwiseResult("a1", "b1", "tie")]);
+  assert.equal(agg.variants[0]!.headToHeadWinRate, null); // no decisive opponent
   const md = renderPairwise([pairwiseResult("a1", "b1", "tie")]);
-  assert.match(md, /\| a1 \| — \| 0–0–1 \|/);
+  assert.match(md, /\| a1 \| — \| — \| 0 \| 0–0–1 \|/);
   assert.match(md, /A-slot won 0 of 0 decisive comparisons/);
   assert.match(renderPairwise(undefined), /No pairwise comparisons ran/);
   assert.match(renderPairwise([]), /No pairwise comparisons ran/);
@@ -1133,17 +1138,26 @@ test("aggregateSlop keys each variant into its OWN bucket: different diffs → d
 const cs = (variant: string, slop: Partial<SlopMetrics>) =>
   cell(variant, "t", { slop: slopMetrics(slop) });
 
-/** 6 balanced comparisons → gstack 3W-1L (.75), agentic-os 2W-1L (.667), naked 1W-4L (.20). */
+/** `n` comparisons in which `a` beats `b` (a always in the resolved A slot). */
+const beats = (a: string, b: string, n: number): PairwiseResult[] =>
+  Array.from({ length: n }, () => pairwiseResult(a, b, "A"));
+
+/**
+ * A fully-decisive round-robin with ≥5 comparisons between every adjacent pair,
+ * so ranks stay separable and confident — isolating the composite formula from
+ * the confidence layer. Head-to-head macro rates: gstack (vs ao .8, vs naked 1)
+ * → .9; agentic-os (vs gstack .2, vs naked .8) → .5; naked (vs gstack 0, vs ao
+ * .2) → .1. Each variant has 10 decisive comparisons.
+ */
 const csPairwise: PairwiseResult[] = [
-  pairwiseResult("gstack", "naked", "A"),
-  pairwiseResult("gstack", "naked", "A"),
-  pairwiseResult("gstack", "agentic-os", "A"),
-  pairwiseResult("agentic-os", "naked", "A"),
-  pairwiseResult("agentic-os", "naked", "A"),
-  pairwiseResult("naked", "gstack", "A"),
+  ...beats("gstack", "agentic-os", 4),
+  ...beats("agentic-os", "gstack", 1),
+  ...beats("agentic-os", "naked", 4),
+  ...beats("naked", "agentic-os", 1),
+  ...beats("gstack", "naked", 5),
 ];
 
-test("aggregateCraftScore: winRate×SlopHealth composite, ranked, matching the locked formula", () => {
+test("aggregateCraftScore: head-to-head winRate × SlopHealth composite, ranked, matching the locked formula", () => {
   const results = [
     cs("gstack", {}), // clean: SlopHealth 1.0
     cs("agentic-os", { residue: { todos: 0, debugLogging: 1, commentedOutCode: 0 } }), // 0.90
@@ -1156,17 +1170,114 @@ test("aggregateCraftScore: winRate×SlopHealth composite, ranked, matching the l
   const a = aggs.find((a) => a.variant === "agentic-os")!;
   const n = aggs.find((a) => a.variant === "naked")!;
   assert.equal(g.slopHealth, 1);
-  assert.equal(g.score, 83); // round(100·(0.7·0.75 + 0.3·1.0))
+  assert.equal(g.winRate, 0.9); // macro of (.8 vs ao, 1.0 vs naked)
+  assert.equal(g.score, 93); // round(100·(0.7·0.9 + 0.3·1.0))
+  assert.equal(g.decisiveTotal, 10);
   assert.equal(a.slopHealth, 0.9);
-  assert.equal(a.score, 74); // round(100·(0.7·0.667 + 0.3·0.90))
+  assert.equal(a.winRate, 0.5); // macro of (.2 vs gstack, .8 vs naked)
+  assert.equal(a.score, 62); // round(100·(0.7·0.5 + 0.3·0.90))
   assert.equal(n.slopHealth, 0);
-  assert.equal(n.score, 14); // round(100·(0.7·0.20 + 0.3·0))
+  assert.equal(n.winRate, 0.1); // macro of (0 vs gstack, .2 vs ao)
+  assert.equal(n.score, 7); // round(100·(0.7·0.1 + 0.3·0))
   assert.equal(g.slopOnly, false);
+  // 10 decisive each, ≥5 between every adjacent pair → confident, separable.
+  assert.equal(aggs.every((x) => x.lowConfidence), false);
 
   const md = renderCraftScore(results, csPairwise);
-  assert.match(md, /\| 1 \| gstack \| sonnet \| 83 \| 75% \| 1\.00 \|/);
-  assert.match(md, /\| 2 \| agentic-os \| sonnet \| 74 \| 67% \| 0\.90 \|/);
-  assert.match(md, /\| 3 \| naked \| sonnet \| 14 \| 20% \| 0\.00 \|/);
+  assert.match(md, /\| 1 \| gstack \| sonnet \| 93 \| 90% \| 1\.00 \|/);
+  assert.match(md, /\| 2 \| agentic-os \| sonnet \| 62 \| 50% \| 0\.90 \|/);
+  // Each row's variant is immediately followed by `| sonnet` — no ≈ rank and no
+  // low-confidence suffix — so the three positive matches already prove clean,
+  // distinct, confident ranks.
+  assert.match(md, /\| 3 \| naked \| sonnet \| 7 \| 10% \| 0\.00 \|/);
+});
+
+test("aggregatePairwise: macro-average ignores volume — beating only the weak variant earns no bonus", () => {
+  // "farmer" pads its record by beating "naked" 9 times but splits 1–1 with the
+  // strong "rival". GLOBAL rate = 10/12 ≈ .83 (volume inflates it); the honest
+  // HEAD-TO-HEAD macro is (1.0 vs naked + 0.5 vs rival)/2 = .75 — one opponent,
+  // one vote, no matter how many times it was farmed.
+  const pw = [
+    ...beats("farmer", "naked", 9),
+    ...beats("farmer", "rival", 1),
+    ...beats("rival", "farmer", 1),
+  ];
+  const farmer = aggregatePairwise(pw).variants.find((v) => v.variant === "farmer")!;
+  assert.equal(farmer.winRate, 10 / 11); // global (10 W, 1 L), volume-inflated
+  assert.equal(farmer.headToHeadWinRate, 0.75); // macro, volume-neutral
+  assert.deepEqual(farmer.headToHead, [
+    { opponent: "naked", wins: 9, losses: 0 },
+    { opponent: "rival", wins: 1, losses: 1 },
+  ]);
+});
+
+test("renderCraftScore: a variant backed by < MIN_CONFIDENT_DECISIVE comparisons is flagged low-confidence", () => {
+  // "thin" scores on a single 3–1 head-to-head (4 decisive < 5) → score stands,
+  // but the row is annotated ⚠ low-confidence (n=4).
+  const results = [cs("thin", {}), cs("other", { duplicationDelta: 20 })];
+  const pw = [...beats("thin", "other", 3), ...beats("other", "thin", 1)];
+  const aggs = aggregateCraftScore(results, pw);
+  const thin = aggs.find((a) => a.variant === "thin")!;
+  assert.equal(thin.decisiveTotal, 4);
+  assert.equal(thin.slopOnly, false); // 4 ≥ 3, so the rate is still used
+  assert.equal(thin.lowConfidence, true);
+  assert.equal(thin.winRate, 0.75); // single opponent → macro == that split
+  const md = renderCraftScore(results, pw);
+  assert.match(md, /thin ⚠ low-confidence \(n=4\)/);
+});
+
+test("renderCraftScore tie-band: close-and-thin AND lower won ≥1 → not separable (≈)", () => {
+  // "top" beats "next" 2–1 (3 decisive < 5), both clean slop → scores 77 vs 53,
+  // gap 24 < 25, and next won one of the three. Thin, close, not a shutout → the
+  // second row must render ≈ (same band), not a distinct rank 2.
+  const results = [cs("top", {}), cs("next", {})];
+  const pw = [...beats("top", "next", 2), ...beats("next", "top", 1)];
+  const aggs = aggregateCraftScore(results, pw);
+  assert.deepEqual(aggs.map((a) => a.variant), ["top", "next"]); // top scores higher
+  assert.equal(aggs[0]!.score, 77); // round(100·(0.7·0.667 + 0.3·1.0))
+  assert.equal(aggs[1]!.score, 53); // round(100·(0.7·0.333 + 0.3·1.0)); gap 24 < 25
+  const md = renderCraftScore(results, pw);
+  assert.match(md, /\| 1 \| top ⚠ low-confidence \(n=3\) \| sonnet \|/);
+  assert.match(md, /\| ≈ \| next ⚠ low-confidence \(n=3\) \| sonnet \|/); // not a rank 2
+  assert.doesNotMatch(md, /\| 2 \|/);
+});
+
+test("renderCraftScore tie-band: a head-to-head SHUTOUT separates even on a thin sample and small gap", () => {
+  // Chain of shutouts with SMALL score gaps (18, 17 — both < 25) so only the
+  // shutout rule can separate them. Macro rates: hi (vs mid 1.0, vs lo .5)=.75;
+  // mid (vs hi 0, vs lo 1.0)=.5; lo (vs hi .5, vs mid 0)=.25. mid is shut out by
+  // hi (0–2); lo is shut out by mid (0–2). Each must get its own rank, not ≈.
+  const results = [cs("hi", {}), cs("mid", {}), cs("lo", {})];
+  const pw = [
+    ...beats("hi", "mid", 2), // mid shut out by hi
+    ...beats("mid", "lo", 2), // lo shut out by mid
+    ...beats("hi", "lo", 1),
+    ...beats("lo", "hi", 1), // hi–lo split 1–1
+  ];
+  const aggs = aggregateCraftScore(results, pw);
+  assert.deepEqual(aggs.map((a) => a.variant), ["hi", "mid", "lo"]);
+  assert.deepEqual(aggs.map((a) => a.score), [83, 65, 48]); // gaps 18, 17 (< 25)
+  const md = renderCraftScore(results, pw);
+  assert.match(md, /\| 1 \| hi ⚠ low-confidence \(n=4\) \| sonnet \| 83 \|/);
+  assert.match(md, /\| 2 \| mid ⚠ low-confidence \(n=4\) \| sonnet \| 65 \|/); // shutout → rank 2
+  assert.match(md, /\| 3 \| lo ⚠ low-confidence \(n=4\) \| sonnet \| 48 \|/); // shutout → rank 3
+  assert.doesNotMatch(md, /\| ≈ \|/); // no banded rows
+});
+
+test("renderCraftScore tie-band: a ≥ 25-point score gap separates even on a thin sample", () => {
+  // "a" beats "b" 3–1 (4 decisive < 5) and b won one (NOT a shutout), so only the
+  // big-gap rule can separate them: a is clean (score 83), b's slop saturates
+  // (score 18) → gap 65 ≥ 25 → distinct ranks, not ≈.
+  const results = [cs("a", {}), cs("b", { duplicationDelta: 10 })];
+  const pw = [...beats("a", "b", 3), ...beats("b", "a", 1)];
+  const aggs = aggregateCraftScore(results, pw);
+  assert.deepEqual(aggs.map((a) => a.variant), ["a", "b"]);
+  assert.equal(aggs[0]!.score, 83);
+  assert.equal(aggs[1]!.score, 18); // gap 65 ≥ 25
+  const md = renderCraftScore(results, pw);
+  assert.match(md, /\| 1 \| a ⚠ low-confidence \(n=4\) \| sonnet \| 83 \|/);
+  assert.match(md, /\| 2 \| b ⚠ low-confidence \(n=4\) \| sonnet \| 18 \|/); // big gap → rank 2
+  assert.doesNotMatch(md, /\| ≈ \|/); // no banded rows
 });
 
 test("aggregateCraftScore: missing pairwise drops the winRate term → round(100·SlopHealth), flagged slop-only", () => {
