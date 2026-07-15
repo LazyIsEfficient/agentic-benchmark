@@ -45,46 +45,126 @@ export function truncateEvidence(
   };
 }
 
+/** Cap on how many `{` start positions we probe per region — bounds the
+ * enumeration cost on pathological input while comfortably covering any real
+ * judge response (which carries at most a handful of top-level braces). */
+const MAX_OBJECT_STARTS = 200;
+
 /**
- * Return the first complete, balanced `{ ... }` object span in `text`
- * (brace-matched, string/escape aware), or null if none. Crucially this stops at
- * the matching close brace, so any trailing content after the object is ignored.
- * Pure.
+ * Remove commas that immediately precede a `}` or `]` (JSON forbids them, but
+ * models emit them freely). String/escape aware so a comma inside a string
+ * value is never touched. Pure — restructures nothing, only deletes the
+ * offending comma tokens.
  */
-function firstBalancedObject(text: string): string | null {
-  const start = text.indexOf("{");
-  if (start === -1) return null;
-  let depth = 0;
+function stripTrailingCommas(text: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j]!)) j++;
+      if (j < text.length && (text[j] === "}" || text[j] === "]")) continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+/**
+ * Scan a brace/bracket-balanced object starting at `start` (which must index a
+ * `{`), string/escape aware. Returns:
+ * - the exact object span when it closes cleanly (trailing content ignored);
+ * - a REPAIR-CLOSED span when the text is truncated mid-object — an open string
+ *   is closed and every still-open container is closed, in reverse order.
+ * The repair only APPENDS closers (and one quote); it never inserts keys,
+ * values, or commas, so it cannot fabricate structure. Any residual invalidity
+ * (e.g. a truncated `"key":` with no value) is caught by the caller's
+ * `JSON.parse` gate, which rejects the candidate. Pure.
+ */
+function scanObject(text: string, start: number): string | null {
+  const closers: string[] = [];
   let inStr = false;
   let esc = false;
   for (let i = start; i < text.length; i++) {
-    const c = text[i];
+    const c = text[i]!;
     if (inStr) {
       if (esc) esc = false;
       else if (c === "\\") esc = true;
       else if (c === '"') inStr = false;
-    } else if (c === '"') inStr = true;
-    else if (c === "{") depth++;
-    else if (c === "}" && --depth === 0) return text.slice(start, i + 1);
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") closers.push("}");
+    else if (c === "[") closers.push("]");
+    else if (c === "}" || c === "]") {
+      if (closers.length === 0) break; // stray closer — not our object
+      closers.pop();
+      if (closers.length === 0) return text.slice(start, i + 1);
+    }
   }
-  return null;
+  // Truncated: the object never closed. Rebuild by closing an open string and
+  // the outstanding containers (innermost first).
+  let repaired = text.slice(start);
+  if (inStr) repaired += '"';
+  for (let k = closers.length - 1; k >= 0; k--) repaired += closers[k];
+  return repaired;
 }
 
 /**
- * Extract a JSON object string from free text: prefer the content of a ```json
- * (or bare ```) fenced block, else the whole text — but in BOTH cases reduce to
- * exactly the first balanced object. The judge occasionally appends prose after
- * the JSON (even inside the fence); returning the balanced object rather than the
- * raw fence body keeps `JSON.parse` from choking on that trailer. Pure.
+ * Extract a JSON object string from free model text, robust to the shapes the
+ * judge actually emits: ```json (or bare ```) fenced blocks, leading/trailing
+ * prose, an object that does not start at char 0, decoy braces before the real
+ * object, trailing commas, nested/multiple braces (via balanced scan), and
+ * truncated-but-recoverable output (via close-repair). Deterministic and safe —
+ * never eval; the returned text is guaranteed to `JSON.parse`, since each
+ * candidate is parse-verified before it is returned. Returns null when no
+ * region yields a parseable object, so genuine garbage still fails closed. Pure.
+ *
+ * Contract (STABLE — `pairwise.ts` depends on it): `(text: string) => string |
+ * null`, returning JSON object *text* ready for `JSON.parse`.
  */
 export function extractJsonObjectText(text: string): string | null {
-  const fenced =
-    text.match(/```json\s*([\s\S]*?)```/i) ?? text.match(/```\s*([\s\S]*?)```/);
-  if (fenced?.[1]) {
-    const obj = firstBalancedObject(fenced[1]);
-    if (obj) return obj;
+  // Search regions in priority order: a ```json fence, then a bare ``` fence,
+  // then the whole text. First region to yield a parseable object wins.
+  const regions: string[] = [];
+  const jsonFence = text.match(/```json\s*([\s\S]*?)```/i);
+  if (jsonFence?.[1] !== undefined) regions.push(jsonFence[1]);
+  const bareFence = text.match(/```\s*([\s\S]*?)```/);
+  if (bareFence?.[1] !== undefined) regions.push(bareFence[1]);
+  regions.push(text);
+
+  for (const region of regions) {
+    let starts = 0;
+    for (let i = 0; i < region.length; i++) {
+      if (region[i] !== "{") continue;
+      if (++starts > MAX_OBJECT_STARTS) break;
+      const candidate = scanObject(region, i);
+      if (candidate === null) continue;
+      const cleaned = stripTrailingCommas(candidate);
+      try {
+        JSON.parse(cleaned);
+        return cleaned;
+      } catch {
+        // This `{` did not open a parseable object (decoy brace, unrecoverable
+        // truncation, or invalid JSON) — try the next candidate start.
+      }
+    }
   }
-  return firstBalancedObject(text);
+  return null;
 }
 
 /**
@@ -438,14 +518,22 @@ export async function judgeCell(
   }
 
   let parsed: CellJudgeResult | null;
+  let parseError = "";
   try {
     parsed = parseCellJudgeResult(rawText);
-  } catch {
+  } catch (err) {
     parsed = null;
+    parseError = (err as Error).message;
   }
 
   if (parsed === null) {
-    const reAskPrompt = `${judgePrompt}\n\nYour previous output could not be parsed as JSON:\n${rawText}\n\nOutput valid JSON only.`;
+    // Targeted repair: quote the exact failure and name the concrete mistakes to
+    // avoid, so the re-ask corrects the specific defect rather than guessing.
+    // Budget stays at exactly ONE re-ask (spec-mandated).
+    const reAskPrompt =
+      `${judgePrompt}\n\nYour previous output could not be parsed as JSON:\n${rawText}\n\n` +
+      `The parser failed with: ${parseError}\n` +
+      `Return ONLY a single JSON object — no code fences, no prose before or after it, no trailing commas, and do not truncate it. Output valid JSON only.`;
     try {
       parsed = parseCellJudgeResult(await ask(reAskPrompt));
     } catch (err) {
