@@ -213,6 +213,124 @@ function countResidue(added: string[]): SlopMetrics["residue"] {
   return { todos, debugLogging, commentedOutCode };
 }
 
+// --- helperReuse -----------------------------------------------------------------------
+
+/**
+ * Names DECLARED as a reusable helper on an added line: a `function foo(`, a
+ * `const foo = (…) =>` / `const foo = x =>` arrow, or a `const foo = function`
+ * expression (also `let`/`var`, with optional `export`/`async`). The negative
+ * lookbehind keeps `obj.foo` / `a_foo` from matching. WHY only these forms: they
+ * are the syntactic shapes an agent uses when it EXTRACTS shared logic — the
+ * thing whose reuse we want to reward.
+ */
+const FUNCTION_DECL = /(?<![\w$.])(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/;
+const ARROW_OR_FN_EXPR_DECL =
+  /(?<![\w$.])(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/;
+
+/** Identifier chars need no regex escaping, but be explicit for the dynamic call regex. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Helper-extraction signal: total call-sites in the ADDED lines that REUSE a
+ * helper the SAME diff declares. Collect every declared helper name, then count
+ * `name(` call tokens across all added lines and subtract the one spurious token
+ * a `function name(` declaration contributes to its own name (arrow/expression
+ * declarations write `name =`, not `name(`, so they self-count as zero). A helper
+ * defined but never called scores 0; a helper called from N sites scores N. WHY
+ * declared-only: counting arbitrary `foo(` calls would reward ordinary library
+ * use and punish nothing — the metric must isolate the run's OWN extraction.
+ */
+function helperReuseCount(added: string[]): number {
+  const declared = new Set<string>();
+  const functionDeclCount = new Map<string, number>();
+  for (const line of added) {
+    const arrow = ARROW_OR_FN_EXPR_DECL.exec(line);
+    if (arrow !== null) declared.add(arrow[1]!);
+    const fn = FUNCTION_DECL.exec(line);
+    if (fn !== null) {
+      const name = fn[1]!;
+      declared.add(name);
+      functionDeclCount.set(name, (functionDeclCount.get(name) ?? 0) + 1);
+    }
+  }
+  if (declared.size === 0) return 0;
+  let reused = 0;
+  for (const name of declared) {
+    const callRe = new RegExp(`(?<![\\w$.])${escapeRegExp(name)}\\s*\\(`, "g");
+    let calls = 0;
+    for (const line of added) calls += (line.match(callRe) ?? []).length;
+    calls -= functionDeclCount.get(name) ?? 0; // the declaration's own `name(` is not a call
+    if (calls > 0) reused += calls;
+  }
+  return reused;
+}
+
+// --- literalDensity --------------------------------------------------------------------
+
+/**
+ * A declaration whose ENTIRE right-hand side is a single literal —
+ * `const NAME = 3600;` / `const LABEL = "svc";` (optional type annotation,
+ * optional leading `-`, optional trailing `;`). This is the HEALTHY extraction
+ * (naming a magic value), so its literal is not slop. A COMPOUND RHS
+ * (`const delay = elapsed * 1000 + 250`) does NOT match — its inlined literals
+ * still count. Skipping only the single-literal form keeps the metric from
+ * crediting expression-buried literals as "extracted".
+ */
+const SIMPLE_CONSTANT_DECL =
+  /^(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*(?::[^=]+)?=\s*(?:-?\d[\d_]*(?:\.\d+)?|(['"`])(?:\\.|(?!\1).)*\1)\s*;?\s*$/;
+/** An import / re-export line — module specifiers are not magic literals. */
+const MODULE_LINE = /^(?:import\b|export\s+.*\bfrom\b)|require\s*\(/;
+/** A quoted string literal (single/double/backtick), escapes tolerated. */
+const STRING_LITERAL = /(['"`])(?:\\.|(?!\1).)*\1/g;
+/** A numeric literal not glued to an identifier/dot (so `a1`/`x.5` don't match), digit-group underscores allowed. */
+const NUMERIC_LITERAL = /(?<![\w$.])\d[\d_]*(?:\.\d+)?(?![\w$.])/g;
+
+/** Count magic string literals on a line: inner length ≥2 and not a `${}` template. */
+function countMagicStrings(line: string): number {
+  let n = 0;
+  for (const m of line.matchAll(STRING_LITERAL)) {
+    const inner = m[0].slice(1, -1);
+    if (inner.length >= 2 && !inner.includes("${")) n++;
+  }
+  return n;
+}
+
+/** Count magic numeric literals on a string-stripped line: skip single-digit ints (0–9). */
+function countMagicNumbers(lineWithoutStrings: string): number {
+  let n = 0;
+  for (const m of lineWithoutStrings.matchAll(NUMERIC_LITERAL)) {
+    const raw = m[0].replace(/_/g, "");
+    if (/^\d$/.test(raw)) continue; // single-digit integer: too common to be "magic"
+    n++;
+  }
+  return n;
+}
+
+/**
+ * Literal-density signal: magic literals INLINED in added code. Skips blank,
+ * comment, import, and named-constant-declaration lines (defining a `const NAME`
+ * is the extraction we want, not slop). On surviving lines, count non-trivial
+ * string literals, then count numeric literals in the string-stripped remainder
+ * so digits inside a string never double-count. Conservative floors (empty/1-char
+ * strings, single-digit ints) keep ordinary code from scoring; the metric is
+ * meant to separate inline-literal drift from constant extraction, nothing finer.
+ */
+function literalDensityCount(added: string[]): number {
+  let count = 0;
+  for (const raw of added) {
+    const line = raw.trim();
+    if (line === "") continue;
+    if (COMMENT_MARKER.test(line)) continue;
+    if (MODULE_LINE.test(line)) continue;
+    if (SIMPLE_CONSTANT_DECL.test(line)) continue;
+    count += countMagicStrings(line);
+    count += countMagicNumbers(line.replace(STRING_LITERAL, " "));
+  }
+  return count;
+}
+
 // --- testTamper -----------------------------------------------------------------------
 
 /**
@@ -372,5 +490,7 @@ export function computeSlopMetrics(inputs: {
     churnRatio: computeChurnRatio(removed, inputs.earlierAddedLines),
     residue: countResidue(added),
     testTamper: detectTestTamper(added, removed),
+    helperReuse: helperReuseCount(added),
+    literalDensity: literalDensityCount(added),
   };
 }

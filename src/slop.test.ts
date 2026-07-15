@@ -557,6 +557,8 @@ test("empty diff → everything zero, churnRatio null, no tamper evidence", () =
     churnRatio: null,
     residue: { todos: 0, debugLogging: 0, commentedOutCode: 0 },
     testTamper: { hits: 0, evidence: [] },
+    helperReuse: 0,
+    literalDensity: 0,
   });
 });
 
@@ -589,4 +591,88 @@ test("a deletion-only diff that removes assertions still flags tamper", () => {
   const m = computeSlopMetrics({ diff });
   assert.equal(m.testTamper.hits, 2);
   assert.equal(m.testTamper.evidence.length, 2);
+});
+
+// --- helperReuse (#16) -----------------------------------------------------------------
+
+test("helperReuse: an extracted helper called from N sites scores N; the declaration itself is not a call", () => {
+  const diff = `diff --git a/src/id.ts b/src/id.ts
+--- a/src/id.ts
++++ b/src/id.ts
+@@ -1,1 +1,6 @@
++function generateId(prefix) {
++  return prefix + Date.now();
++}
++const a = generateId("u");
++const b = generateId("o");
++const c = generateId("p");
+`;
+  // 3 call-sites; the function generateId( declaration line is not counted.
+  assert.equal(computeSlopMetrics({ diff }).helperReuse, 3);
+});
+
+test("helperReuse: arrow helpers count their reuses, and only diff-declared names count", () => {
+  const diff = `diff --git a/src/u.ts b/src/u.ts
+--- a/src/u.ts
++++ b/src/u.ts
+@@ -1,1 +1,4 @@
++const slug = (s) => s.toLowerCase();
++const x = slug(name);
++const y = slug(title);
++const z = external(value);
+`;
+  // slug: declared as arrow (self-declaration is "slug =", not a call) → 2 reuses.
+  // external() is not declared in the diff → never counted.
+  assert.equal(computeSlopMetrics({ diff }).helperReuse, 2);
+});
+
+test("helperReuse: inlined duplication with no shared helper scores 0 (the generateId drift)", () => {
+  const diff = `diff --git a/src/inline.ts b/src/inline.ts
+--- a/src/inline.ts
++++ b/src/inline.ts
+@@ -1,1 +1,3 @@
++const a = "user_" + Date.now() + Math.random();
++const b = "order_" + Date.now() + Math.random();
++const c = "post_" + Date.now() + Math.random();
+`;
+  assert.equal(computeSlopMetrics({ diff }).helperReuse, 0);
+});
+
+// --- literalDensity (#16) --------------------------------------------------------------
+
+test("literalDensity: counts inlined magic numbers and strings, skips single-digit ints and 1-char strings", () => {
+  const diff = `diff --git a/src/cfg.ts b/src/cfg.ts
+--- a/src/cfg.ts
++++ b/src/cfg.ts
+@@ -1,1 +1,3 @@
++if (retries > 3) throw new Error("too many retries");
++const delay = elapsed * 1000 + 250;
++setTimeout(fn, i);
+`;
+  // "too many retries" (string) + 1000 + 250 = 3 magic literals; 3 and i are skipped.
+  assert.equal(computeSlopMetrics({ diff }).literalDensity, 3);
+});
+
+test("literalDensity: a named-constant declaration is the healthy pattern — its RHS literals do NOT count", () => {
+  const diff = `diff --git a/src/cfg.ts b/src/cfg.ts
+--- a/src/cfg.ts
++++ b/src/cfg.ts
+@@ -1,1 +1,2 @@
++const MAX_RETRIES = 3600;
++const LABEL = "checkout-service";
+`;
+  assert.equal(computeSlopMetrics({ diff }).literalDensity, 0);
+});
+
+test("literalDensity: comment and import lines never count as inlined literals", () => {
+  const diff = `diff --git a/src/cfg.ts b/src/cfg.ts
+--- a/src/cfg.ts
++++ b/src/cfg.ts
+@@ -1,1 +1,3 @@
++import { thing } from "some-long-module-path";
++// magic 4096 in a comment "quoted" stays out
++thing(4096);
+`;
+  // Only the inlined 4096 in real code counts; the import specifier and comment do not.
+  assert.equal(computeSlopMetrics({ diff }).literalDensity, 1);
 });

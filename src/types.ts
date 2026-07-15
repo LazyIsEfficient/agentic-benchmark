@@ -625,6 +625,28 @@ export interface SlopMetrics {
    * assertions). Evidence entries cite the offending hunks.
    */
   testTamper: { hits: number; evidence: string[] };
+  /**
+   * Helper-extraction signal: call-sites in the ADDED lines that REUSE a helper
+   * the SAME diff DECLARES (a `function`, arrow, or `function`-expression
+   * binding), counted beyond the declaration itself. A run that extracts one
+   * helper and calls it from N sites scores N; a run that inlines the same logic
+   * N times declares no shared helper and scores 0 — the direct read on the
+   * `generateId()`-style drift. Conservative by construction: only identifiers
+   * the diff itself defines are ever counted, so ordinary library/framework
+   * calls can never inflate it. Optional for backward-compat — legacy slop
+   * objects (old report.json) lack it; computeSlopMetrics always sets it.
+   */
+  helperReuse?: number;
+  /**
+   * Literal-density signal: count of MAGIC literals inlined in added CODE lines
+   * — multi-digit / fractional numbers and non-trivial (≥2-char, non-template)
+   * string literals that are NOT the right-hand side of a named-constant
+   * declaration (extracting a `const NAME = …` is the healthy pattern and is
+   * deliberately excluded, as are comment and import lines). Single-digit
+   * integers (0–9) and empty/1-char strings are floored out so ordinary code
+   * does not score. Optional for backward-compat (see {@link helperReuse}).
+   */
+  literalDensity?: number;
 }
 
 /**

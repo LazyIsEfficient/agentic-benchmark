@@ -380,6 +380,10 @@ export interface SlopAggregate {
   residue: { todos: number; debugLogging: number; commentedOutCode: number };
   /** Summed test-tamper hits. */
   testTamperHits: number;
+  /** Summed helper-reuse call-sites (legacy cells lacking the field contribute 0). */
+  helperReuse: number;
+  /** Summed inlined magic-literal count (legacy cells lacking the field contribute 0). */
+  literalDensity: number;
 }
 
 /**
@@ -412,6 +416,8 @@ export function aggregateSlop(results: VariantTaskResult[]): SlopAggregate[] {
         commentedOutCode: slops.reduce((a, s) => a + s.residue.commentedOutCode, 0),
       },
       testTamperHits: slops.reduce((a, s) => a + s.testTamper.hits, 0),
+      helperReuse: slops.reduce((a, s) => a + (s.helperReuse ?? 0), 0),
+      literalDensity: slops.reduce((a, s) => a + (s.literalDensity ?? 0), 0),
     };
   });
 }
@@ -426,18 +432,18 @@ export function renderSlop(
     return "_No slop metrics recorded (legacy results)._";
   }
   const header =
-    `| Variant | Model | Duplication Δ (mean) | Churn (mean) | TODOs | Debug logs | Commented-out | Test tamper |\n` +
-    `| --- | --- | --- | --- | --- | --- | --- | --- |`;
+    `| Variant | Model | Duplication Δ (mean) | Churn (mean) | TODOs | Debug logs | Commented-out | Test tamper | Helper reuse | Literal density |\n` +
+    `| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
   const rows = aggs.map((a) => {
     if (a.cellCount === 0) {
-      return `| ${a.variant} | ${a.executorModel} | — | — | — | — | — | — |`;
+      return `| ${a.variant} | ${a.executorModel} | — | — | — | — | — | — | — | — |`;
     }
     const dup = formatScore(a.meanDuplicationDelta!);
     const churn = a.meanChurnRatio === null ? "—" : a.meanChurnRatio.toFixed(2);
-    return `| ${a.variant} | ${a.executorModel} | ${dup} | ${churn} | ${a.residue.todos} | ${a.residue.debugLogging} | ${a.residue.commentedOutCode} | ${a.testTamperHits} |`;
+    return `| ${a.variant} | ${a.executorModel} | ${dup} | ${churn} | ${a.residue.todos} | ${a.residue.debugLogging} | ${a.residue.commentedOutCode} | ${a.testTamperHits} | ${a.helperReuse} | ${a.literalDensity} |`;
   });
   return [
-    "_Mechanical diff signals — re-derivable by hand. Churn applies to campaign links only. Disqualified cells excluded._",
+    "_Mechanical diff signals — re-derivable by hand. Churn applies to campaign links only. Helper reuse (higher = shared helpers reused) and Literal density (higher = magic literals inlined) are summed over cells. Disqualified cells excluded._",
     "",
     [header, ...rows].join("\n"),
   ].join("\n");
@@ -599,12 +605,180 @@ export function renderPairwise(pairwise: PairwiseResult[] | undefined): string {
   ].join("\n");
 }
 
+// --- Composite Craft Score (within-axis ranking summary) ---------------------
+
 /**
- * The Craft axis: deterministic slop, judge-craft medians, and pairwise
- * win-rates — three independent reads on the qualitative residual, never
- * combined into one number. Campaign links fold into the slop and judge-craft
- * tables as pseudo-cells of their (variant × model). Collapses to a one-liner
- * for legacy reports that carry none of the three.
+ * Duplication cap for SlopHealth: a mean duplication Δ of ≥10 windows saturates
+ * the duplication penalty to its full weight. Above this the metric stops
+ * discriminating — a diff that copy-pastes 10 blocks is already maximally
+ * duplicative for scoring purposes.
+ */
+const CRAFT_DUP_CAP = 10;
+/**
+ * Minimum DECISIVE pairwise comparisons (wins+losses, ties excluded) a variant
+ * needs before its win rate is trusted in the composite. Below it the rate is
+ * too noisy — one head-to-head swings it 0↔100% — so the score drops the
+ * winRate term and renders `(slop-only)` rather than IMPUTE a rate. Chosen as
+ * the smallest sample where a majority is not a single comparison.
+ */
+const MIN_DECISIVE_COMPARISONS = 3;
+
+/** Clamp x into [lo, hi]. */
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.min(Math.max(x, lo), hi);
+}
+
+/**
+ * One variant×model's composite Craft Score — a WITHIN-Craft ranking summary,
+ * never a cross-axis total (the lexicographic "axes are never summed" rule holds:
+ * this combines only Craft's own sub-signals). See {@link renderCraftScore}.
+ */
+export interface CraftScoreAggregate {
+  variant: string;
+  executorModel: string;
+  /** SlopHealth ∈ [0,1] from the deterministic slop means; null when no scorable cell. */
+  slopHealth: number | null;
+  /** Pairwise win rate folded into the score, or null when dropped (untrusted/missing). */
+  winRate: number | null;
+  /** Composite 0–100 score; null when no slop cell survives (all disqualified / no data). */
+  score: number | null;
+  /** True when the winRate term was dropped → `score = round(100·slopHealth)`. */
+  slopOnly: boolean;
+  /** True when any member cell was disqualified (adversarial) — the ☠ mark. */
+  disqualified: boolean;
+  /** True when EVERY member cell was disqualified: no inputs survive → ☠/no score. */
+  allDisqualified: boolean;
+}
+
+/**
+ * `SlopHealth = clamp(1 − min(meanDupΔ/10,1) − 0.1·(residueTotal/cells)
+ * − 0.5·(tamperHits/cells), 0, 1)`. testTamper is a SOFT penalty here — it lowers
+ * health but never disqualifies. null when the group carries no scorable slop
+ * cell (all disqualified, or legacy cells without slop).
+ */
+function slopHealthOf(a: SlopAggregate): number | null {
+  if (a.cellCount === 0 || a.meanDuplicationDelta === null) return null;
+  const residueTotal =
+    a.residue.todos + a.residue.debugLogging + a.residue.commentedOutCode;
+  const dupPenalty = Math.min(a.meanDuplicationDelta / CRAFT_DUP_CAP, 1);
+  const residuePenalty = 0.1 * (residueTotal / a.cellCount);
+  const tamperPenalty = 0.5 * (a.testTamperHits / a.cellCount);
+  return clamp(1 - dupPenalty - residuePenalty - tamperPenalty, 0, 1);
+}
+
+/**
+ * Composite Craft Score per (variant × model), ordered as a ranking (highest
+ * first; unscored rows last, otherwise first-seen-stable). Joins the
+ * deterministic {@link aggregateSlop} SlopHealth with the pairwise win rate from
+ * {@link aggregatePairwise} (matched by variant — comparisons never cross
+ * models, so one variant win rate applies to each of its model rows). Missing or
+ * low-sample pairwise drops the winRate term (renormalized to `100·slopHealth`,
+ * flagged slop-only); disqualified cells are already excluded from the slop
+ * inputs but their variant keeps the ☠ mark, and an all-disqualified variant
+ * yields no score. Pure.
+ */
+export function aggregateCraftScore(
+  results: VariantTaskResult[],
+  pairwise?: PairwiseResult[],
+  campaigns?: CampaignResult[],
+): CraftScoreAggregate[] {
+  const cells = withCampaignLinks(results, campaigns);
+  const slopAggs = aggregateSlop(cells);
+  const winRates = new Map<string, { rate: number | null; decisive: number }>();
+  if (pairwise !== undefined && pairwise.length > 0) {
+    for (const v of aggregatePairwise(pairwise).variants) {
+      winRates.set(v.variant, { rate: v.winRate, decisive: v.wins + v.losses });
+    }
+  }
+  const anyDisqByGroup = new Map<string, boolean>();
+  for (const g of groupByVariantModel(cells)) {
+    anyDisqByGroup.set(
+      `${g.variant}${SEP}${g.executorModel}`,
+      g.members.some((m) => m.disqualified === true),
+    );
+  }
+  const rows: CraftScoreAggregate[] = slopAggs.map((a) => {
+    const anyDisq = anyDisqByGroup.get(`${a.variant}${SEP}${a.executorModel}`) ?? false;
+    const slopHealth = slopHealthOf(a);
+    const wr = winRates.get(a.variant);
+    const trusted =
+      wr !== undefined && wr.rate !== null && wr.decisive >= MIN_DECISIVE_COMPARISONS;
+    let score: number | null = null;
+    let winRate: number | null = null;
+    let slopOnly = false;
+    if (slopHealth !== null) {
+      if (trusted) {
+        winRate = wr!.rate;
+        score = Math.round(100 * (0.7 * winRate! + 0.3 * slopHealth));
+      } else {
+        slopOnly = true;
+        score = Math.round(100 * slopHealth);
+      }
+    }
+    return {
+      variant: a.variant,
+      executorModel: a.executorModel,
+      slopHealth,
+      winRate,
+      score,
+      slopOnly,
+      disqualified: anyDisq,
+      allDisqualified: slopHealth === null && anyDisq,
+    };
+  });
+  return rows
+    .map((r, i) => ({ r, i }))
+    .sort((x, y) => {
+      if (x.r.score === null && y.r.score === null) return x.i - y.i;
+      if (x.r.score === null) return 1;
+      if (y.r.score === null) return -1;
+      return y.r.score - x.r.score || x.i - y.i;
+    })
+    .map(({ r }) => r);
+}
+
+/**
+ * The Craft Score sub-table (4th under Craft): a within-axis ranking of the
+ * variants by composite score. One-liner when no scorable slop cell exists.
+ */
+export function renderCraftScore(
+  results: VariantTaskResult[],
+  pairwise?: PairwiseResult[],
+  campaigns?: CampaignResult[],
+): string {
+  const aggs = aggregateCraftScore(results, pairwise, campaigns);
+  if (aggs.every((a) => a.score === null && !a.allDisqualified)) {
+    return "_No craft score — no deterministic slop metrics to score._";
+  }
+  const header =
+    `| Rank | Variant | Model | Craft Score | Win rate | Slop health |\n` +
+    `| --- | --- | --- | --- | --- | --- |`;
+  let rank = 0;
+  const rows = aggs.map((a) => {
+    const label = variantLabelWithDisqualification(a.variant, a.disqualified);
+    if (a.score === null) {
+      return `| — | ${label} | ${a.executorModel} | ${a.allDisqualified ? "☠" : "—"} | — | — |`;
+    }
+    rank++;
+    const health = a.slopHealth === null ? "—" : a.slopHealth.toFixed(2);
+    const wr = a.slopOnly ? "_(slop-only)_" : `${Math.round(a.winRate! * 100)}%`;
+    return `| ${rank} | ${label} | ${a.executorModel} | ${a.score} | ${wr} | ${health} |`;
+  });
+  return [
+    "_Within-Craft ranking summary — NOT a cross-axis total (axes are never summed; this combines only Craft's own sub-signals). `Score = round(100·(0.7·winRate + 0.3·SlopHealth))`, dup capped at " +
+      `${CRAFT_DUP_CAP}; a variant with fewer than ${MIN_DECISIVE_COMPARISONS} decisive pairwise comparisons drops the winRate term and is flagged \`(slop-only)\` (never imputed). testTamper is a soft penalty via SlopHealth. Disqualified cells are excluded from the inputs but keep their ☠ mark._`,
+    "",
+    [header, ...rows].join("\n"),
+  ].join("\n");
+}
+
+/**
+ * The Craft axis: deterministic slop, judge-craft medians, pairwise win-rates,
+ * and a composite Craft Score ranking — the qualitative residual read four ways.
+ * The first three are independent reads never combined; the fourth is a
+ * within-Craft ranking SUMMARY (still not a cross-axis total). Campaign links
+ * fold into the slop and judge-craft tables as pseudo-cells of their
+ * (variant × model). Collapses to a one-liner for legacy reports that carry none.
  */
 export function renderCraft(
   results: VariantTaskResult[],
@@ -630,6 +804,10 @@ export function renderCraft(
     "### Pairwise (cross-bundle)",
     "",
     renderPairwise(pairwise),
+    "",
+    "### Craft Score (ranking summary)",
+    "",
+    renderCraftScore(results, pairwise, campaigns),
   ].join("\n");
 }
 
