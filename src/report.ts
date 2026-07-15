@@ -606,7 +606,13 @@ export interface PairwiseAggregate {
   comparisons: number;
   pairs: PairwisePairAggregate[];
   variants: PairwiseVariantAggregate[];
-  /** How often the "A" presentation slot won — should hover near 50%. */
+  /**
+   * A-slot position-bias audit, computed over SINGLE-ORDER comparisons ONLY.
+   * Both-order comparisons are canonical (A = first-listed variant, not
+   * randomized), so their A slot is not a fair coin and would skew the audit
+   * toward the first-listed variant — they are excluded from `aSlotWins` and
+   * `decisive` and counted separately in `bothOrderComparisons` (issue #36).
+   */
   positionBias: { aSlotWins: number; decisive: number };
   /**
    * True when EVERY usable comparison was judged in both seatings (issue #36).
@@ -615,6 +621,13 @@ export interface PairwiseAggregate {
    * the audit line renders that instead of a misleading percentage.
    */
   bothOrders: boolean;
+  /**
+   * Count of usable comparisons judged in both seatings (position-cancelled by
+   * construction). Excluded from the `positionBias` audit; surfaced so a MIXED
+   * single+both-order run (e.g. a `--report` regeneration pooling both) reports
+   * the single-order audit AND how many pairs were cancelled.
+   */
+  bothOrderComparisons: number;
 }
 
 /**
@@ -707,8 +720,15 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
       b.ties++;
       continue;
     }
-    decisive++;
-    if (p.overall.winner === "A") aSlotWins++;
+    // AUDIT counters are SINGLE-ORDER ONLY: a both-order comparison is canonical
+    // (A = first, non-randomized), so counting its A-slot wins would skew the
+    // bias reading toward the first-listed variant. The win/loss TALLIES below
+    // still count ALL pairs (the win rates + confidence gating see every
+    // comparison); only this audit slice is single-order.
+    if (p.bothOrders !== true) {
+      decisive++;
+      if (p.overall.winner === "A") aSlotWins++;
+    }
     const winner = p.overall.winner === "A" ? p.variantA : p.variantB;
     const loser = p.overall.winner === "A" ? p.variantB : p.variantA;
     const weight = severityWeight(p);
@@ -758,6 +778,7 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
     }),
     positionBias: { aSlotWins, decisive },
     bothOrders: usable.length > 0 && usable.every((p) => p.bothOrders === true),
+    bothOrderComparisons: usable.filter((p) => p.bothOrders === true).length,
   };
 }
 
@@ -786,13 +807,21 @@ export function renderPairwise(pairwise: PairwiseResult[] | undefined): string {
       v.headToHeadWinRate === null ? "—" : `${Math.round(v.headToHeadWinRate * 100)}%`;
     return `| ${v.variant} | ${global} | ${h2h} | ${v.wins + v.losses} | ${v.wins}–${v.losses}–${v.ties} |`;
   });
-  // In both-order mode each pair is judged in BOTH seatings and combined, so the
-  // A slot is canonical (A = first-listed variant) and position bias is
-  // cancelled per comparison — the old "A-slot won X of N" line would misread as
-  // a bias signal, so render the construction instead (issue #36).
-  const bias = agg.bothOrders
-    ? `_Position-bias audit: both-order mode — every pair judged in both seatings and combined, so position bias is cancelled by construction (order-dependent verdicts resolve to tie). ${agg.positionBias.decisive} decisive comparison(s)._`
-    : `_Position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} decisive comparisons (expected ≈50%)._`;
+  // The A-slot audit is only meaningful for SINGLE-ORDER comparisons: a
+  // both-order comparison is canonical (A = first, non-randomized), so its slot
+  // is cancelled by construction, not a fair coin (issue #36). Three cases:
+  //   • all both-order  → the construction, no percentage;
+  //   • all single      → the classic A-slot audit;
+  //   • mixed           → audit the single-order subset AND note the cancelled ones.
+  const { aSlotWins, decisive } = agg.positionBias;
+  const bothN = agg.bothOrderComparisons;
+  const singleN = agg.comparisons - bothN;
+  const bias =
+    singleN === 0
+      ? `_Position-bias audit: both-order mode — every pair judged in both seatings and combined, so position bias is cancelled by construction (order-dependent verdicts resolve to tie). ${bothN} comparison(s)._`
+      : bothN === 0
+        ? `_Position-bias audit: A-slot won ${aSlotWins} of ${decisive} decisive comparisons (expected ≈50%)._`
+        : `_Position-bias audit: A-slot won ${aSlotWins} of ${decisive} single-order decisive comparisons (expected ≈50%); ${bothN} both-order pair(s) position-cancelled by construction._`;
   return [
     `_Same-cell A/B craft comparisons (overall winner per comparison). Win rates are SEVERITY-WEIGHTED: a soundness-implicating win (correctness/security/robustness) counts as ${SOUNDNESS_WEIGHT} stylistic wins, so a caught defect is not outweighed by a naming/import nit (fail-closed: a missing/invalid severity is ordinary weight). Global win rate = weighted wins/(weighted wins+losses) pooled across all opponents; H2H win rate = macro-average of per-opponent weighted head-to-head rates (each opponent weighted once — the rate the Craft Score consumes). Decisive = raw wins+losses; ties excluded from both rates._`,
     "",

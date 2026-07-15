@@ -1336,10 +1336,14 @@ async function main(): Promise<void> {
       });
       report.pairwise = pairwise;
       const agg = aggregatePairwise(pairwise);
+      const bothN = agg.bothOrderComparisons;
+      const singleN = agg.comparisons - bothN;
       console.error(
-        agg.bothOrders
-          ? `Pairwise position-bias audit: both-order mode — position cancelled by construction over ${agg.positionBias.decisive} decisive comparison(s).`
-          : `Pairwise position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} decisive comparisons.`,
+        singleN === 0
+          ? `Pairwise position-bias audit: both-order mode — position cancelled by construction over ${bothN} comparison(s).`
+          : bothN === 0
+            ? `Pairwise position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} decisive comparisons.`
+            : `Pairwise position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} single-order decisive comparisons; ${bothN} both-order pair(s) position-cancelled.`,
       );
     }
   }

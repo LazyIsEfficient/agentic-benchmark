@@ -1188,25 +1188,38 @@ test("aggregatePairwise/renderPairwise: both-order mode renders position-cancell
   ];
   const agg = aggregatePairwise(comparisons);
   assert.equal(agg.bothOrders, true);
+  assert.equal(agg.bothOrderComparisons, 2);
+  // The both-order pairs are excluded from the A-slot audit entirely.
+  assert.deepEqual(agg.positionBias, { aSlotWins: 0, decisive: 0 });
   const md = renderPairwise(comparisons);
   // The misleading "A-slot won X of N (expected ≈50%)" line is gone; the audit
-  // states the construction instead.
+  // states the construction instead, over all both-order comparisons.
   assert.doesNotMatch(md, /expected ≈50%/);
   assert.match(md, /both-order mode/);
   assert.match(md, /cancelled by construction/);
-  assert.match(md, /1 decisive comparison/);
+  assert.match(md, /2 comparison\(s\)/);
 });
 
-test("aggregatePairwise: mixed both-order and single-order comparisons ⇒ not both-order mode", () => {
-  const agg = aggregatePairwise([
-    pairwiseResult("alpha", "bravo", "A", { bothOrders: true }),
-    pairwiseResult("alpha", "bravo", "A"), // single-order
-  ]);
-  assert.equal(agg.bothOrders, false);
-  assert.match(renderPairwise([
-    pairwiseResult("alpha", "bravo", "A", { bothOrders: true }),
-    pairwiseResult("alpha", "bravo", "A"),
-  ]), /expected ≈50%/);
+test("aggregatePairwise: MIXED set audits the single-order subset ONLY; both-order pairs excluded", () => {
+  // Two comparisons, both won by the A slot (alpha). If the audit naively
+  // counted both, aSlotWins/decisive would be 2/2 — but the both-order pair is
+  // canonical (A=first, non-randomized) and must NOT skew the coin, so only the
+  // single-order pair is audited: 1/1. The both-order pair is counted separately.
+  const comparisons = [
+    pairwiseResult("alpha", "bravo", "A", { bothOrders: true }), // excluded from audit
+    pairwiseResult("alpha", "bravo", "A"), // single-order → audited
+  ];
+  const agg = aggregatePairwise(comparisons);
+  assert.equal(agg.bothOrders, false); // mixed ⇒ not all-both-order
+  assert.equal(agg.bothOrderComparisons, 1);
+  assert.deepEqual(agg.positionBias, { aSlotWins: 1, decisive: 1 });
+  // The win TALLIES still count BOTH pairs (win rate / confidence see everything).
+  const alpha = agg.variants.find((v) => v.variant === "alpha")!;
+  assert.equal(alpha.wins, 2);
+
+  const md = renderPairwise(comparisons);
+  assert.match(md, /A-slot won 1 of 1 single-order decisive comparisons \(expected ≈50%\)/);
+  assert.match(md, /1 both-order pair\(s\) position-cancelled by construction/);
 });
 
 test("renderPairwise: ties-only variant renders — win rate; absent pairwise is a one-liner", () => {
