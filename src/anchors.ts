@@ -420,12 +420,59 @@ function isValidRegExpSource(src: string): boolean {
 /** Candidate identifiers for linkage evidence: 3+ chars, JS-identifier shaped. */
 const LINKAGE_IDENTIFIER_RE = /[A-Za-z_$][\w$]{2,}/g;
 
+/**
+ * Half-height (in added CODE lines) of the linkage-harvest window around a
+ * required-matching line. The window's ONLY job is to reach the enclosing
+ * helper's DECLARATION line (`function mintId()` / `const mintId =`) from the
+ * convention literal (`ulid_`), which sits further down in the helper BODY.
+ * Because harvesting is now restricted to DECLARATION NAMES (see
+ * {@link declaredNames}) and rule vocabulary is excluded, the window no longer
+ * governs false positives — a domain noun or a `Math`/`slice` call on the
+ * literal's own line is never a candidate regardless of span. So ±8 is chosen
+ * purely to span a realistic id-minting helper (signature → body → `return
+ * 'ulid_' + …`) without a genuine, slightly-longer helper silently degrading
+ * ✓A → drift; it is tight enough not to routinely reach a sibling helper's
+ * declaration.
+ */
+const LINKAGE_WINDOW = 8;
+
 /** JS keywords / common tokens that can never serve as linkage evidence. */
 const LINKAGE_STOPLIST: ReadonlySet<string> = new Set([
   "const", "let", "var", "function", "return", "export", "import", "new",
   "class", "type", "interface", "string", "number", "boolean", "true", "false",
   "null", "undefined", "async", "await", "this",
 ]);
+
+/**
+ * Declaration NAMES bound on a code line — the identifier introduced by a
+ * `function` / `const` / `let` / `var` / `class` declaration. Only a name the
+ * bundle INTRODUCED can be a carried abstraction, so linkage is harvested from
+ * these alone. This deliberately EXCLUDES call targets (`Math`, `slice`,
+ * `toString`), assignment targets (`row.createdAt`), destructured fields, and
+ * bare reads — those are shared vocabulary or globals that every link may touch,
+ * so treating their reuse as linkage manufactured false ✓A (a drift link that
+ * copied the `createdAt` field or re-called `Math.random` graded held-by-
+ * abstraction). Not a parser — covers the declaration shapes real diffs produce.
+ */
+const DECLARATION_RES: readonly RegExp[] = [
+  /\bfunction\s*\*?\s+([A-Za-z_$][\w$]*)/g,
+  /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g,
+  /\bclass\s+([A-Za-z_$][\w$]*)/g,
+];
+
+/** The declaration names introduced on a single code line, in first-seen order. */
+function declaredNames(line: string): string[] {
+  const out: string[] = [];
+  for (const re of DECLARATION_RES) {
+    for (const m of line.matchAll(re)) out.push(m[1]!);
+  }
+  return out;
+}
+
+/** Identifier tokens (3+ chars) present on a code line — for TOKEN-boundary link matching. */
+function lineIdentifiers(line: string): string[] {
+  return [...line.matchAll(LINKAGE_IDENTIFIER_RE)].map((m) => m[0]!);
+}
 
 /**
  * Added lines of a unified diff grouped by post-image file — same extraction as
@@ -456,24 +503,47 @@ function extractAddedLineGroups(diff: string): string[][] {
 
 /**
  * Harvest candidate linkage identifiers from a cumulative diff: for every added
- * line matching ANY `required` marker, collect the identifiers appearing within
- * ±3 added lines of it (same-file window, stoplist excluded), deduplicated in
- * first-seen order. These are the names an abstraction built next to the marker
- * plausibly travels under (e.g. the helper's own name); a later link consuming
- * that abstraction re-emits one of them.
+ * line matching ANY `markerRequired` pattern, collect the DECLARATION NAMES (see
+ * {@link declaredNames}) introduced within ±{@link LINKAGE_WINDOW} added lines of
+ * it (same-file window), deduplicated in first-seen order, MINUS two classes of
+ * non-abstraction:
+ *
+ *  - the stoplist (JS keywords / primitive type names), and
+ *  - `ruleVocabulary` — any name matching a `required` OR `appliesIf` pattern of
+ *    the anchor itself. Those are the rule's OWN field/domain terms (`createdAt`,
+ *    `updatedAt`, `timestamp`, an `…Id` field, `ulid_`) shared by every link, so
+ *    a later link re-emitting one is applying the rule's surface, NOT reusing a
+ *    carried helper — crediting it as linkage produced false ✓A.
+ *
+ * `markerRequired` is the required patterns ABSENT from the current link (the
+ * conventions being credited to the CHAIN), NOT every required pattern. Scoping
+ * to the missing markers is what proves the ABSTRACTION: linkage must sit beside
+ * the literal the link no longer emits (`ulid_` held via a helper), never beside
+ * a marker the link DID emit — otherwise a link self-links via its own function
+ * name declared next to a literal it wrote itself.
+ *
+ * What survives is the helper's own name (`mintId`) and the locals it declared —
+ * identifiers this bundle genuinely INTRODUCED beside the convention literal. A
+ * later link consuming that abstraction re-emits one of them.
  */
-function harvestLinkageIdentifiers(groups: string[][], required: RegExp[]): string[] {
+function harvestLinkageIdentifiers(
+  groups: string[][],
+  markerRequired: RegExp[],
+  ruleVocabulary: RegExp[],
+): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
+  const isRuleVocabulary = (ident: string): boolean =>
+    ruleVocabulary.some((re) => re.test(ident));
   for (const group of groups) {
     for (let i = 0; i < group.length; i++) {
-      if (!required.some((re) => re.test(group[i]!))) continue;
-      const lo = Math.max(0, i - 3);
-      const hi = Math.min(group.length - 1, i + 3);
+      if (!markerRequired.some((re) => re.test(group[i]!))) continue;
+      const lo = Math.max(0, i - LINKAGE_WINDOW);
+      const hi = Math.min(group.length - 1, i + LINKAGE_WINDOW);
       for (let j = lo; j <= hi; j++) {
-        for (const m of group[j]!.matchAll(LINKAGE_IDENTIFIER_RE)) {
-          const ident = m[0]!;
-          if (LINKAGE_STOPLIST.has(ident) || seen.has(ident)) continue;
+        for (const ident of declaredNames(group[j]!)) {
+          if (ident.length < 3 || LINKAGE_STOPLIST.has(ident) || seen.has(ident)) continue;
+          if (isRuleVocabulary(ident)) continue;
           seen.add(ident);
           out.push(ident);
         }
@@ -526,11 +596,14 @@ function gradeFromLegacy(
  *  4. link diff has NO added lines                 → `unknown` (fail closed)
  *  5. all `required` match the CUMULATIVE diff (when provided) — a cumulative
  *     hold, adjudicated by LINK-LEVEL LINKAGE EVIDENCE. Candidate identifiers
- *     are harvested from the cumulative diff's added lines within ±3 lines of
- *     each required-matching line (same-file window, 3+ chars, JS keywords /
- *     common tokens stoplisted); evidence = at least one harvested identifier
- *     appears in the link diff's added lines (e.g. a `generateId` helper built
- *     beside the `ulid_` marker earlier, and `generateId(` called here):
+ *     are harvested from the cumulative diff as DECLARATION NAMES the bundle
+ *     introduced within ±LINKAGE_WINDOW lines of each required-matching line
+ *     (same-file window, wide enough to reach a helper's declaration line from
+ *     its body), MINUS the stoplist and the anchor's own rule vocabulary
+ *     (`required` ∪ `appliesIf` — field/domain names shared by every link).
+ *     Evidence = at least one surviving identifier appears as a whole TOKEN in
+ *     the link diff's added lines (e.g. a `generateId` helper declared beside the
+ *     `ulid_` marker earlier, and `generateId()` called here):
  *      a. linkage evidence found                   → `held-by-abstraction`
  *      b. no linkage, `appliesIf` defined          → `drift` (past rule 3, so
  *         the link EXERCISED the rule surface and did wrong-way work)
@@ -634,8 +707,17 @@ function detectRuleGraded(config: RuleAnchor, step: FinalStep, diffs: GradedDiff
     const cumulativeAdded = cumulativeGroups.flat();
     const matchesCumulative = (re: RegExp): boolean => cumulativeAdded.some((line) => re.test(line));
     if (required.every(matchesCumulative)) {
-      const candidates = harvestLinkageIdentifiers(cumulativeGroups, required);
-      const linkage = candidates.find((ident) => linkAdded.some((line) => line.includes(ident)));
+      // Linkage is credited only for the required markers ABSENT from this link
+      // (the conventions held via the chain), so a link can never self-link via a
+      // marker it emitted itself. Exclusion still spans the FULL rule vocabulary.
+      const missingRequired = required.filter((re) => !matchesLink(re));
+      const ruleVocabulary = [...required, ...(appliesIf ?? [])];
+      const candidates = harvestLinkageIdentifiers(cumulativeGroups, missingRequired, ruleVocabulary);
+      // TOKEN-boundary match (not substring): the identifier must appear as a
+      // whole token in the link's added lines, so `id` never matches inside
+      // `mintId` and a domain field never spoofs a helper call.
+      const linkTokens = new Set(linkAdded.flatMap(lineIdentifiers));
+      const linkage = candidates.find((ident) => linkTokens.has(ident));
       if (linkage !== undefined) {
         return held(
           "held-by-abstraction",

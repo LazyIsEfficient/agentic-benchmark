@@ -620,6 +620,81 @@ test("graded rule: abstraction hold — required in the cumulative diff WITH lin
   assert.match(r.evidence, /linkage via identifier "generateId"/, "evidence names the linking identifier");
 });
 
+test("graded rule: abstraction hold survives a helper whose NAME is far from the ulid_ literal (widened window)", () => {
+  // The helper's NAME sits on its declaration line; the ulid_ literal lives 6
+  // comment-stripped lines down in the body. The old ±3 window dropped `mintId`
+  // and degraded this genuine ✓A to ✗ drift. The widened window keeps the name.
+  const farHelperCumulative = `diff --git a/src/ids.ts b/src/ids.ts
+--- a/src/ids.ts
++++ b/src/ids.ts
+@@ -1,1 +1,8 @@
++export function mintId(): string {
++  const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz";
++  let suffix = "";
++  for (let n = 0; n < 8; n++) {
++    suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
++  }
++  return "ulid_" + suffix;
++}
+`;
+  const linkDiff = `diff --git a/src/revision.ts b/src/revision.ts
+--- a/src/revision.ts
++++ b/src/revision.ts
+@@ -1,1 +1,2 @@
++const id = mintId();
+`;
+  const r = detectAnchorGraded(ULID_RULE, step(linkDiff), {
+    linkDiff,
+    cumulativeDiff: farHelperCumulative,
+  });
+  assert.equal(r.grade, "held-by-abstraction");
+  assert.equal(r.conventionHeld, true);
+  assert.match(r.evidence, /linkage via identifier "mintId"/, "the far-off helper name is still harvested");
+});
+
+test("graded rule: a DRIFT link that reuses a shared domain noun (createdAt) is NOT false-credited ✓A", () => {
+  // Regression for the reviewer's counterexample. `createdAt` is harvested near
+  // the Date.now()/1000 marker AND is one of the anchor's own appliesIf terms —
+  // shared vocabulary, not a carried helper. A drift link that copies the
+  // createdAt FIELD and mints an id the wrong way (Math.random) must grade drift,
+  // not held-by-abstraction. Fixed two ways: linkage harvests only DECLARATION
+  // names (createdAt is an assignment target, never harvested) and rule
+  // vocabulary is excluded; the link match is token-boundary, not substring.
+  const r1r2: AnchorConfig = {
+    kind: "rule",
+    label: "R1+R2",
+    required: ["ulid_", "Date\\.now\\(\\)\\s*/\\s*1000"],
+    forbidden: ["\\brandomUUID\\b", "toISOString", "new Date\\(", "date-fns|dayjs|moment"],
+    appliesIf: ["\\bid\\b", "\\buuid|\\bUUID", "createdAt|updatedAt|timestamp", "\\bDate\\b", "\\bat\\s*[:=]"],
+  };
+  const cumulative = `diff --git a/src/time.ts b/src/time.ts
+--- a/src/time.ts
++++ b/src/time.ts
+@@ -1,1 +1,3 @@
++export function stampCreatedAt(row) {
++  row.createdAt = Math.floor(Date.now() / 1000);
++}
+diff --git a/src/ids.ts b/src/ids.ts
+--- a/src/ids.ts
++++ b/src/ids.ts
+@@ -1,1 +1,3 @@
++export function mintId() {
++  return "ulid_" + something();
++}
+`;
+  const linkDrift = `diff --git a/src/revision.ts b/src/revision.ts
+--- a/src/revision.ts
++++ b/src/revision.ts
+@@ -1,1 +1,3 @@
++  revision.createdAt = source.createdAt;
++  revision.revId = "rev-" + Math.random().toString(36).slice(2);
+`;
+  const r = detectAnchorGraded(r1r2, step(linkDrift), { linkDiff: linkDrift, cumulativeDiff: cumulative });
+  assert.equal(r.grade, "drift", "shared field-name reuse must not manufacture ✓A");
+  assert.equal(r.conventionHeld, false);
+  assert.doesNotMatch(r.evidence, /held-by-abstraction/);
+});
+
 test("graded rule: cumulative hold WITHOUT linkage grades drift when the link exercised the surface", () => {
   // The rev_/Math.random repro: the link mints an id (appliesIf matches) using a
   // wrong-way scheme; the ulid_ marker exists only in an earlier link's diff and
