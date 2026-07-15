@@ -11,6 +11,7 @@ import {
   formatVariantListLine,
   loadTasks,
   loadVariants,
+  parseArgs,
   parseConcurrency,
   parseDelayMs,
   parseFocus,
@@ -124,6 +125,15 @@ test("parseRepeats: zero, negative, and non-numeric throw", () => {
   assert.throws(() => parseRepeats("-2"), /positive integer|>= 1/);
   assert.throws(() => parseRepeats("abc"), /positive integer/);
   assert.throws(() => parseRepeats("2.5"), /positive integer/);
+});
+
+test("parseArgs: --pairwise-both-orders sets the opt-in flag; absent ⇒ false", () => {
+  assert.equal(parseArgs(["--all"]).pairwiseBothOrders, false);
+  assert.equal(parseArgs(["--all", "--pairwise-both-orders"]).pairwiseBothOrders, true);
+  // It is independent of --no-pairwise (both parse without interfering).
+  const both = parseArgs(["--pairwise-both-orders", "--no-pairwise"]);
+  assert.equal(both.pairwiseBothOrders, true);
+  assert.equal(both.noPairwise, true);
 });
 
 test("parseFocus: missing → undefined (full report)", () => {

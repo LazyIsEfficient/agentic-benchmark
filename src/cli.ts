@@ -257,6 +257,12 @@ interface Args {
   repeats?: string;
   /** --no-pairwise: skip the pairwise A/B craft lane for this run. */
   noPairwise: boolean;
+  /**
+   * --pairwise-both-orders: judge each pair in BOTH seatings and combine, so
+   * position bias cancels deterministically per comparison (issue #36). Opt-in
+   * — it doubles the pairwise judge cost.
+   */
+  pairwiseBothOrders: boolean;
   /** --report <path>: regenerate a report from a finished run (offline). */
   reportPath?: string;
   /** --focus <axis>: render only the named axis's section(s) + run header. */
@@ -280,13 +286,14 @@ export function parseFocus(raw: string | undefined): FocusAxis | undefined {
   );
 }
 
-function parseArgs(argv: string[]): Args {
+export function parseArgs(argv: string[]): Args {
   const args: Args = {
     list: false,
     all: false,
     variants: [],
     modelTokens: [],
     noPairwise: false,
+    pairwiseBothOrders: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -323,6 +330,9 @@ function parseArgs(argv: string[]): Args {
         break;
       case "--no-pairwise":
         args.noPairwise = true;
+        break;
+      case "--pairwise-both-orders":
+        args.pairwiseBothOrders = true;
         break;
       case "--report":
         args.reportPath = argv[++i];
@@ -434,6 +444,10 @@ Usage:
                                           repeated cells get distinct __rN cell ids
   npm run bench -- --no-pairwise          Skip the pairwise A/B craft lane
                                           (also BENCH_PAIRWISE=0)
+  npm run bench -- --pairwise-both-orders  Judge each pair in BOTH A/B seatings and
+                                          combine, so position bias cancels per
+                                          comparison (order-dependent verdicts →
+                                          tie). Opt-in: 2× pairwise judge cost.
   npm run bench -- --report <path>        Regenerate report.md/json from a finished
                                           run (folder or report.json) — offline
   npm run bench -- --focus <axis>         Render only one concern's section(s) + the
@@ -1301,22 +1315,35 @@ async function main(): Promise<void> {
     if (pairJobs.length === 0) {
       console.error("Pairwise: skipped (no eligible pairs).");
     } else {
-      console.error(`\nPairwise: judging ${pairJobs.length} comparison(s) …`);
+      const bothOrders = args.pairwiseBothOrders;
+      console.error(
+        `\nPairwise: judging ${pairJobs.length} comparison(s)${bothOrders ? " in BOTH orders (2× judge calls; position-cancelled)" : ""} …`,
+      );
       // Same pool settings as the cell lane. judgePair fail-closes internally
       // and never throws, but a rejected job must still not kill the run this
-      // close to writeReport — hence the outcome guard.
-      const outcomes = await runPool(pairJobs, concurrency, (job) => judgePair(job), {
-        delayMs,
-      });
+      // close to writeReport — hence the outcome guard. `--pairwise-both-orders`
+      // judges each pair in both seatings and combines (issue #36).
+      const outcomes = await runPool(
+        pairJobs,
+        concurrency,
+        (job) => judgePair(job, { bothOrders }),
+        { delayMs },
+      );
       const pairwise: PairwiseResult[] = [];
       outcomes.forEach((o, i) => {
         if (o.value) pairwise.push(o.value);
         else console.error(`Pairwise job ${i} failed unexpectedly: ${o.error?.message}`);
       });
       report.pairwise = pairwise;
-      const { positionBias } = aggregatePairwise(pairwise);
+      const agg = aggregatePairwise(pairwise);
+      const bothN = agg.bothOrderComparisons;
+      const singleN = agg.comparisons - bothN;
       console.error(
-        `Pairwise position-bias audit: A-slot won ${positionBias.aSlotWins} of ${positionBias.decisive} decisive comparisons.`,
+        singleN === 0
+          ? `Pairwise position-bias audit: both-order mode — position cancelled by construction over ${bothN} comparison(s).`
+          : bothN === 0
+            ? `Pairwise position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} decisive comparisons.`
+            : `Pairwise position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} single-order decisive comparisons; ${bothN} both-order pair(s) position-cancelled.`,
       );
     }
   }

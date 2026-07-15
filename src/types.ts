@@ -781,6 +781,13 @@ export interface PairwiseResult {
     rationale: string;
     severity: PairwiseSeverity;
   };
+  /**
+   * Set when this comparison was judged in BOTH seatings and combined (issue
+   * #36): position bias is cancelled per comparison, so the report's A-slot
+   * audit is ~50% by construction rather than a bias signal. Absent ⇒ the
+   * single randomized-order path (the A-slot audit is a real bias check).
+   */
+  bothOrders?: boolean;
   /** Set when the pairwise judge call failed; the comparison is unusable. */
   judgeFailure?: string;
 }

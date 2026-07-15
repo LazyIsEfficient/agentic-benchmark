@@ -253,6 +253,13 @@ export interface JudgePairDeps {
   sleepFn?: (ms: number) => Promise<void>;
   /** Randomness source for the A/B shuffle; tests inject a fixed value. */
   rng?: () => number;
+  /**
+   * Judge each pair in BOTH seatings (first-as-A and first-as-B) and combine, so
+   * position bias cancels DETERMINISTICALLY per comparison instead of only in
+   * expectation across many. Opt-in (issue #36): it doubles the pairwise judge
+   * cost. Off ⇒ today's single randomized-order behavior, byte-identical.
+   */
+  bothOrders?: boolean;
 }
 
 /**
@@ -263,12 +270,35 @@ export interface JudgePairDeps {
  * ask; a parse failure triggers exactly ONE re-ask quoting the unparseable
  * output back with "Output valid JSON only."
  *
- * The A/B assignment is randomized per call (rng() < 0.5 → first shows as A)
- * to cancel position bias; the resolved mapping is recorded in
- * variantA/variantB. Dimensions/overall stay in A/B terms — the harness
- * resolves winners to variant names downstream, never here.
+ * Dispatch: `deps.bothOrders` runs the pair in BOTH seatings and combines
+ * ({@link combineBothOrderVerdicts}); off ⇒ ONE randomized-order call
+ * ({@link judgePairSingleOrder}), today's behavior byte-identical.
  */
 export async function judgePair(
+  inputs: JudgePairInputs,
+  deps: JudgePairDeps = {},
+): Promise<PairwiseResult> {
+  if (!deps.bothOrders) return judgePairSingleOrder(inputs, deps);
+
+  // Force the two deterministic seatings by pinning rng: rng() < 0.5 ⇒ first
+  // shows as A. So 0 → first-as-A, 0.999 → first-as-B. Everything else
+  // (transport, backoff) is inherited from deps. Sequential, not parallel: the
+  // pairwise lane already pools across pairs, so firing both orders concurrently
+  // here would double the peak container fan-out the operator picked.
+  const firstAsA = await judgePairSingleOrder(inputs, { ...deps, rng: () => 0 });
+  const firstAsB = await judgePairSingleOrder(inputs, { ...deps, rng: () => 0.999 });
+  return combineBothOrderVerdicts(inputs, firstAsA, firstAsB);
+}
+
+/**
+ * Run ONE randomized-order pairwise comparison. The A/B assignment is randomized
+ * per call (rng() < 0.5 → first shows as A) to cancel position bias IN
+ * EXPECTATION; the resolved mapping is recorded in variantA/variantB.
+ * Dimensions/overall stay in A/B terms — the harness resolves winners to variant
+ * names downstream, never here. {@link judgePair} calls this once (single-order)
+ * or twice with pinned seatings (both-order).
+ */
+async function judgePairSingleOrder(
   inputs: JudgePairInputs,
   deps: JudgePairDeps = {},
 ): Promise<PairwiseResult> {
@@ -398,4 +428,158 @@ export async function judgePair(
   }
 
   return { ...base, dimensions: parsed.dimensions, overall: parsed.overall };
+}
+
+// --- Both-order combine (deterministic position-bias cancellation) ------------
+//
+// A single randomized order only cancels judge position bias IN EXPECTATION; at
+// the ~4–8 decisive comparisons a real run produces it does not cancel WITHIN a
+// run (issue #36). Judging each pair in BOTH seatings and combining cancels it
+// per comparison: a verdict that only holds in one seating was position-driven,
+// not craft-driven, so it must not move a ranking.
+
+/** The six craft dimensions, as a list, for the combine loop. */
+const COMBINE_DIMENSIONS = PAIRWISE_CRAFT_DIMENSIONS;
+
+/**
+ * Combine two preferences over {@link a}, {@link b}, or `"tie"` (the neutral).
+ * A side wins ONLY if it wins in both readings, OR wins one and ties the other;
+ * two DIFFERENT decisive readings (a flip) collapse to `"tie"` — the verdict was
+ * order-dependent, not craft-driven. Used for the overall winner AND each
+ * dimension. Inputs/output are in variant-name (or `"tie"`) terms.
+ */
+function combinePreference(w1: string, w2: string): string {
+  if (w1 === w2) return w1; // agree (both a, both b, or both tie)
+  if (w1 === "tie") return w2; // one neutral ⇒ the decisive reading stands
+  if (w2 === "tie") return w1;
+  return "tie"; // decisive disagreement (flip) ⇒ neutral
+}
+
+/**
+ * The variant a single-order verdict's letter-winner names, or `"tie"`. Reads
+ * through the order's OWN variantA/variantB mapping so it is correct regardless
+ * of which seating that order used.
+ */
+function letterToVariant(order: PairwiseResult, winner: PairwiseWinner): string {
+  if (winner === "tie") return "tie";
+  return winner === "A" ? order.variantA : order.variantB;
+}
+
+/**
+ * Combine two single-order pairwise verdicts (the SAME pair judged in opposite
+ * seatings) into one, canonicalized to A = `inputs.first`, B = `inputs.second`.
+ *
+ * - Overall winner + every dimension: {@link combinePreference} — a side wins
+ *   only if it wins both orders (or wins one, ties the other); a flip ⇒ tie.
+ * - Severity: fail-closed AND — `"soundness"` sticks only when the combined
+ *   winner is decisive AND BOTH orders called it soundness; anything else
+ *   degrades to `"style"` (a position-dependent soundness claim is not trusted,
+ *   mirroring the module's "when unsure, style" rule).
+ * - Fail-closed: if EITHER order carries `judgeFailure`, the whole comparison
+ *   degrades to an all-tie result — a single trustworthy order is never promoted
+ *   to a both-order verdict.
+ *
+ * Evidence is taken from the first-as-A order (its A/B already align with the
+ * canonical first/second orientation), re-oriented if a test injects the other
+ * seating. Marked `bothOrders: true` so the report's position-bias audit knows
+ * the slot was cancelled by construction.
+ */
+export function combineBothOrderVerdicts(
+  inputs: JudgePairInputs,
+  order1: PairwiseResult,
+  order2: PairwiseResult,
+): PairwiseResult {
+  const firstVariant = inputs.first.variant;
+  const secondVariant = inputs.second.variant;
+  const base = {
+    taskId: inputs.taskId,
+    ...(inputs.linkIndex !== undefined ? { linkIndex: inputs.linkIndex } : {}),
+    executorModel: inputs.executorModel,
+    ...(inputs.repeat !== undefined ? { repeat: inputs.repeat } : {}),
+    variantA: firstVariant,
+    variantB: secondVariant,
+    bothOrders: true as const,
+  };
+
+  const tie = (): PairwiseDimension => ({ winner: "tie", evidenceA: "", evidenceB: "" });
+
+  // Fail-closed: a single-order failure taints the pair. Degrade to all-tie and
+  // surface WHICH order(s) failed so the degradation stays attributable.
+  if (order1.judgeFailure || order2.judgeFailure) {
+    const which = [
+      order1.judgeFailure ? `first-as-A: ${order1.judgeFailure}` : null,
+      order2.judgeFailure ? `first-as-B: ${order2.judgeFailure}` : null,
+    ]
+      .filter((s): s is string => s !== null)
+      .join(" | ");
+    return {
+      ...base,
+      dimensions: {
+        naming: tie(),
+        structure: tie(),
+        consistency: tie(),
+        economy: tie(),
+        documentation: tie(),
+        testing: tie(),
+      },
+      overall: { winner: "tie", rationale: "", severity: "style" },
+      judgeFailure: `both-order degraded to tie — ${which}`,
+    };
+  }
+
+  const toLetter = (variant: string): PairwiseWinner =>
+    variant === "tie" ? "tie" : variant === firstVariant ? "A" : "B";
+
+  // Which order presents `first` as its A? The real path pins order1 to
+  // first-as-A, but read the mapping so an injected seating is still correct.
+  const order1AisFirst = order1.variantA === firstVariant;
+
+  // Combine each craft dimension in variant-name terms, then re-letter to the
+  // canonical A=first/B=second. Evidence comes from order1, re-oriented so
+  // evidenceA always describes `first` and evidenceB always describes `second`.
+  const dims = {} as PairwiseResult["dimensions"];
+  for (const key of COMBINE_DIMENSIONS) {
+    const d1 = order1.dimensions[key];
+    const d2 = order2.dimensions[key];
+    const combined = combinePreference(
+      letterToVariant(order1, d1.winner),
+      letterToVariant(order2, d2.winner),
+    );
+    dims[key] = {
+      winner: toLetter(combined),
+      evidenceA: order1AisFirst ? d1.evidenceA : d1.evidenceB,
+      evidenceB: order1AisFirst ? d1.evidenceB : d1.evidenceA,
+    };
+  }
+
+  const w1 = letterToVariant(order1, order1.overall.winner);
+  const w2 = letterToVariant(order2, order2.overall.winner);
+  const overallVariant = combinePreference(w1, w2);
+  const overallWinner = toLetter(overallVariant);
+
+  // Severity: only a decisive, BOTH-orders-agree soundness claim survives.
+  const severity: PairwiseSeverity =
+    overallWinner !== "tie" &&
+    order1.overall.severity === "soundness" &&
+    order2.overall.severity === "soundness"
+      ? "soundness"
+      : "style";
+
+  // Rationale: on a decisive verdict, quote whichever order named that winner;
+  // on a flip-to-tie, say so plainly rather than keep a now-wrong claim.
+  let rationale: string;
+  if (overallVariant === "tie") {
+    rationale =
+      w1 !== "tie" && w2 !== "tie" && w1 !== w2
+        ? "Order-dependent verdict (winner flipped on A/B swap) — resolved to tie."
+        : "";
+  } else {
+    rationale = (w1 === overallVariant ? order1 : order2).overall.rationale;
+  }
+
+  return {
+    ...base,
+    dimensions: dims,
+    overall: { winner: overallWinner, rationale, severity },
+  };
 }
