@@ -1123,7 +1123,8 @@ export function renderCrossTaskInsight(report: Report): string {
   const sentences: string[] = [];
 
   if (featured !== undefined) {
-    const su = subAgentUsage(featured.lean);
+    const leanUse = subAgentUsage(featured.lean);
+    const heavyUse = subAgentUsage(featured.heavy);
     const leanCost = totalOf(featured.lean, (r) => r.metrics.executor.costUsd);
     const heavyCost = totalOf(featured.heavy, (r) => r.metrics.executor.costUsd);
     const leanWall = totalOf(featured.lean, (r) => r.metrics.executor.wallMs);
@@ -1136,9 +1137,24 @@ export function renderCrossTaskInsight(report: Report): string {
       effParts.push(ratioClause(leanWall, heavyWall, "wall time"));
     }
     const eff = effParts.length > 0 ? ` at ${effParts.join(" and ")}` : "";
-    sentences.push(
-      `\`${featured.lean}\` used sub-agents on ${su.used}/${su.total} tasks, and produced a leaner diff than \`${featured.heavy}\` on \`${featured.taskId}\` (+${fmtLoc(featured.leanLoc)} vs +${fmtLoc(featured.heavyLoc)} LOC)${eff}.`,
-    );
+    const diffClause = `produced a leaner diff than \`${featured.heavy}\` on \`${featured.taskId}\` (+${fmtLoc(featured.leanLoc)} vs +${fmtLoc(featured.heavyLoc)} LOC)${eff}`;
+    if (leanUse.used > 0) {
+      // Coherent pairing: the lean variant DID use sub-agents, so citing its
+      // usage alongside the leaner-diff claim reads as one consistent story.
+      sentences.push(
+        `\`${featured.lean}\` used sub-agents on ${leanUse.used}/${leanUse.total} tasks and ${diffClause}.`,
+      );
+    } else {
+      // The lean variant used NO sub-agents. Pairing "0/N" with "leaner diff"
+      // reads as if leanness came *despite* them — a misleading juxtaposition.
+      // Lead with the diff and, when it applies, cite the HEAVIER variant's
+      // sub-agent usage as the coherent contrast (heavier diff, more agents).
+      const heavyClause =
+        heavyUse.used > 0
+          ? ` \`${featured.heavy}\` used sub-agents on ${heavyUse.used}/${heavyUse.total} tasks.`
+          : "";
+      sentences.push(`\`${featured.lean}\` ${diffClause}.${heavyClause}`);
+    }
   } else {
     // Degenerate: one variant, or no shared task to contrast. Emit a modest
     // single-variant sub-agent line (or nothing) rather than a fabricated gap.

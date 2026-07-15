@@ -1491,6 +1491,25 @@ test("renderCrossTaskInsight: synthesizes the diff/efficiency contrast from beha
   assert.doesNotMatch(insight, /undefined|NaN/);
 });
 
+test("renderCrossTaskInsight: lean variant used no sub-agents → drops the misleading 0/N pairing", () => {
+  // agentic-os owns the HEAVY diff and the sub-agents; naked is lean with none.
+  // Pairing "naked used sub-agents on 0/1 tasks, and produced a leaner diff"
+  // would read as if leanness came despite them — so the clause must be dropped.
+  const report = makeReport({
+    taskId: "safe-redirect",
+    results: [
+      behavCell("agentic-os", "safe-redirect", 1166, 1, 0.2, 100_000),
+      behavCell("naked", "safe-redirect", 195, 0, 0.1, 50_000),
+    ],
+  });
+  const insight = renderCrossTaskInsight(report);
+  assert.match(insight, /`naked` produced a leaner diff than `agentic-os`/);
+  assert.doesNotMatch(insight, /used sub-agents on 0\//); // no misleading pairing
+  // The heavier variant's sub-agent usage is the coherent contrast instead.
+  assert.match(insight, /`agentic-os` used sub-agents on 1\/1 tasks\./);
+  assert.doesNotMatch(insight, /undefined|NaN/);
+});
+
 test("renderCrossTaskInsight: no behavioral data → empty; assembly omits the section", () => {
   const report = makeReport({ results: [cell("alpha", "t1"), cell("bravo", "t1")] });
   assert.equal(renderCrossTaskInsight(report), "");
