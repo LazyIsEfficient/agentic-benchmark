@@ -555,14 +555,40 @@ export interface PairwisePairAggregate {
   ties: number;
 }
 
+/**
+ * One opponent's head-to-head split from a variant's point of view: how many of
+ * their DECISIVE (non-tie) comparisons this variant won vs lost. Only opponents
+ * with ≥1 decisive comparison appear.
+ */
+export interface PairwiseHeadToHead {
+  opponent: string;
+  wins: number;
+  losses: number;
+}
+
 /** One variant's overall pairwise record across every pair it appeared in. */
 export interface PairwiseVariantAggregate {
   variant: string;
   wins: number;
   losses: number;
   ties: number;
-  /** wins/(wins+losses); null when the variant had no decisive comparison. */
+  /**
+   * GLOBAL win rate: wins/(wins+losses) pooled across ALL opponents; null when
+   * the variant had no decisive comparison. Kept for the pairwise table, but NOT
+   * what the Craft Score consumes — pooling lets a variant bank credit for
+   * beating one weak opponent many times.
+   */
   winRate: number | null;
+  /** Per-opponent decisive splits (opponents with ≥1 decisive comparison). */
+  headToHead: PairwiseHeadToHead[];
+  /**
+   * MACRO-AVERAGE of per-opponent head-to-head win rates: mean over opponents O
+   * of winsV_vs_O/(winsV_vs_O + winsO_vs_V). Each opponent counts once regardless
+   * of how many times it was faced, so beating the weakest variant repeatedly
+   * can't dominate. null when the variant had no decisive comparison against any
+   * opponent. This is the rate the Craft Score uses.
+   */
+  headToHeadWinRate: number | null;
 }
 
 /** Win/loss/tie tallies plus the A-slot position-bias audit. */
@@ -594,6 +620,16 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
       variantOrder.push(variant);
     }
     return tallies.get(variant)!;
+  };
+  // Per-variant, per-opponent decisive splits, keyed variant → opponent → w/l.
+  // Opponent insertion order per variant is first-seen, so the macro-average is
+  // stable and the headToHead array reads in the order pairs first appeared.
+  const h2h = new Map<string, Map<string, { wins: number; losses: number }>>();
+  const h2hEntry = (variant: string, opponent: string) => {
+    if (!h2h.has(variant)) h2h.set(variant, new Map());
+    const opps = h2h.get(variant)!;
+    if (!opps.has(opponent)) opps.set(opponent, { wins: 0, losses: 0 });
+    return opps.get(opponent)!;
   };
 
   let aSlotWins = 0;
@@ -630,6 +666,8 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
     else pair.winsY++;
     tallies.get(winner)!.wins++;
     tallies.get(loser)!.losses++;
+    h2hEntry(winner, loser).wins++;
+    h2hEntry(loser, winner).losses++;
   }
 
   return {
@@ -638,7 +676,17 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
     variants: variantOrder.map((v) => {
       const t = tallies.get(v)!;
       const denom = t.wins + t.losses;
-      return { variant: v, ...t, winRate: denom > 0 ? t.wins / denom : null };
+      const headToHead: PairwiseHeadToHead[] = [...(h2h.get(v)?.entries() ?? [])].map(
+        ([opponent, wl]) => ({ opponent, wins: wl.wins, losses: wl.losses }),
+      );
+      const perOpponentRates = headToHead.map((h) => h.wins / (h.wins + h.losses));
+      return {
+        variant: v,
+        ...t,
+        winRate: denom > 0 ? t.wins / denom : null,
+        headToHead,
+        headToHeadWinRate: perOpponentRates.length > 0 ? mean(perOpponentRates) : null,
+      };
     }),
     positionBias: { aSlotWins, decisive },
   };
@@ -660,14 +708,18 @@ export function renderPairwise(pairwise: PairwiseResult[] | undefined): string {
   const pairLines = agg.pairs.map(
     (p) => `- ${p.variantX} vs ${p.variantY}: ${p.winsX}–${p.winsY} (${p.ties} ties)`,
   );
-  const header = `| Variant | Win rate | W–L–T |\n| --- | --- | --- |`;
+  const header =
+    `| Variant | Global win rate | H2H win rate | Decisive | W–L–T |\n` +
+    `| --- | --- | --- | --- | --- |`;
   const rows = agg.variants.map((v) => {
-    const rate = v.winRate === null ? "—" : `${Math.round(v.winRate * 100)}%`;
-    return `| ${v.variant} | ${rate} | ${v.wins}–${v.losses}–${v.ties} |`;
+    const global = v.winRate === null ? "—" : `${Math.round(v.winRate * 100)}%`;
+    const h2h =
+      v.headToHeadWinRate === null ? "—" : `${Math.round(v.headToHeadWinRate * 100)}%`;
+    return `| ${v.variant} | ${global} | ${h2h} | ${v.wins + v.losses} | ${v.wins}–${v.losses}–${v.ties} |`;
   });
   const bias = `_Position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} decisive comparisons (expected ≈50%)._`;
   return [
-    "_Same-cell A/B craft comparisons (overall winner per comparison). Win rate = wins/(wins+losses); ties excluded._",
+    "_Same-cell A/B craft comparisons (overall winner per comparison). Global win rate = wins/(wins+losses) pooled across all opponents; H2H win rate = macro-average of per-opponent head-to-head rates (each opponent weighted once — the rate the Craft Score consumes). Decisive = wins+losses; ties excluded from both rates._",
     "",
     pairLines.join("\n"),
     "",
@@ -694,6 +746,20 @@ const CRAFT_DUP_CAP = 10;
  * the smallest sample where a majority is not a single comparison.
  */
 const MIN_DECISIVE_COMPARISONS = 3;
+/**
+ * Confidence floor for the Craft Score's pairwise signal. A variant needs at
+ * least this many DECISIVE comparisons before its head-to-head rate is presented
+ * as firm, and two adjacent ranks need at least this many DECISIVE comparisons
+ * BETWEEN THE TWO OF THEM before we claim one outranks the other. Below it we
+ * still show a score (the rate is the best point estimate we have) but flag the
+ * row `⚠ low-confidence (n=…)` and render the adjacent pair as `≈` (not
+ * separable) instead of distinct ranks — 4 comparisons cannot rank two variants.
+ * Set to 5: the smallest sample where a 4–1 split (one dissenting comparison) is
+ * still a clear majority, so a lone judge call can't manufacture a separation.
+ * This is a BROADER layer above {@link MIN_DECISIVE_COMPARISONS} (the <3 →
+ * slop-only cutoff), not a replacement for it.
+ */
+const MIN_CONFIDENT_DECISIVE = 5;
 
 /** Clamp x into [lo, hi]. */
 function clamp(x: number, lo: number, hi: number): number {
@@ -710,12 +776,26 @@ export interface CraftScoreAggregate {
   executorModel: string;
   /** SlopHealth ∈ [0,1] from the deterministic slop means; null when no scorable cell. */
   slopHealth: number | null;
-  /** Pairwise win rate folded into the score, or null when dropped (untrusted/missing). */
+  /**
+   * HEAD-TO-HEAD macro-average win rate folded into the score, or null when
+   * dropped (untrusted/missing). Not the global pooled rate — see
+   * {@link PairwiseVariantAggregate.headToHeadWinRate}.
+   */
   winRate: number | null;
   /** Composite 0–100 score; null when no slop cell survives (all disqualified / no data). */
   score: number | null;
   /** True when the winRate term was dropped → `score = round(100·slopHealth)`. */
   slopOnly: boolean;
+  /** Total DECISIVE comparisons (wins+losses) backing this variant's rate. */
+  decisiveTotal: number;
+  /** Per-opponent decisive splits — exposes how thin each head-to-head rate is. */
+  headToHead: PairwiseHeadToHead[];
+  /**
+   * True when the score USES a win rate (not slop-only) but rests on fewer than
+   * {@link MIN_CONFIDENT_DECISIVE} decisive comparisons — the score stands but is
+   * annotated `⚠ low-confidence`.
+   */
+  lowConfidence: boolean;
   /** True when any member cell was disqualified (adversarial) — the ☠ mark. */
   disqualified: boolean;
   /** True when EVERY member cell was disqualified: no inputs survive → ☠/no score. */
@@ -756,10 +836,18 @@ export function aggregateCraftScore(
 ): CraftScoreAggregate[] {
   const cells = withCampaignLinks(results, campaigns);
   const slopAggs = aggregateSlop(cells);
-  const winRates = new Map<string, { rate: number | null; decisive: number }>();
+  const winRates = new Map<
+    string,
+    { rate: number | null; decisive: number; headToHead: PairwiseHeadToHead[] }
+  >();
   if (pairwise !== undefined && pairwise.length > 0) {
     for (const v of aggregatePairwise(pairwise).variants) {
-      winRates.set(v.variant, { rate: v.winRate, decisive: v.wins + v.losses });
+      // Craft Score consumes the HEAD-TO-HEAD macro-average, not the global rate.
+      winRates.set(v.variant, {
+        rate: v.headToHeadWinRate,
+        decisive: v.wins + v.losses,
+        headToHead: v.headToHead,
+      });
     }
   }
   const anyDisqByGroup = new Map<string, boolean>();
@@ -773,8 +861,10 @@ export function aggregateCraftScore(
     const anyDisq = anyDisqByGroup.get(`${a.variant}${SEP}${a.executorModel}`) ?? false;
     const slopHealth = slopHealthOf(a);
     const wr = winRates.get(a.variant);
+    const decisiveTotal = wr?.decisive ?? 0;
+    const headToHead = wr?.headToHead ?? [];
     const trusted =
-      wr !== undefined && wr.rate !== null && wr.decisive >= MIN_DECISIVE_COMPARISONS;
+      wr !== undefined && wr.rate !== null && decisiveTotal >= MIN_DECISIVE_COMPARISONS;
     let score: number | null = null;
     let winRate: number | null = null;
     let slopOnly = false;
@@ -794,6 +884,10 @@ export function aggregateCraftScore(
       winRate,
       score,
       slopOnly,
+      decisiveTotal,
+      headToHead,
+      lowConfidence:
+        score !== null && !slopOnly && decisiveTotal < MIN_CONFIDENT_DECISIVE,
       disqualified: anyDisq,
       allDisqualified: slopHealth === null && anyDisq,
     };
@@ -825,20 +919,37 @@ export function renderCraftScore(
   const header =
     `| Rank | Variant | Model | Craft Score | Win rate | Slop health |\n` +
     `| --- | --- | --- | --- | --- | --- |`;
-  let rank = 0;
+  // Competition-style ranking with a confidence tie-band: a scored row gets a
+  // fresh rank number only when it is SEPARABLE from the row above — i.e. the two
+  // variants faced each other in ≥ MIN_CONFIDENT_DECISIVE decisive comparisons.
+  // Otherwise it shares the band and renders `≈` (not separable), so the table
+  // never claims a firm separation the sample can't support.
+  let prevScored: CraftScoreAggregate | undefined;
+  let band = 0;
   const rows = aggs.map((a) => {
-    const label = variantLabelWithDisqualification(a.variant, a.disqualified);
+    const baseLabel = variantLabelWithDisqualification(a.variant, a.disqualified);
     if (a.score === null) {
-      return `| — | ${label} | ${a.executorModel} | ${a.allDisqualified ? "☠" : "—"} | — | — |`;
+      return `| — | ${baseLabel} | ${a.executorModel} | ${a.allDisqualified ? "☠" : "—"} | — | — |`;
     }
-    rank++;
+    const vsPrev = prevScored
+      ? a.headToHead.find((h) => h.opponent === prevScored!.variant)
+      : undefined;
+    const decisiveBetween = vsPrev ? vsPrev.wins + vsPrev.losses : 0;
+    const separable =
+      prevScored === undefined || decisiveBetween >= MIN_CONFIDENT_DECISIVE;
+    if (separable) band++;
+    const rankCell = separable ? String(band) : "≈";
+    prevScored = a;
+    const label = a.lowConfidence
+      ? `${baseLabel} ⚠ low-confidence (n=${a.decisiveTotal})`
+      : baseLabel;
     const health = a.slopHealth === null ? "—" : a.slopHealth.toFixed(2);
     const wr = a.slopOnly ? "_(slop-only)_" : `${Math.round(a.winRate! * 100)}%`;
-    return `| ${rank} | ${label} | ${a.executorModel} | ${a.score} | ${wr} | ${health} |`;
+    return `| ${rankCell} | ${label} | ${a.executorModel} | ${a.score} | ${wr} | ${health} |`;
   });
   return [
-    "_Within-Craft ranking summary — NOT a cross-axis total (axes are never summed; this combines only Craft's own sub-signals). `Score = round(100·(0.7·winRate + 0.3·SlopHealth))`, dup capped at " +
-      `${CRAFT_DUP_CAP}; a variant with fewer than ${MIN_DECISIVE_COMPARISONS} decisive pairwise comparisons drops the winRate term and is flagged \`(slop-only)\` (never imputed). testTamper is a soft penalty via SlopHealth. Disqualified cells are excluded from the inputs but keep their ☠ mark._`,
+    "_Within-Craft ranking summary — NOT a cross-axis total (axes are never summed; this combines only Craft's own sub-signals). `Score = round(100·(0.7·winRate + 0.3·SlopHealth))`, where winRate is the HEAD-TO-HEAD macro-average (each opponent weighted once, so beating one weak variant repeatedly earns no extra credit), dup capped at " +
+      `${CRAFT_DUP_CAP}. A variant with fewer than ${MIN_DECISIVE_COMPARISONS} decisive comparisons drops the winRate term and is flagged \`(slop-only)\` (never imputed). Confidence layer: a scored row backed by fewer than ${MIN_CONFIDENT_DECISIVE} decisive comparisons is flagged \`⚠ low-confidence (n=…)\`; two adjacent rows separated by fewer than ${MIN_CONFIDENT_DECISIVE} decisive HEAD-TO-HEAD comparisons share a rank band and render \`≈\` (not separable) rather than distinct ranks. testTamper is a soft penalty via SlopHealth. Disqualified cells are excluded from the inputs but keep their ☠ mark._`,
     "",
     [header, ...rows].join("\n"),
   ].join("\n");
