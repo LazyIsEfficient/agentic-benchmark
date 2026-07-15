@@ -44,6 +44,12 @@ test("buildPairwisePrompt renders both diffs, the read-only context, and the spe
   assert.ok(p.includes("the harness handles the lexicographic ordering"));
   assert.ok(p.includes('{"dimensions":{"naming":{"winner":"A"|"B"|"tie"'));
   assert.ok(p.includes(`<task>\n${promptInputs.taskPrompt}\n</task>`));
+  // Craft v2: the documentation dimension and the severity rule are in the spec.
+  assert.ok(p.includes("naming, structure, consistency, economy, documentation"));
+  assert.ok(p.includes('"documentation":{…}'));
+  assert.ok(p.includes('"severity":"soundness"|"style"'));
+  assert.ok(p.includes("Rate the OVERALL verdict's severity"));
+  assert.ok(p.includes("judge documentation on VALUE, not volume"));
 });
 
 test("buildPairwisePrompt caps EACH diff at MAX_DIFF_BYTES/2 with a visible marker", () => {
@@ -111,8 +117,17 @@ const validPairwisePayload = {
       evidence_a: "src/a.ts:1 — 10-line diff",
       evidence_b: "src/b.ts:1 — 40-line diff with padding",
     },
+    documentation: {
+      winner: "A",
+      evidence_a: "src/a.ts:2 — docstring states the limiter window",
+      evidence_b: "src/b.ts:2 — no docs; comment restates the code",
+    },
   },
-  overall: { winner: "A", rationale: "A is tighter with clearer names." },
+  overall: {
+    winner: "A",
+    rationale: "A is tighter with clearer names.",
+    severity: "soundness",
+  },
 };
 
 /** Rebuild the payload with one dimension replaced (untyped on purpose). */
@@ -132,6 +147,57 @@ test("parsePairwiseJudgeOutput accepts a well-formed payload and maps snake_case
   assert.equal(r.dimensions.consistency.winner, "B");
   assert.equal(r.overall.winner, "A");
   assert.equal(r.overall.rationale, "A is tighter with clearer names.");
+});
+
+test("parsePairwiseJudgeOutput parses the documentation dimension and overall severity", () => {
+  const r = parsePairwiseJudgeOutput(JSON.stringify(validPairwisePayload));
+  assert.equal(r.dimensions.documentation.winner, "A");
+  assert.equal(
+    r.dimensions.documentation.evidenceA,
+    "src/a.ts:2 — docstring states the limiter window",
+  );
+  assert.equal(r.overall.severity, "soundness");
+});
+
+test("parsePairwiseJudgeOutput fails a missing/malformed documentation dimension closed to tie", () => {
+  const missing = { ...validPairwisePayload } as Record<string, unknown>;
+  missing["dimensions"] = { ...validPairwisePayload.dimensions } as Record<string, unknown>;
+  delete (missing["dimensions"] as Record<string, unknown>)["documentation"];
+  const r = parsePairwiseJudgeOutput(JSON.stringify(missing));
+  assert.deepEqual(r.dimensions.documentation, {
+    winner: "tie",
+    evidenceA: "",
+    evidenceB: "(invalid — treated as tie)",
+  });
+  // Siblings untouched — field-level validation.
+  assert.equal(r.dimensions.naming.winner, "A");
+});
+
+test("parsePairwiseJudgeOutput degrades severity fail-closed to style — never inflates a preference", () => {
+  // Missing severity → style (ordinary weight).
+  const noSev = parsePairwiseJudgeOutput(
+    JSON.stringify({ ...validPairwisePayload, overall: { winner: "A", rationale: "r" } }),
+  );
+  assert.equal(noSev.overall.severity, "style");
+
+  // Invalid severity value → style.
+  const badSev = parsePairwiseJudgeOutput(
+    JSON.stringify({
+      ...validPairwisePayload,
+      overall: { winner: "A", rationale: "r", severity: "critical" },
+    }),
+  );
+  assert.equal(badSev.overall.severity, "style");
+
+  // A tie can NEVER carry soundness weight, even when the judge labels it so.
+  const tieSev = parsePairwiseJudgeOutput(
+    JSON.stringify({
+      ...validPairwisePayload,
+      overall: { winner: "tie", rationale: "r", severity: "soundness" },
+    }),
+  );
+  assert.equal(tieSev.overall.winner, "tie");
+  assert.equal(tieSev.overall.severity, "style");
 });
 
 test("parsePairwiseJudgeOutput parses fence-wrapped JSON with surrounding prose", () => {
@@ -181,7 +247,7 @@ test("parsePairwiseJudgeOutput fails a missing/malformed dimension closed to tie
 test("parsePairwiseJudgeOutput fails every dimension closed when dimensions is missing", () => {
   const noDims = { overall: validPairwisePayload.overall };
   const r = parsePairwiseJudgeOutput(JSON.stringify(noDims));
-  for (const dim of ["naming", "structure", "consistency", "economy"] as const) {
+  for (const dim of ["naming", "structure", "consistency", "economy", "documentation"] as const) {
     assert.equal(r.dimensions[dim].winner, "tie");
     assert.equal(r.dimensions[dim].evidenceB, "(invalid — treated as tie)");
   }
@@ -381,10 +447,10 @@ test("judgePair fails closed to all-tie after a second parse failure — moves n
   assert.equal(calls, 2); // original ask + exactly ONE re-ask
   assert.ok(r.judgeFailure);
   assert.match(r.judgeFailure!, /could not be parsed after one re-ask/);
-  for (const dim of ["naming", "structure", "consistency", "economy"] as const) {
+  for (const dim of ["naming", "structure", "consistency", "economy", "documentation"] as const) {
     assert.equal(r.dimensions[dim].winner, "tie");
   }
-  assert.deepEqual(r.overall, { winner: "tie", rationale: "" });
+  assert.deepEqual(r.overall, { winner: "tie", rationale: "", severity: "style" });
   // The resolved mapping is still recorded so the failure is attributable.
   assert.equal(r.variantA, "bundle-v1");
   assert.equal(r.variantB, "claude-md-only");
@@ -403,8 +469,8 @@ test("judgePair fails closed to all-tie when transport dies on every attempt", a
   assert.equal(calls, JUDGE_MAX_ATTEMPTS);
   assert.ok(r.judgeFailure);
   assert.match(r.judgeFailure!, /container exit 1/);
-  for (const dim of ["naming", "structure", "consistency", "economy"] as const) {
+  for (const dim of ["naming", "structure", "consistency", "economy", "documentation"] as const) {
     assert.equal(r.dimensions[dim].winner, "tie");
   }
-  assert.deepEqual(r.overall, { winner: "tie", rationale: "" });
+  assert.deepEqual(r.overall, { winner: "tie", rationale: "", severity: "style" });
 });

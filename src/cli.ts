@@ -554,19 +554,25 @@ export function formatTestResultsSummary(testResults: TestResults | undefined): 
     : verdict;
 }
 
-/** `N/S/C/E` craft scores for a console line; `?` for unknown/missing. */
+/** `N/S/C/E/D` craft scores for a console line; `?` for unknown/missing. */
 function formatCraftLine(judge: CellJudgeResult | undefined): string {
   const s = (v: CraftScore | undefined): string =>
     v === undefined || v.score === "unknown" ? "?" : String(v.score);
   const c = judge?.craft;
-  return `${s(c?.naming)}/${s(c?.structure)}/${s(c?.consistency)}/${s(c?.economy)}`;
+  return `${s(c?.naming)}/${s(c?.structure)}/${s(c?.consistency)}/${s(c?.economy)}/${s(c?.documentation)}`;
 }
 
 /** The fail-closed empty verdict used when the judge seam THROWS (see judgeSafe). */
 function emptyCellVerdict(flag: string): CellJudgeResult {
   const unknown = (): CraftScore => ({ score: "unknown", evidence: [] });
   return {
-    craft: { naming: unknown(), structure: unknown(), consistency: unknown(), economy: unknown() },
+    craft: {
+      naming: unknown(),
+      structure: unknown(),
+      consistency: unknown(),
+      economy: unknown(),
+      documentation: unknown(),
+    },
     blastRadius: [],
     correctnessAssessment: null,
     flags: [flag],

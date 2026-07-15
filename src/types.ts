@@ -506,13 +506,20 @@ export interface AnchorResult {
 }
 
 /**
- * The four craft dimensions the cell judge scores. Craft is the qualitative
+ * The five craft dimensions the cell judge scores. Craft is the qualitative
  * residual the deterministic axes can't measure: naming (do identifiers say
  * what things mean), structure (is the change shaped like the codebase),
  * consistency (does it match surrounding conventions), economy (no more code
- * than the task needs).
+ * than the task needs), documentation (does the change explain its intent —
+ * useful docstrings, README/DATA_MODEL/ADR updates, intent-explaining comments
+ * — scored on VALUE, not volume; redundant restatement scores LOW).
  */
-export type CraftDimension = "naming" | "structure" | "consistency" | "economy";
+export type CraftDimension =
+  | "naming"
+  | "structure"
+  | "consistency"
+  | "economy"
+  | "documentation";
 
 /**
  * One craft dimension's value on a 0–4 ordinal scale. `"unknown"` is the
@@ -534,12 +541,20 @@ export interface CraftScore {
   evidence: string[];
 }
 
-/** All four craft dimensions for one cell — the judge must score every one. */
+/** All five craft dimensions for one cell — the judge must score every one. */
 export interface CellCraft {
   naming: CraftScore;
   structure: CraftScore;
   consistency: CraftScore;
   economy: CraftScore;
+  /**
+   * Documentation quality — scored on VALUE, not volume. Useful docstrings,
+   * README/DATA_MODEL/ADR updates, and intent-explaining comments score HIGH;
+   * redundant restatement of the code or README scores LOW, so the dimension
+   * cannot be gamed by padding. Distinct from `economy`: good documentation is
+   * NOT the "verbosity" the anti-verbosity rule penalizes.
+   */
+  documentation: CraftScore;
 }
 
 /**
@@ -686,6 +701,21 @@ export interface TestResults {
 export type PairwiseWinner = "A" | "B" | "tie";
 
 /**
+ * How consequential a pairwise verdict is, so the aggregation can weight a
+ * soundness/correctness-relevant win (e.g. catching a real open redirect the
+ * other diff shipped) above a purely stylistic nit (an import spelling, a
+ * naming preference):
+ * - `soundness` — the winning side's edge implicates correctness, security, or
+ *   robustness (a real defect avoided, a check the loser omitted).
+ * - `style`     — the edge is stylistic/craft-only; the ORDINARY weight.
+ *
+ * FAIL-CLOSED: a missing/invalid severity degrades to `style` (ordinary weight)
+ * — it never manufactures or inflates a preference. Only an explicit
+ * `soundness` on a DECISIVE (non-tie) verdict earns the heavier weight.
+ */
+export type PairwiseSeverity = "soundness" | "style";
+
+/**
  * One craft dimension of an A/B comparison. Evidence is required for BOTH
  * sides — a winner without cited evidence from each diff is unauditable.
  */
@@ -722,9 +752,20 @@ export interface PairwiseResult {
     structure: PairwiseDimension;
     consistency: PairwiseDimension;
     economy: PairwiseDimension;
+    documentation: PairwiseDimension;
   };
-  /** The judge's overall call across the four dimensions, with its reasoning. */
-  overall: { winner: PairwiseWinner; rationale: string };
+  /**
+   * The judge's overall call across the five dimensions, with its reasoning and
+   * a severity signal. `severity` is `soundness` only when the winning edge
+   * implicates correctness/security/robustness; it degrades to `style` (the
+   * ordinary weight) fail-closed, so a malformed field never inflates a
+   * preference. A `tie` is always ordinary regardless of severity.
+   */
+  overall: {
+    winner: PairwiseWinner;
+    rationale: string;
+    severity: PairwiseSeverity;
+  };
   /** Set when the pairwise judge call failed; the comparison is unusable. */
   judgeFailure?: string;
 }

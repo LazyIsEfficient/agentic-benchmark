@@ -119,6 +119,7 @@ const validCellPayload = {
     structure: { score: 2, evidence: ["src/a.ts:20 — one right-sized function"] },
     consistency: { score: 4, evidence: ["src/a.ts:5 — matches existing import style"] },
     economy: { score: 3, evidence: ["src/a.ts:1 — 14-line diff for the task"] },
+    documentation: { score: 3, evidence: ["src/a.ts:2 — docstring explains the retry budget"] },
   },
   blast_radius: [],
   correctness_assessment: null,
@@ -141,6 +142,34 @@ test("parseCellJudgeResult accepts a well-formed payload", () => {
   assert.deepEqual(r.blastRadius, []);
   assert.equal(r.correctnessAssessment, null);
   assert.deepEqual(r.flags, []);
+});
+
+test("parseCellJudgeResult parses the documentation dimension like any other craft score", () => {
+  const r = parseCellJudgeResult(JSON.stringify(validCellPayload));
+  assert.equal(r.craft.documentation.score, 3);
+  assert.deepEqual(r.craft.documentation.evidence, [
+    "src/a.ts:2 — docstring explains the retry budget",
+  ]);
+});
+
+test("parseCellJudgeResult fails a missing/malformed documentation dimension closed to unknown", () => {
+  // Missing entirely → unknown + invalid:documentation flag (fail-closed), and
+  // siblings stay intact (field-level validation).
+  const { documentation: _d, ...craftNoDoc } = validCellPayload.craft;
+  const missing = parseCellJudgeResult(
+    JSON.stringify({ ...validCellPayload, craft: craftNoDoc }),
+  );
+  assert.equal(missing.craft.documentation.score, "unknown");
+  assert.deepEqual(missing.craft.documentation.evidence, []);
+  assert.ok(missing.flags.includes("invalid:documentation"));
+  assert.equal(missing.craft.naming.score, 3);
+
+  // A numeric documentation score WITHOUT evidence is invalid per the rubric.
+  const noEvidence = parseCellJudgeResult(
+    JSON.stringify(withCraftDim("documentation", { score: 4, evidence: [] })),
+  );
+  assert.equal(noEvidence.craft.documentation.score, "unknown");
+  assert.ok(noEvidence.flags.includes("invalid:documentation"));
 });
 
 test("parseCellJudgeResult parses fence-wrapped JSON with surrounding prose", () => {

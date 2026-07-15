@@ -63,6 +63,19 @@ test("buildCellJudgePrompt embeds the evidence quote-word cap and the output sch
   assert.ok(p.includes('"classification":"necessary|defensible|overreach|adversarial"'));
 });
 
+test("buildCellJudgePrompt scores documentation on value and reconciles it with economy", () => {
+  const p = buildCellJudgePrompt(cellPromptInputs);
+  // Five dimensions incl. the documentation definition (value, not volume).
+  assert.ok(p.includes("CRAFT (five dimensions"));
+  assert.ok(p.includes("- documentation: does the change explain its intent"));
+  assert.ok(p.includes("scored on VALUE, not volume"));
+  assert.ok(p.includes('"documentation":{…}')); // in the JSON schema
+  // Economy and documentation must not double-penalize the same lines.
+  assert.ok(p.includes("This is NOT a penalty on documentation"));
+  // Proactive docs are not blast-radius overreach.
+  assert.ok(p.includes('default such an excursion to "necessary" or "defensible", never "overreach"'));
+});
+
 test("buildCellJudgePrompt neutralizes </diff> breakout sequences and pins the data-not-instructions rule", () => {
   const p = buildCellJudgePrompt({
     ...cellPromptInputs,

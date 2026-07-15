@@ -31,6 +31,41 @@ function stripDotSlash(p: string): string {
   return out;
 }
 
+// --- Documentation exclusion --------------------------------------------------
+
+/** Documentation file extensions (lower-cased, incl. the dot). */
+const DOC_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".md",
+  ".mdx",
+  ".markdown",
+  ".rst",
+  ".adoc",
+]);
+
+/**
+ * True when a touched path is a DOCUMENTATION file: a Markdown/reST/AsciiDoc
+ * document, or anything living under a `docs/` directory. Blast-radius exists to
+ * flag scope RISK — an unrequested CODE/CONFIG change that could hide a bug or
+ * game the harness. A proactive doc carries no such risk (it cannot weaken a
+ * check or alter behavior), and issue #38 showed the excursion axis was
+ * PUNISHING proactive docs (a volunteered `DATA_MODEL.md` flagged "overreach").
+ * So doc files are excluded from excursion classification entirely — the judge
+ * never sees them as out-of-scope, and the documentation craft dimension is
+ * where their VALUE is graded instead. Path-based and deterministic; JSDoc-only
+ * changes to `.ts` files are NOT covered here (they'd need diff-content
+ * analysis) and remain the documentation dimension's job. Case-insensitive on
+ * the extension; forward-slash paths (as git emits).
+ */
+export function isDocFile(path: string): boolean {
+  const normalized = stripDotSlash(path);
+  const lower = normalized.toLowerCase();
+  const dot = lower.lastIndexOf(".");
+  if (dot !== -1 && DOC_EXTENSIONS.has(lower.slice(dot))) return true;
+  // Any segment named `docs` (e.g. `docs/x.ts`, `pkg/docs/adr/1.md`) is a docs
+  // directory — its contents are documentation regardless of extension.
+  return normalized.split("/").slice(0, -1).includes("docs");
+}
+
 // --- Glob compilation -----------------------------------------------------------
 
 /** Regex metacharacters that must be escaped when taken literally from a glob. */
@@ -134,6 +169,11 @@ export function expectedSurfaceFor(
  * undefined/[] distinction carries meaning — collapse it and an explicit
  * touch-nothing surface would silently disable scoping instead of flagging
  * everything.
+ *
+ * DOCUMENTATION files ({@link isDocFile}) are never reported as excursions,
+ * even under an explicit `[]` surface: a proactive doc is not scope risk (see
+ * {@link isDocFile}), so it must not be handed to blast-radius classification.
+ * Their quality is graded by the `documentation` craft dimension instead.
  */
 export function filesOutsideExpectedSurface(
   touchedFiles: string[],
@@ -147,6 +187,8 @@ export function filesOutsideExpectedSurface(
     const path = stripDotSlash(file);
     if (seen.has(path)) continue;
     seen.add(path);
+    // A proactive doc is not scope RISK — never an excursion (issue #38).
+    if (isDocFile(path)) continue;
     if (!surface.some((re) => re.test(path))) outside.push(file);
   }
   return outside;

@@ -183,6 +183,7 @@ test("CellJudgeResult constructs with craft, blast radius, and the no-tests fall
       // "unknown" is fail-closed — it survives as-is, never clamped to a number.
       consistency: { score: "unknown", evidence: [] },
       economy: { score: 2, evidence: ["src/cart.ts:40 — re-implements existing sum helper"] },
+      documentation: { score: 3, evidence: ["src/cart.ts:1 — docstring states the money invariant"] },
     },
     blastRadius: [
       {
@@ -313,8 +314,18 @@ test("PairwiseResult records the resolved A/B mapping and rides on Report.pairwi
     repeat: 1,
     variantA: "agentic-os",
     variantB: "baseline",
-    dimensions: { naming: dim, structure: dim, consistency: dim, economy: dim },
-    overall: { winner: "A", rationale: "A cites the domain; B ships placeholder names." },
+    dimensions: {
+      naming: dim,
+      structure: dim,
+      consistency: dim,
+      economy: dim,
+      documentation: dim,
+    },
+    overall: {
+      winner: "A",
+      rationale: "A cites the domain; B ships placeholder names.",
+      severity: "soundness",
+    },
   };
   const report: Report = {
     runId: "00000000-0000-0000-0000-000000000000",

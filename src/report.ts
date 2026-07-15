@@ -379,8 +379,14 @@ function correctnessCoverageWarning(aggregates: CorrectnessAggregate[]): string[
 
 // --- Axis 3: Craft --------------------------------------------------------------
 
-/** The four craft dimensions in table-column order. */
-const CRAFT_DIMENSIONS = ["naming", "structure", "consistency", "economy"] as const;
+/** The five craft dimensions in table-column order. */
+const CRAFT_DIMENSIONS = [
+  "naming",
+  "structure",
+  "consistency",
+  "economy",
+  "documentation",
+] as const;
 
 /**
  * Lower median of an ordinal sample: middle element for odd counts, the LOWER
@@ -531,12 +537,12 @@ export function renderJudgeCraft(
     return "_No judge craft verdicts recorded (legacy results)._";
   }
   const header =
-    `| Variant | Model | Naming | Structure | Consistency | Economy | Unknown scores | Cells |\n` +
-    `| --- | --- | --- | --- | --- | --- | --- | --- |`;
+    `| Variant | Model | Naming | Structure | Consistency | Economy | Documentation | Unknown scores | Cells |\n` +
+    `| --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
   const cell = (m: number | null) => (m === null ? "—" : String(m));
   const rows = aggs.map(
     (a) =>
-      `| ${a.variant} | ${a.executorModel} | ${cell(a.median.naming)} | ${cell(a.median.structure)} | ${cell(a.median.consistency)} | ${cell(a.median.economy)} | ${a.unknownCount} | ${a.cellCount} |`,
+      `| ${a.variant} | ${a.executorModel} | ${cell(a.median.naming)} | ${cell(a.median.structure)} | ${cell(a.median.consistency)} | ${cell(a.median.economy)} | ${cell(a.median.documentation)} | ${a.unknownCount} | ${a.cellCount} |`,
   );
   return [
     "_Lower median (ordinal 0–4) over scored, non-disqualified cells. `unknown` scores never enter a median — they are counted instead (fail-closed)._",
@@ -573,8 +579,9 @@ export interface PairwiseVariantAggregate {
   losses: number;
   ties: number;
   /**
-   * GLOBAL win rate: wins/(wins+losses) pooled across ALL opponents; null when
-   * the variant had no decisive comparison. Kept for the pairwise table, but NOT
+   * GLOBAL win rate: SEVERITY-WEIGHTED wins/(wins+losses) pooled across ALL
+   * opponents (a soundness win weighs {@link SOUNDNESS_WEIGHT}); null when the
+   * variant had no decisive comparison. Kept for the pairwise table, but NOT
    * what the Craft Score consumes — pooling lets a variant bank credit for
    * beating one weak opponent many times.
    */
@@ -583,9 +590,10 @@ export interface PairwiseVariantAggregate {
   headToHead: PairwiseHeadToHead[];
   /**
    * MACRO-AVERAGE of per-opponent head-to-head win rates: mean over opponents O
-   * of winsV_vs_O/(winsV_vs_O + winsO_vs_V). Each opponent counts once regardless
-   * of how many times it was faced, so beating the weakest variant repeatedly
-   * can't dominate. null when the variant had no decisive comparison against any
+   * of the SEVERITY-WEIGHTED wWinsV_vs_O/(wWinsV_vs_O + wWinsO_vs_V) (a soundness
+   * win weighs {@link SOUNDNESS_WEIGHT}). Each opponent counts once regardless of
+   * how many times it was faced, so beating the weakest variant repeatedly can't
+   * dominate. null when the variant had no decisive comparison against any
    * opponent. This is the rate the Craft Score uses.
    */
   headToHeadWinRate: number | null;
@@ -602,10 +610,34 @@ export interface PairwiseAggregate {
 }
 
 /**
+ * Weight a SOUNDNESS-implicating decisive verdict carries in the win RATES,
+ * relative to an ordinary stylistic verdict (weight 1). Issue #35: a comparison
+ * whose sole win caught a real open redirect the other diff shipped was tallied
+ * identically to a `../handler` import nit, so three stylistic nits "beat" one
+ * caught vulnerability. A soundness win counts as {@link SOUNDNESS_WEIGHT}
+ * stylistic wins in the RATE, so a lone soundness win is no longer outweighed by
+ * a couple of nits. FAIL-CLOSED: only an explicit `overall.severity ===
+ * "soundness"` on a decisive verdict earns the weight; a missing/invalid/tie
+ * severity is ordinary (weight 1), so a malformed field never inflates a rate.
+ * Chosen as 3: it exactly neutralizes the 1-soundness-vs-3-stylistic pathology
+ * (weighted 3–3, an even split) rather than a 1–3 loss, without letting one
+ * heavy win swamp a large stylistic majority.
+ */
+const SOUNDNESS_WEIGHT = 3;
+
+/** The weight a single decisive verdict contributes to the win RATES. */
+function severityWeight(p: PairwiseResult): number {
+  return p.overall.severity === "soundness" ? SOUNDNESS_WEIGHT : 1;
+}
+
+/**
  * Tally pairwise OVERALL winners per variant pair and per variant. Winners are
  * resolved through variantA/variantB (the post-randomization mapping), so the
  * "A"/"B" letters never leak into the tallies — except into the position-bias
- * audit, whose whole point is watching the presentation slot. Pure.
+ * audit, whose whole point is watching the presentation slot. Raw win/loss/tie
+ * counts drive the DISPLAY (W–L–T, decisive sample size, pair splits); the win
+ * RATES are computed from SEVERITY-WEIGHTED wins/losses ({@link severityWeight})
+ * so a soundness win outweighs a stylistic nit (issue #35). Pure.
  */
 export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate {
   const usable = pairwise.filter((p) => !p.judgeFailure);
@@ -613,10 +645,14 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
   const pairOrder: string[] = [];
   const pairs = new Map<string, PairwisePairAggregate>();
   const variantOrder: string[] = [];
-  const tallies = new Map<string, { wins: number; losses: number; ties: number }>();
+  // Raw counts drive display; wWins/wLosses (severity-weighted) drive the rates.
+  const tallies = new Map<
+    string,
+    { wins: number; losses: number; ties: number; wWins: number; wLosses: number }
+  >();
   const tally = (variant: string) => {
     if (!tallies.has(variant)) {
-      tallies.set(variant, { wins: 0, losses: 0, ties: 0 });
+      tallies.set(variant, { wins: 0, losses: 0, ties: 0, wWins: 0, wLosses: 0 });
       variantOrder.push(variant);
     }
     return tallies.get(variant)!;
@@ -624,11 +660,16 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
   // Per-variant, per-opponent decisive splits, keyed variant → opponent → w/l.
   // Opponent insertion order per variant is first-seen, so the macro-average is
   // stable and the headToHead array reads in the order pairs first appeared.
-  const h2h = new Map<string, Map<string, { wins: number; losses: number }>>();
+  // Raw wins/losses are exposed (shutout/decisive logic reads them); wWins/
+  // wLosses are the severity-weighted counts the per-opponent rate divides.
+  const h2h = new Map<
+    string,
+    Map<string, { wins: number; losses: number; wWins: number; wLosses: number }>
+  >();
   const h2hEntry = (variant: string, opponent: string) => {
     if (!h2h.has(variant)) h2h.set(variant, new Map());
     const opps = h2h.get(variant)!;
-    if (!opps.has(opponent)) opps.set(opponent, { wins: 0, losses: 0 });
+    if (!opps.has(opponent)) opps.set(opponent, { wins: 0, losses: 0, wWins: 0, wLosses: 0 });
     return opps.get(opponent)!;
   };
 
@@ -662,12 +703,21 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
     if (p.overall.winner === "A") aSlotWins++;
     const winner = p.overall.winner === "A" ? p.variantA : p.variantB;
     const loser = p.overall.winner === "A" ? p.variantB : p.variantA;
+    const weight = severityWeight(p);
     if (winner === pair.variantX) pair.winsX++;
     else pair.winsY++;
-    tallies.get(winner)!.wins++;
-    tallies.get(loser)!.losses++;
-    h2hEntry(winner, loser).wins++;
-    h2hEntry(loser, winner).losses++;
+    const w = tallies.get(winner)!;
+    const l = tallies.get(loser)!;
+    w.wins++;
+    w.wWins += weight;
+    l.losses++;
+    l.wLosses += weight;
+    const hw = h2hEntry(winner, loser);
+    const hl = h2hEntry(loser, winner);
+    hw.wins++;
+    hw.wWins += weight;
+    hl.losses++;
+    hl.wLosses += weight;
   }
 
   return {
@@ -675,15 +725,25 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
     pairs: pairOrder.map((k) => pairs.get(k)!),
     variants: variantOrder.map((v) => {
       const t = tallies.get(v)!;
-      const denom = t.wins + t.losses;
-      const headToHead: PairwiseHeadToHead[] = [...(h2h.get(v)?.entries() ?? [])].map(
-        ([opponent, wl]) => ({ opponent, wins: wl.wins, losses: wl.losses }),
+      const opps = [...(h2h.get(v)?.entries() ?? [])];
+      const headToHead: PairwiseHeadToHead[] = opps.map(([opponent, wl]) => ({
+        opponent,
+        wins: wl.wins,
+        losses: wl.losses,
+      }));
+      // Rates are SEVERITY-WEIGHTED (a soundness win weighs SOUNDNESS_WEIGHT);
+      // the exposed wins/losses/ties stay RAW for display, decisive-sample, and
+      // shutout logic. A weighted denom of 0 (no decisive comparison) → null.
+      const weightedDenom = t.wWins + t.wLosses;
+      const perOpponentRates = opps.map(
+        ([, wl]) => wl.wWins / (wl.wWins + wl.wLosses),
       );
-      const perOpponentRates = headToHead.map((h) => h.wins / (h.wins + h.losses));
       return {
         variant: v,
-        ...t,
-        winRate: denom > 0 ? t.wins / denom : null,
+        wins: t.wins,
+        losses: t.losses,
+        ties: t.ties,
+        winRate: weightedDenom > 0 ? t.wWins / weightedDenom : null,
         headToHead,
         headToHeadWinRate: perOpponentRates.length > 0 ? mean(perOpponentRates) : null,
       };
@@ -719,7 +779,7 @@ export function renderPairwise(pairwise: PairwiseResult[] | undefined): string {
   });
   const bias = `_Position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} decisive comparisons (expected ≈50%)._`;
   return [
-    "_Same-cell A/B craft comparisons (overall winner per comparison). Global win rate = wins/(wins+losses) pooled across all opponents; H2H win rate = macro-average of per-opponent head-to-head rates (each opponent weighted once — the rate the Craft Score consumes). Decisive = wins+losses; ties excluded from both rates._",
+    `_Same-cell A/B craft comparisons (overall winner per comparison). Win rates are SEVERITY-WEIGHTED: a soundness-implicating win (correctness/security/robustness) counts as ${SOUNDNESS_WEIGHT} stylistic wins, so a caught defect is not outweighed by a naming/import nit (fail-closed: a missing/invalid severity is ordinary weight). Global win rate = weighted wins/(weighted wins+losses) pooled across all opponents; H2H win rate = macro-average of per-opponent weighted head-to-head rates (each opponent weighted once — the rate the Craft Score consumes). Decisive = raw wins+losses; ties excluded from both rates._`,
     "",
     pairLines.join("\n"),
     "",
@@ -1208,11 +1268,11 @@ export function renderReliability(results: VariantTaskResult[]): string {
       ? "—"
       : `${g.craftScore.min.toFixed(1)} / ${g.craftScore.mean.toFixed(1)} / ${g.craftScore.max.toFixed(1)}`;
   const header =
-    `| Cell | Runs | Correctness | Craft score (min/mean/max) | Exec cost σ | Wall time σ | Naming | Structure | Consistency | Economy | Craft unknowns | Anchor grades |\n` +
-    `| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
+    `| Cell | Runs | Correctness | Craft score (min/mean/max) | Exec cost σ | Wall time σ | Naming | Structure | Consistency | Economy | Documentation | Craft unknowns | Anchor grades |\n` +
+    `| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
   const rows = groups.map(
     (g) =>
-      `| \`${g.taskId}\` × ${g.variant} [${g.executorModel}] | ${g.runCount} | ${correctness(g)} | ${craftScore(g)} | ${g.costStddevUsd === null ? "—" : fmtCost(g.costStddevUsd)} | ${fmtSeconds(g.wallMsStddev)} | ${range(g.craftRange.naming)} | ${range(g.craftRange.structure)} | ${range(g.craftRange.consistency)} | ${range(g.craftRange.economy)} | ${unknowns(g)} | ${agreement(g.anchorGrades)} |`,
+      `| \`${g.taskId}\` × ${g.variant} [${g.executorModel}] | ${g.runCount} | ${correctness(g)} | ${craftScore(g)} | ${g.costStddevUsd === null ? "—" : fmtCost(g.costStddevUsd)} | ${fmtSeconds(g.wallMsStddev)} | ${range(g.craftRange.naming)} | ${range(g.craftRange.structure)} | ${range(g.craftRange.consistency)} | ${range(g.craftRange.economy)} | ${range(g.craftRange.documentation)} | ${unknowns(g)} | ${agreement(g.anchorGrades)} |`,
   );
   return [
     "_Dispersion across --repeats runs of the same (task × variant × model) cell — the three major axes plus per-dimension craft ranges. Correctness = correct runs / runs with a verdict; Craft score = per-run mean-of-dimensions as min/mean/max; σ = population standard deviation of cost/time. Executor-failed repeats are excluded (coverage gaps, not variance). Observed, never a score component._",

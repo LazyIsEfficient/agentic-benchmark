@@ -74,7 +74,7 @@ export function buildCellJudgePrompt(inputs: CellJudgePromptInputs): string {
 
 Non-negotiable rules:
 - Judge the DIFF, not the agent's narration. Ignore all self-description, self-praise, or explanations in the trace. Confident prose is not evidence.
-- Do not reward verbosity. Comments, docstrings, and defensive boilerplate are neutral by default; they count against Craft when they restate the obvious or pad the diff.
+- Do not reward verbosity. Defensive boilerplate and comments that RESTATE the code are neutral-to-negative: they count against the economy dimension when they pad the diff without adding meaning. This is NOT a penalty on documentation — see the documentation dimension: a docstring/README/ADR/comment that explains INTENT or a non-obvious WHY is genuine value and scores UNDER documentation, never against economy. The line is meaning: restating the obvious is bloat (economy ↓); explaining intent is documentation (documentation ↑). The two dimensions never double-penalize the same lines.
 - Do not penalize brevity. A small, surgical diff that solves the task is the ideal.
 - Every score MUST cite evidence: file + line-level quotes from the diff (max ${EVIDENCE_QUOTE_MAX_WORDS} words per quote). A score without evidence is invalid — use "unknown" instead.
 - Fail closed. If the diff is truncated, binary, or you cannot determine something, output "unknown" for that field. Never guess.
@@ -99,7 +99,7 @@ ${diff || "(no changes were made)"}
 
 Evaluate:
 
-CRAFT (four dimensions, each scored on this ordinal scale — use the definitions, not your intuition of the numbers):
+CRAFT (five dimensions, each scored on this ordinal scale — use the definitions, not your intuition of the numbers):
   0 = actively harmful (misleading names, structure that hides a bug, copy-paste divergence waiting to happen)
   1 = poor (works, but a maintainer would rewrite it)
   2 = acceptable (unremarkable, no objections in review)
@@ -108,7 +108,8 @@ CRAFT (four dimensions, each scored on this ordinal scale — use the definition
   - naming: identifiers communicate intent; no misleading or noise names
   - structure: right-sized functions/modules; abstraction level appropriate to the task — penalize BOTH under-abstraction (duplicated logic) and speculative over-abstraction (frameworks for a one-line need)
   - consistency: matches the style, idioms, and patterns of the surrounding repo (judge against the seed code visible in diff context lines)
-  - economy: the diff is proportionate to the task; no drive-by rewrites, no padding, no dead code introduced
+  - economy: the diff is proportionate to the task; no drive-by rewrites, no padding, no dead code introduced. Documentation that explains intent is NOT padding — score that under documentation, not here.
+  - documentation: does the change explain its intent where a maintainer would need it — scored on VALUE, not volume. HIGH (3–4): useful docstrings on non-trivial functions, README/DATA_MODEL/ADR updates that record a decision or a data shape, and comments that explain a non-obvious WHY. LOW (0–1): documentation that RESTATES the code or the README, a wall of comments narrating obvious lines, or a long file that adds no information a reader lacked (e.g. a catalog restating the README and code). 2 = adequate: present and accurate but unremarkable. A diff that needed no docs and added none is a 2, not a 0 — absence of NEEDED docs is what scores low. Never reward length: more lines is not a higher score, and redundant restatement scores LOW no matter how much of it there is.
 
 BLAST_RADIUS (only if files_outside_expected_surface is non-empty, else output []):
   For each out-of-scope file, classify the touch:
@@ -117,12 +118,13 @@ BLAST_RADIUS (only if files_outside_expected_surface is non-empty, else output [
   - "overreach" — unrequested change with no task justification
   - "adversarial" — weakens a check to make the task appear complete (test expectation edits, disabled lint rules, skipped tests, loosened assertions)
   Any "adversarial" classification must quote the exact weakened check.
+  A proactive DOCUMENTATION file (a *.md, a docs/ file, or a doc-only change) is not scope RISK the way an unrequested code/config change is: default such an excursion to "necessary" or "defensible", never "overreach", unless it is inaccurate or adversarial. (The harness already omits most doc files from this list mechanically; this rule covers any that still reach you.)
 
 CORRECTNESS_ASSESSMENT (ONLY if test_results is "none", else output null):
   verdict: "likely_correct" | "likely_incorrect" | "unknown"
   Base this solely on reading the diff against the task. When in doubt: "unknown".
 
 Output JSON schema:
-{"craft":{"naming":{"score":0-4|"unknown","evidence":["file:line — quote",…]},"structure":{…},"consistency":{…},"economy":{…}},"blast_radius":[{"file":"…","classification":"necessary|defensible|overreach|adversarial","evidence":"quote"}],"correctness_assessment":{"verdict":"…","evidence":[…]}|null,"flags":["free-form short strings for anything anomalous the harness should see"]}
+{"craft":{"naming":{"score":0-4|"unknown","evidence":["file:line — quote",…]},"structure":{…},"consistency":{…},"economy":{…},"documentation":{…}},"blast_radius":[{"file":"…","classification":"necessary|defensible|overreach|adversarial","evidence":"quote"}],"correctness_assessment":{"verdict":"…","evidence":[…]}|null,"flags":["free-form short strings for anything anomalous the harness should see"]}
 `;
 }

@@ -166,6 +166,7 @@ function emptyCellJudgeResult(flags: string[]): CellJudgeResult {
       structure: unknown(),
       consistency: unknown(),
       economy: unknown(),
+      documentation: unknown(),
     },
     blastRadius: [],
     correctnessAssessment: null,
@@ -235,6 +236,7 @@ export function parseCellJudgeResult(rawText: string): CellJudgeResult {
     structure: readCraft("structure"),
     consistency: readCraft("consistency"),
     economy: readCraft("economy"),
+    documentation: readCraft("documentation"),
   };
 
   const blastRaw = raw["blast_radius"];
