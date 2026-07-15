@@ -1122,8 +1122,13 @@ async function main(): Promise<void> {
     for (const v of variants) console.log(formatVariantListLine(v));
     console.log("\nTasks:");
     for (const t of tasks) {
+      // Mark testOnly fixtures: they load for the integration tests and remain
+      // selectable via an explicit --task, but are skipped by the --all roster
+      // (their stub prompt yields an empty diff on a real run). Flag them so an
+      // operator scanning --list doesn't pick one and burn quota for no signal.
+      const testOnly = t.meta.testOnly ? " (testOnly — excluded from --all)" : "";
       console.log(
-        `  - ${t.meta.id}: ${t.meta.title} (logicBearing=${t.meta.logicBearing}, securityRelevant=${t.meta.securityRelevant})`,
+        `  - ${t.meta.id}: ${t.meta.title} (logicBearing=${t.meta.logicBearing}, securityRelevant=${t.meta.securityRelevant})${testOnly}`,
       );
     }
     return;
