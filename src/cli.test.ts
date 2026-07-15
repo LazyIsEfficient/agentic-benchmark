@@ -513,6 +513,45 @@ test("runCell: no expectedSurface ⇒ filesOutsideExpectedSurface stays absent; 
   assert.equal(result.testResults, undefined);
 });
 
+// Regression guard for issue #9: the executor-ok progress line must print the
+// DETERMINISTIC test verdict, never the `testFilesPresent` presence boolean —
+// a `tests=true` (test file touched) once read like "tests ran/passed" and
+// masked an all-empty Correctness column for a whole matrix. A revert of that
+// one line must fail here.
+async function captureCellLog(artifacts: RunArtifacts): Promise<string> {
+  const lines: string[] = [];
+  const orig = console.error;
+  console.error = (...args: unknown[]) => void lines.push(args.join(" "));
+  try {
+    const { deps } = stubDeps({ runVariant: async () => artifacts });
+    const cell: Cell = { executorModel: "sonnet", task: makeTask(), variant: NAKED };
+    await runCell(cell, false, PROGRESS(), "/tmp", deps);
+  } finally {
+    console.error = orig;
+  }
+  return lines.join("\n");
+}
+
+test("runCell log: executor-ok line reports the test VERDICT (`tests: none`), never `tests=<presence>` (#9)", async () => {
+  const log = await captureCellLog(makeArtifacts({ testFilesPresent: true }));
+  // testFilesPresent:true would print `tests=true` under the old masking bug.
+  assert.match(log, /executor: ok .*tests: none/);
+  assert.doesNotMatch(log, /tests=/);
+});
+
+test("runCell log: a real pass/fail verdict surfaces in the executor-ok line (#9)", async () => {
+  const pass = await captureCellLog(
+    makeArtifacts({ testResults: { command: "npm test", ok: true, passed: 3, failed: 0 } }),
+  );
+  assert.match(pass, /executor: ok .*tests: pass \(3p\/0f\)/);
+
+  const fail = await captureCellLog(
+    makeArtifacts({ testResults: { command: "npm test", ok: false, passed: 2, failed: 1 } }),
+  );
+  assert.match(fail, /executor: ok .*tests: fail \(2p\/1f\)/);
+  assert.doesNotMatch(fail, /tests=/);
+});
+
 test("runCell: a judge failure is absorbed — fail-closed verdict, judgeFailure set, cell survives", async () => {
   const failedOutcome = makeOutcome({
     result: makeVerdict({
