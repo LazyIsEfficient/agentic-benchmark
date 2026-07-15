@@ -306,6 +306,16 @@ export interface TaskMeta {
    * {@link CorrectnessAssessment}.
    */
   testCommand?: string;
+  /**
+   * True when the task CANNOT be deterministically tested in the bench container
+   * — its harness needs infra the image lacks (an external DB/service, generated
+   * client, or npm-installed deps), or it has no test harness at all. Such a task
+   * intentionally declares no {@link testCommand} and is scored by the judge's
+   * hedged {@link CorrectnessAssessment} ALONE. The distinction matters to the
+   * issue-#9 all-fallback warning: an empty deterministic verdict on a judgeOnly
+   * task is EXPECTED, not a misconfiguration, so it must not trip that warning.
+   */
+  judgeOnly?: boolean;
 }
 
 /** A resolved task: metadata + the prompt handed to the executor. */
@@ -742,6 +752,14 @@ export interface VariantTaskResult {
    * testCommand, i.e. "no executable tests" — NOT a failure.
    */
   testResults?: TestResults;
+  /**
+   * Mirror of {@link TaskMeta.judgeOnly}, stamped onto the cell at scoring time
+   * so report rendering (which reads the persisted {@link Report}, not the task
+   * metas) can tell an EXPECTED empty deterministic verdict from a #9-style
+   * misconfiguration. Absent/false = an ordinary cell whose empty Tests column
+   * still counts toward the all-fallback coverage warning.
+   */
+  judgeOnly?: boolean;
   /**
    * Changed files matching none of the task's expectedSurface globs — the
    * mechanical input to blast-radius judging. Absent when the task declares

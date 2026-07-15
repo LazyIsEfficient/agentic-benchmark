@@ -251,6 +251,13 @@ export interface CorrectnessAggregate {
   legacy: boolean;
   /** True when any member cell was disqualified (☠ marker in the table). */
   hasDisqualified: boolean;
+  /**
+   * Untested cells that are NOT {@link TaskMeta.judgeOnly} — a genuinely
+   * un-armed correctness cell. A judgeOnly task legitimately has no
+   * deterministic verdict, so it is excluded here; only these cells arm the
+   * issue-#9 all-fallback coverage warning.
+   */
+  nonJudgeOnlyUntestedCount: number;
 }
 
 /**
@@ -285,6 +292,7 @@ export function aggregateCorrectness(
         (r) => r.testResults === undefined && r.judge === undefined,
       ),
       hasDisqualified: members.some((r) => r.disqualified === true),
+      nonJudgeOnlyUntestedCount: untested.filter((r) => r.judgeOnly !== true).length,
     };
   });
 }
@@ -333,12 +341,16 @@ export function renderCorrectness(
  * report last time and shipped unnoticed. Surface it loudly instead: if there is
  * scored (non-legacy) correctness evidence but not a single deterministic test
  * verdict anywhere, prepend a warning. Returns [] (no warning) when the axis is
- * armed (some cell tested) or when there is nothing to score yet.
+ * armed (some cell tested), when there is nothing to score yet, or when every
+ * untested cell is {@link TaskMeta.judgeOnly} — a task that legitimately cannot
+ * run deterministic tests in-container, so its empty verdict is expected, not a
+ * missing-testCommand defect.
  */
 function correctnessCoverageWarning(aggregates: CorrectnessAggregate[]): string[] {
   const scored = aggregates.some((c) => !c.legacy);
   const anyTested = aggregates.some((c) => c.testedCount > 0);
-  if (!scored || anyTested) return [];
+  const anyGenuinelyUntested = aggregates.some((c) => c.nonJudgeOnlyUntestedCount > 0);
+  if (!scored || anyTested || !anyGenuinelyUntested) return [];
   return [
     "",
     "> ⚠️ **No deterministic test verdict ran in this matrix** — every Correctness cell fell back to the judge's hedged read. Declare a `testCommand` in the task's `meta.json` to arm the deterministic axis before trusting these numbers.",

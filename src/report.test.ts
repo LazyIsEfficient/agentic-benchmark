@@ -342,6 +342,47 @@ test("renderCorrectness: a legacy-only report (no evidence at all) does NOT trip
   assert.doesNotMatch(renderCorrectness([cell("old", "t1")]), /No deterministic test verdict ran/);
 });
 
+test("renderCorrectness: a judgeOnly-only matrix does NOT trip the #9 warning (issue #22)", () => {
+  // Every cell is judgeOnly — a task that legitimately cannot run deterministic
+  // tests in-container (needs a DB/service). An empty Tests column is EXPECTED
+  // here, so the all-fallback warning must stay silent.
+  const judgeOnlyMatrix = [
+    cell("a", "prisma", {
+      judgeOnly: true,
+      judge: judgeResult({
+        correctnessAssessment: { verdict: "likely_correct", evidence: ["fix looks right"] },
+      }),
+    }),
+    cell("a", "webhook", {
+      judgeOnly: true,
+      judge: judgeResult({
+        correctnessAssessment: { verdict: "likely_incorrect", evidence: ["missing replay guard"] },
+      }),
+    }),
+  ];
+  assert.doesNotMatch(renderCorrectness(judgeOnlyMatrix), /No deterministic test verdict ran/);
+});
+
+test("renderCorrectness: a genuinely-untested non-judgeOnly matrix STILL trips the #9 warning", () => {
+  // A judgeOnly cell alongside an ordinary cell that simply lacks a testCommand:
+  // the ordinary cell is a real coverage gap (the #22 bug), so the warning fires
+  // — judgeOnly suppression must not mask a genuine missing-testCommand defect.
+  const mixed = [
+    cell("a", "prisma", {
+      judgeOnly: true,
+      judge: judgeResult({
+        correctnessAssessment: { verdict: "likely_correct", evidence: ["ok"] },
+      }),
+    }),
+    cell("a", "safe-redirect", {
+      judge: judgeResult({
+        correctnessAssessment: { verdict: "likely_correct", evidence: ["looks wired"] },
+      }),
+    }),
+  ];
+  assert.match(renderCorrectness(mixed), /No deterministic test verdict ran/);
+});
+
 // --- Axis 2: Adherence — grade symbols + legacy fallback -----------------------
 
 test("gradeSymbol maps every grade to its compact symbol", () => {

@@ -8,5 +8,6 @@
     "package.json",
     "package-lock.json",
     "test/harness.test.mjs"
-  ]
+  ],
+  "testCommand": "npm test"
 }

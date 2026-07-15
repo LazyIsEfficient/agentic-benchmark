@@ -20,5 +20,6 @@
     "seed/src/strcase.test.mjs",
     "seed/src/table.test.mjs",
     "seed/scripts/gen.mjs"
-  ]
+  ],
+  "testCommand": "npm test"
 }
