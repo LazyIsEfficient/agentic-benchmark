@@ -700,6 +700,41 @@ test("campaign trajectory cells show grade symbols + legend when graded", () => 
   assert.match(md, /Grades: ✓A = held-by-abstraction/);
 });
 
+test("#37: renderCampaignMemoryEffect fires a ✓A headline callout when a campaign link grades held-by-abstraction, before the legend/trajectory", () => {
+  const abstraction: CampaignResult = {
+    variant: "agentic-os",
+    executorModel: "sonnet",
+    campaignId: "campaign-conventions",
+    tasks: [
+      campaignTaskResult(4, "t5-revisions", {
+        anchors: { conventionHeld: true, hitKnownTrap: false, evidence: "reused helper", grade: "held-by-abstraction" },
+      }),
+    ],
+  };
+  const md = renderCampaignMemoryEffect([abstraction]);
+  assert.match(md, /✓A held-by-abstraction:.*agentic-os on `t5-revisions`/);
+  assert.match(md, /reused a prior abstraction rather than re-emitting the convention literal/);
+  assert.match(md, /Mechanical, not scored\./);
+  // Headlined: before the legend and the trajectory grid, not buried in a cell.
+  assert.ok(md.indexOf("✓A held-by-abstraction:") < md.indexOf("Grades:"), "callout before the legend");
+  assert.ok(md.indexOf("✓A held-by-abstraction:") < md.indexOf("| Task |"), "callout before the trajectory");
+});
+
+test("#37: no ✓A callout when no campaign link grades held-by-abstraction", () => {
+  // graded chain of literal/trap/inertia — a hold, but never the abstraction generalization.
+  const noAbstraction: CampaignResult = {
+    variant: "gstack",
+    executorModel: "sonnet",
+    campaignId: "c",
+    tasks: [
+      campaignTaskResult(2, "l2", {
+        anchors: { conventionHeld: true, hitKnownTrap: false, evidence: "e", grade: "held-by-literal" },
+      }),
+    ],
+  };
+  assert.doesNotMatch(renderCampaignMemoryEffect([noAbstraction]), /✓A held-by-abstraction:/);
+});
+
 test("renderReportMarkdown surfaces the campaign memory effect; buildReportJson structures it", () => {
   const report = makeReport({
     taskId: "campaign-conventions",

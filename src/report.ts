@@ -2079,6 +2079,27 @@ export function renderCampaignMemoryEffect(campaigns: CampaignResult[]): string 
     c.tasks.some((t) => t.anchors?.grade !== undefined),
   );
 
+  // ✓A headline (issue #37): held-by-abstraction is the strongest memory signal
+  // (the bundle GENERALIZED the convention instead of re-emitting the literal).
+  // The first-ever ✓A was earned in a campaign, not a single-shot task, so mirror
+  // renderMemoryEffect's callout here — fire only when at least one campaign link
+  // grades held-by-abstraction, naming the bundle(s) + link(s). Mechanical text;
+  // this section is not scored.
+  const abstractionWins = campaigns.flatMap((c) =>
+    c.tasks
+      .filter((t) => t.anchors?.grade === "held-by-abstraction")
+      .map((t) => `${label(c)} on \`${cellText(t.taskId)}\``),
+  );
+  const abstractionCallout =
+    abstractionWins.length === 0
+      ? []
+      : [
+          `> **✓A held-by-abstraction:** ${abstractionWins.join(
+            ", ",
+          )} reused a prior abstraction rather than re-emitting the convention literal — the strongest memory signal. Mechanical, not scored.`,
+          "",
+        ];
+
   // Headline cumulative adherence delta — the memory-vs-memoryless contrast.
   // Keeps the `adhered/anchored` fraction, then breaks the rest into drift vs
   // trap (issue #15) so the summary never collapses "wrote something else" and
@@ -2119,6 +2140,7 @@ export function renderCampaignMemoryEffect(campaigns: CampaignResult[]): string 
   });
 
   return [
+    ...abstractionCallout,
     `**Cumulative adherence:** ${headline}`,
     "",
     "_Anchored links whose required convention held, per bundle — a memory bundle should stay consistent across the chain while a memoryless one drifts. Anchors are mechanical (not the judge)._",
