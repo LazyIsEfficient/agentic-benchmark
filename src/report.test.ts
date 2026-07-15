@@ -1181,6 +1181,34 @@ test("aggregatePairwise: shuffled orientations fold into one pair; ties excluded
   assert.match(md, /A-slot won 2 of 2 decisive comparisons \(expected ≈50%\)/);
 });
 
+test("aggregatePairwise/renderPairwise: both-order mode renders position-cancelled, not a slot %", () => {
+  const comparisons = [
+    pairwiseResult("alpha", "bravo", "A", { bothOrders: true }),
+    pairwiseResult("alpha", "bravo", "tie", { bothOrders: true }),
+  ];
+  const agg = aggregatePairwise(comparisons);
+  assert.equal(agg.bothOrders, true);
+  const md = renderPairwise(comparisons);
+  // The misleading "A-slot won X of N (expected ≈50%)" line is gone; the audit
+  // states the construction instead.
+  assert.doesNotMatch(md, /expected ≈50%/);
+  assert.match(md, /both-order mode/);
+  assert.match(md, /cancelled by construction/);
+  assert.match(md, /1 decisive comparison/);
+});
+
+test("aggregatePairwise: mixed both-order and single-order comparisons ⇒ not both-order mode", () => {
+  const agg = aggregatePairwise([
+    pairwiseResult("alpha", "bravo", "A", { bothOrders: true }),
+    pairwiseResult("alpha", "bravo", "A"), // single-order
+  ]);
+  assert.equal(agg.bothOrders, false);
+  assert.match(renderPairwise([
+    pairwiseResult("alpha", "bravo", "A", { bothOrders: true }),
+    pairwiseResult("alpha", "bravo", "A"),
+  ]), /expected ≈50%/);
+});
+
 test("renderPairwise: ties-only variant renders — win rate; absent pairwise is a one-liner", () => {
   const agg = aggregatePairwise([pairwiseResult("a1", "b1", "tie")]);
   assert.equal(agg.variants[0]!.headToHeadWinRate, null); // no decisive opponent

@@ -161,6 +161,18 @@ legitimate and expected verdict; a judge failure degrades to all-tie (a dead
 judge can never move rankings). On by default — disable with `--no-pairwise` /
 `BENCH_PAIRWISE=0` to halve judge cost on exploratory runs.
 
+Per-call randomization cancels position bias only *in expectation*; at the ~4–8
+decisive comparisons a real run produces it does not cancel *within* a run.
+`--pairwise-both-orders` (opt-in — it doubles the pairwise judge cost) instead
+judges each pair in BOTH seatings and combines: a variant wins the comparison
+only if it wins in both orders (or wins one and ties the other); a winner that
+flips on order-swap resolves to **tie** (the verdict was position-dependent, not
+craft-driven). The same rule applies per craft dimension and to the severity
+tag, and if either order fails the whole comparison degrades to tie. In this
+mode the position-bias audit is ~50% by construction, so the report renders
+"position-cancelled" rather than a slot percentage. Default off preserves
+today's single-order cost and behavior.
+
 ### Blast radius (`expectedSurface`)
 
 A task — or an individual campaign link, whose declaration overrides the task's

@@ -3,9 +3,16 @@ import { test } from "node:test";
 import { JUDGE_MAX_ATTEMPTS, MAX_DIFF_BYTES } from "./config.js";
 import {
   buildPairwisePrompt,
+  combineBothOrderVerdicts,
   judgePair,
   parsePairwiseJudgeOutput,
 } from "./pairwise.js";
+import type { JudgePairInputs } from "./pairwise.js";
+import type {
+  PairwiseResult,
+  PairwiseSeverity,
+  PairwiseWinner,
+} from "./types.js";
 
 // --- buildPairwisePrompt -------------------------------------------------------
 
@@ -504,4 +511,177 @@ test("judgePair fails closed to all-tie when transport dies on every attempt", a
     assert.equal(r.dimensions[dim].winner, "tie");
   }
   assert.deepEqual(r.overall, { winner: "tie", rationale: "", severity: "style" });
+});
+
+// --- both-order combine (issue #36) --------------------------------------------
+
+const ALL_DIMS = [
+  "naming",
+  "structure",
+  "consistency",
+  "economy",
+  "documentation",
+  "testing",
+] as const;
+
+/**
+ * Build ONE single-order verdict. `firstAsA` sets the seating: true ⇒ the first
+ * variant (bundle-v1) was shown as A. Winners are given as LETTERS (the judge's
+ * frame); the combine reads them back through variantA/variantB.
+ */
+function mkOrder(opts: {
+  firstAsA: boolean;
+  winner: PairwiseWinner;
+  naming?: PairwiseWinner;
+  severity?: PairwiseSeverity;
+  judgeFailure?: string;
+}): PairwiseResult {
+  const dim = (w: PairwiseWinner) => ({ winner: w, evidenceA: "ea", evidenceB: "eb" });
+  return {
+    taskId: "rate-limiter",
+    executorModel: "sonnet",
+    variantA: opts.firstAsA ? "bundle-v1" : "claude-md-only",
+    variantB: opts.firstAsA ? "claude-md-only" : "bundle-v1",
+    dimensions: {
+      naming: dim(opts.naming ?? "tie"),
+      structure: dim("tie"),
+      consistency: dim("tie"),
+      economy: dim("tie"),
+      documentation: dim("tie"),
+      testing: dim("tie"),
+    },
+    overall: { winner: opts.winner, rationale: "r", severity: opts.severity ?? "style" },
+    ...(opts.judgeFailure ? { judgeFailure: opts.judgeFailure } : {}),
+  };
+}
+
+const combineInputs: JudgePairInputs = {
+  taskId: "rate-limiter",
+  executorModel: "sonnet",
+  taskPrompt: "Add a rate limiter.",
+  first: { variant: "bundle-v1", diff: "+a", anchor: "none", tests: "none" },
+  second: { variant: "claude-md-only", diff: "+b", anchor: "none", tests: "none" },
+};
+
+test("combineBothOrderVerdicts: agree in both orders ⇒ that variant wins, canonical A=first", () => {
+  // bundle-v1 (first) wins in BOTH seatings: as A in order1, as B in order2.
+  const r = combineBothOrderVerdicts(
+    combineInputs,
+    mkOrder({ firstAsA: true, winner: "A", naming: "A" }),
+    mkOrder({ firstAsA: false, winner: "B", naming: "B" }),
+  );
+  assert.equal(r.bothOrders, true);
+  assert.equal(r.variantA, "bundle-v1"); // canonical: A = first
+  assert.equal(r.variantB, "claude-md-only");
+  assert.equal(r.overall.winner, "A"); // first (bundle-v1) won
+  assert.equal(r.dimensions.naming.winner, "A");
+  assert.equal(r.judgeFailure, undefined);
+});
+
+test("combineBothOrderVerdicts: winner FLIPS on order-swap ⇒ tie (overall AND dimension)", () => {
+  // The A slot wins in BOTH orders — pure position bias. first won order1 (as A),
+  // second won order2 (as A). Decisive disagreement ⇒ tie.
+  const r = combineBothOrderVerdicts(
+    combineInputs,
+    mkOrder({ firstAsA: true, winner: "A", naming: "A" }),
+    mkOrder({ firstAsA: false, winner: "A", naming: "A" }),
+  );
+  assert.equal(r.overall.winner, "tie");
+  assert.match(r.overall.rationale, /flipped/);
+  assert.equal(r.dimensions.naming.winner, "tie");
+  assert.equal(r.overall.severity, "style");
+});
+
+test("combineBothOrderVerdicts: wins one order, ties the other ⇒ still wins", () => {
+  const r = combineBothOrderVerdicts(
+    combineInputs,
+    mkOrder({ firstAsA: true, winner: "A" }), // first wins
+    mkOrder({ firstAsA: false, winner: "tie" }), // tie
+  );
+  assert.equal(r.overall.winner, "A"); // first
+});
+
+test("combineBothOrderVerdicts: severity is soundness only when BOTH decisive orders agree soundness", () => {
+  const both = combineBothOrderVerdicts(
+    combineInputs,
+    mkOrder({ firstAsA: true, winner: "A", severity: "soundness" }),
+    mkOrder({ firstAsA: false, winner: "B", severity: "soundness" }),
+  );
+  assert.equal(both.overall.winner, "A");
+  assert.equal(both.overall.severity, "soundness");
+
+  // One order calls it style ⇒ the soundness claim is position-dependent ⇒ style.
+  const mixed = combineBothOrderVerdicts(
+    combineInputs,
+    mkOrder({ firstAsA: true, winner: "A", severity: "soundness" }),
+    mkOrder({ firstAsA: false, winner: "B", severity: "style" }),
+  );
+  assert.equal(mixed.overall.winner, "A");
+  assert.equal(mixed.overall.severity, "style");
+});
+
+test("combineBothOrderVerdicts: either order failing degrades the whole comparison to tie", () => {
+  const r = combineBothOrderVerdicts(
+    combineInputs,
+    mkOrder({ firstAsA: true, winner: "A", severity: "soundness" }),
+    mkOrder({ firstAsA: false, winner: "B", judgeFailure: "boom" }),
+  );
+  assert.ok(r.judgeFailure);
+  assert.match(r.judgeFailure!, /both-order degraded/);
+  assert.match(r.judgeFailure!, /first-as-B: boom/);
+  assert.equal(r.overall.winner, "tie");
+  assert.equal(r.overall.severity, "style");
+  for (const dim of ALL_DIMS) assert.equal(r.dimensions[dim].winner, "tie");
+  assert.equal(r.bothOrders, true); // still tagged: it WAS a both-order attempt
+});
+
+test("judgePair bothOrders=true issues TWO judge calls (both seatings) and tags the result", async () => {
+  const prompts: string[] = [];
+  // Both orders let the A slot win ⇒ combine resolves to tie (position bias).
+  const r = await judgePair(pairInputs, {
+    bothOrders: true,
+    runJudgeFn: async ({ judgePrompt }) => {
+      prompts.push(judgePrompt);
+      return pairEnvelope(JSON.stringify(validPairwisePayload)); // overall winner "A"
+    },
+  });
+  assert.equal(prompts.length, 2); // one per seating
+  assert.equal(r.bothOrders, true);
+  assert.equal(r.variantA, "bundle-v1"); // canonical A = first
+  assert.equal(r.variantB, "claude-md-only");
+  // validPairwisePayload always names "A": order1 A=first, order2 A=second ⇒ flip ⇒ tie.
+  assert.equal(r.overall.winner, "tie");
+  // The two prompts show the seatings swapped.
+  assert.ok(diffSection(prompts[0]!, "A").includes("+const first = 1;"));
+  assert.ok(diffSection(prompts[1]!, "A").includes("+const second = 2;"));
+});
+
+test("judgePair bothOrders=true: consistent craft winner survives the order swap", async () => {
+  let call = 0;
+  const r = await judgePair(pairInputs, {
+    bothOrders: true,
+    runJudgeFn: async () => {
+      call++;
+      // first (bundle-v1) wins in both seatings: as A in order1, as B in order2.
+      const winner = call === 1 ? "A" : "B";
+      return pairEnvelope(
+        JSON.stringify({ ...validPairwisePayload, overall: { winner, rationale: "r", severity: "style" } }),
+      );
+    },
+  });
+  assert.equal(r.overall.winner, "A"); // first won decisively in both orders
+  assert.equal(r.judgeFailure, undefined);
+});
+
+test("judgePair default (single order) is unchanged — one call, no bothOrders tag", async () => {
+  const prompts: string[] = [];
+  const r = await judgePair(pairInputs, {
+    rng: () => 0.1,
+    runJudgeFn: async ({ judgePrompt }) => {
+      prompts.push(judgePrompt);
+      return pairEnvelope(JSON.stringify(validPairwisePayload));
+    },
+  });
+  assert.equal(prompts.length, 1);
+  assert.equal(r.bothOrders, undefined);
 });

@@ -608,6 +608,13 @@ export interface PairwiseAggregate {
   variants: PairwiseVariantAggregate[];
   /** How often the "A" presentation slot won — should hover near 50%. */
   positionBias: { aSlotWins: number; decisive: number };
+  /**
+   * True when EVERY usable comparison was judged in both seatings (issue #36).
+   * In that mode the A slot is canonical (A = first-listed variant), so
+   * positionBias is NOT a slot-bias signal — it is cancelled by construction and
+   * the audit line renders that instead of a misleading percentage.
+   */
+  bothOrders: boolean;
 }
 
 /**
@@ -750,6 +757,7 @@ export function aggregatePairwise(pairwise: PairwiseResult[]): PairwiseAggregate
       };
     }),
     positionBias: { aSlotWins, decisive },
+    bothOrders: usable.length > 0 && usable.every((p) => p.bothOrders === true),
   };
 }
 
@@ -778,7 +786,13 @@ export function renderPairwise(pairwise: PairwiseResult[] | undefined): string {
       v.headToHeadWinRate === null ? "—" : `${Math.round(v.headToHeadWinRate * 100)}%`;
     return `| ${v.variant} | ${global} | ${h2h} | ${v.wins + v.losses} | ${v.wins}–${v.losses}–${v.ties} |`;
   });
-  const bias = `_Position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} decisive comparisons (expected ≈50%)._`;
+  // In both-order mode each pair is judged in BOTH seatings and combined, so the
+  // A slot is canonical (A = first-listed variant) and position bias is
+  // cancelled per comparison — the old "A-slot won X of N" line would misread as
+  // a bias signal, so render the construction instead (issue #36).
+  const bias = agg.bothOrders
+    ? `_Position-bias audit: both-order mode — every pair judged in both seatings and combined, so position bias is cancelled by construction (order-dependent verdicts resolve to tie). ${agg.positionBias.decisive} decisive comparison(s)._`
+    : `_Position-bias audit: A-slot won ${agg.positionBias.aSlotWins} of ${agg.positionBias.decisive} decisive comparisons (expected ≈50%)._`;
   return [
     `_Same-cell A/B craft comparisons (overall winner per comparison). Win rates are SEVERITY-WEIGHTED: a soundness-implicating win (correctness/security/robustness) counts as ${SOUNDNESS_WEIGHT} stylistic wins, so a caught defect is not outweighed by a naming/import nit (fail-closed: a missing/invalid severity is ordinary weight). Global win rate = weighted wins/(weighted wins+losses) pooled across all opponents; H2H win rate = macro-average of per-opponent weighted head-to-head rates (each opponent weighted once — the rate the Craft Score consumes). Decisive = raw wins+losses; ties excluded from both rates._`,
     "",
