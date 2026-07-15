@@ -360,7 +360,11 @@ test("renderCorrectness: a judgeOnly-only matrix does NOT trip the #9 warning (i
       }),
     }),
   ];
-  assert.doesNotMatch(renderCorrectness(judgeOnlyMatrix), /No deterministic test verdict ran/);
+  const md = renderCorrectness(judgeOnlyMatrix);
+  assert.doesNotMatch(md, /No deterministic test verdict ran/);
+  // The Tests column must SHOW the intentional grade, not a bare `—`, so a
+  // reader can tell "judge-only by design" from "forgot the testCommand".
+  assert.match(md, /\| a \| sonnet \| judge-only \|/);
 });
 
 test("renderCorrectness: a genuinely-untested non-judgeOnly matrix STILL trips the #9 warning", () => {
@@ -380,7 +384,11 @@ test("renderCorrectness: a genuinely-untested non-judgeOnly matrix STILL trips t
       }),
     }),
   ];
-  assert.match(renderCorrectness(mixed), /No deterministic test verdict ran/);
+  const md = renderCorrectness(mixed);
+  assert.match(md, /No deterministic test verdict ran/);
+  // Mixed row: the genuine gap stays `—`, but the judge-only cell is still
+  // annotated so its intentional grading is not hidden by the gap token.
+  assert.match(md, /\| a \| sonnet \| — \(1 judge-only\) \|/);
 });
 
 // --- Axis 2: Adherence — grade symbols + legacy fallback -----------------------

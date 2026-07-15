@@ -20,5 +20,5 @@
     "seed/src/dispatch.ts",
     "seed/src/handlers/ping.ts"
   ],
-  "testCommand": "npm test"
+  "judgeOnly": true
 }
