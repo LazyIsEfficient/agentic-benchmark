@@ -1050,7 +1050,7 @@ export function renderReliability(results: VariantTaskResult[]): string {
       `| \`${g.taskId}\` × ${g.variant} [${g.executorModel}] | ${g.runCount} | ${correctness(g)} | ${craftScore(g)} | ${g.costStddevUsd === null ? "—" : fmtCost(g.costStddevUsd)} | ${fmtSeconds(g.wallMsStddev)} | ${range(g.craftRange.naming)} | ${range(g.craftRange.structure)} | ${range(g.craftRange.consistency)} | ${range(g.craftRange.economy)} | ${unknowns(g)} | ${agreement(g.anchorGrades)} |`,
   );
   return [
-    "_Dispersion across --repeats runs of the same (task × variant × model) cell — the three major axes plus per-dimension craft ranges. Correctness = agreeing runs / runs with a verdict; Craft score = per-run mean-of-dimensions as min/mean/max; σ = population standard deviation of cost/time. Executor-failed repeats are excluded (coverage gaps, not variance). Observed, never a score component._",
+    "_Dispersion across --repeats runs of the same (task × variant × model) cell — the three major axes plus per-dimension craft ranges. Correctness = correct runs / runs with a verdict; Craft score = per-run mean-of-dimensions as min/mean/max; σ = population standard deviation of cost/time. Executor-failed repeats are excluded (coverage gaps, not variance). Observed, never a score component._",
     "",
     [header, ...rows].join("\n"),
     "",
