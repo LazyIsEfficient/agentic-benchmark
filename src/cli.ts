@@ -431,7 +431,10 @@ function selectVariants(all: Variant[], names: string[]): Variant[] {
 }
 
 function selectTasks(all: Task[], taskId?: string): Task[] {
-  if (!taskId) return all;
+  // Implicit roster (`--all`): drop `testOnly` fixtures — synthetic tasks whose
+  // stub prompt yields an empty diff on a real run and only exist to feed the
+  // fake-executor integration tests. An explicit `--task <id>` still selects one.
+  if (!taskId) return all.filter((task) => !task.meta.testOnly);
   const t = all.filter((task) => task.meta.id === taskId);
   if (t.length === 0) throw new Error(`Unknown task id: ${taskId}`);
   return t;
@@ -1123,8 +1126,13 @@ async function main(): Promise<void> {
     for (const v of variants) console.log(formatVariantListLine(v));
     console.log("\nTasks:");
     for (const t of tasks) {
+      // Mark testOnly fixtures: they load for the integration tests and remain
+      // selectable via an explicit --task, but are skipped by the --all roster
+      // (their stub prompt yields an empty diff on a real run). Flag them so an
+      // operator scanning --list doesn't pick one and burn quota for no signal.
+      const testOnly = t.meta.testOnly ? " (testOnly — excluded from --all)" : "";
       console.log(
-        `  - ${t.meta.id}: ${t.meta.title} (logicBearing=${t.meta.logicBearing}, securityRelevant=${t.meta.securityRelevant})`,
+        `  - ${t.meta.id}: ${t.meta.title} (logicBearing=${t.meta.logicBearing}, securityRelevant=${t.meta.securityRelevant})${testOnly}`,
       );
     }
     return;
