@@ -919,7 +919,7 @@ export function aggregateMetrics(
 /** The Efficiency markdown table (with a Model column) + observed-only note. */
 export function renderRunMetrics(results: VariantTaskResult[]): string {
   const header =
-    `| Variant | Model | Exec time (s) | Exec cost (USD) | Input tok | Output tok | Turns | Judge cost (USD) |\n` +
+    `| Variant | Model | Exec time (s) | Exec cost (USD) | Input tok (uncached) | Output tok | Turns | Judge cost (USD) |\n` +
     `| --- | --- | --- | --- | --- | --- | --- | --- |`;
 
   const rows = aggregateMetrics(results).map(

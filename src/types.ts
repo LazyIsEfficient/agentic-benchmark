@@ -364,9 +364,18 @@ export interface Behavior {
  * would-be-API proxy).
  */
 export interface ClaudeUsage {
+  /**
+   * UNCACHED (cache-miss) input tokens only — NOT total context cost. In a
+   * multi-turn agent loop most of the prompt is served from the prompt cache
+   * and billed under `cacheReadTokens`, so this figure is typically tiny
+   * (tens of tokens/turn) and must not be rendered as "total input". Real
+   * input context cost = inputTokens + cacheReadTokens + cacheCreateTokens.
+   */
   inputTokens: number;
   outputTokens: number;
+  /** Input tokens read from the prompt cache — the bulk of context in agent loops. */
   cacheReadTokens: number;
+  /** Input tokens written to the prompt cache on first use. */
   cacheCreateTokens: number;
 }
 
