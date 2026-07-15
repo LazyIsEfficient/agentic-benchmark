@@ -25,7 +25,8 @@ import { judgeCell, writeRunResult } from "./judge.js";
 import type { JudgeCellOutcome } from "./judge.js";
 import { judgePair } from "./pairwise.js";
 import type { JudgePairInputs } from "./pairwise.js";
-import { aggregatePairwise, regenerateReport, writeReport } from "./report.js";
+import { aggregatePairwise, regenerateReport, writeReport, FOCUS_AXES } from "./report.js";
+import type { FocusAxis } from "./report.js";
 import type { CellJudgePromptInputs } from "./rubric.js";
 import { addedLines, computeSlopMetrics } from "./slop.js";
 import { expectedSurfaceFor, filesOutsideExpectedSurface } from "./surface.js";
@@ -258,7 +259,25 @@ interface Args {
   noPairwise: boolean;
   /** --report <path>: regenerate a report from a finished run (offline). */
   reportPath?: string;
+  /** --focus <axis>: render only the named axis's section(s) + run header. */
+  focus?: FocusAxis;
   help: boolean;
+}
+
+/**
+ * Validate a raw --focus token against the accepted axes. Throws a clear,
+ * enumerated error on an unknown value so a typo fails fast instead of silently
+ * rendering the full report. Pure/testable.
+ */
+export function parseFocus(raw: string | undefined): FocusAxis | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if ((FOCUS_AXES as readonly string[]).includes(trimmed)) {
+    return trimmed as FocusAxis;
+  }
+  throw new Error(
+    `--focus must be one of: ${FOCUS_AXES.join(", ")}; got "${raw}".`,
+  );
 }
 
 function parseArgs(argv: string[]): Args {
@@ -307,6 +326,9 @@ function parseArgs(argv: string[]): Args {
         break;
       case "--report":
         args.reportPath = argv[++i];
+        break;
+      case "--focus":
+        args.focus = parseFocus(argv[++i]);
         break;
       default:
         throw new Error(`Unknown argument: ${a}`);
@@ -414,6 +436,9 @@ Usage:
                                           (also BENCH_PAIRWISE=0)
   npm run bench -- --report <path>        Regenerate report.md/json from a finished
                                           run (folder or report.json) — offline
+  npm run bench -- --focus <axis>         Render only one concern's section(s) + the
+                                          run header. axis ∈ correctness | memory |
+                                          craft | efficiency | blast-radius
 
 Prereqs: build the image (npm run build-image) and authenticate once
 (npm run setup-auth). See README for the isolation model.`;
@@ -1114,7 +1139,7 @@ async function main(): Promise<void> {
   // Offline: regenerate a finished run's report with the current aggregation.
   // No containers, no auth, no executor/judge calls.
   if (args.reportPath) {
-    const { jsonPath, mdPath } = await regenerateReport(args.reportPath);
+    const { jsonPath, mdPath } = await regenerateReport(args.reportPath, args.focus);
     console.error(`Report regenerated:\n  ${mdPath}\n  ${jsonPath}`);
     return;
   }
@@ -1288,7 +1313,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const { jsonPath, mdPath } = await writeReport(report, runDir);
+  const { jsonPath, mdPath } = await writeReport(report, runDir, args.focus);
   console.error(`\nReport written:\n  ${mdPath}\n  ${jsonPath}`);
 }
 

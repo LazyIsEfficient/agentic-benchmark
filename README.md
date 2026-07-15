@@ -264,7 +264,29 @@ npm run bench -- --all --delay-ms 5000      # pace cells to ease rate limits
 npm run bench -- --all --repeats 3          # run each cell 3× (Reliability: cross-run variance)
 npm run bench -- --all --no-pairwise        # skip A/B craft judging (halves judge cost)
 npm run bench -- --report reports/<run>/    # regenerate a report from a finished run (offline)
+npm run bench -- --report reports/<run>/ --focus craft   # focused re-render: one concern only
 ```
+
+### Focused reports: `--focus <axis>`
+
+`--focus <axis>` renders a **focused report** — only the named concern's
+section(s) plus the run header — instead of the full multi-axis report. Handy
+when iterating on one dimension (e.g. tuning a CLAUDE.md's craft or memory
+doctrine) without scrolling past the other axes. Accepted axes:
+
+| `--focus` | Renders |
+| --- | --- |
+| `correctness` | Correctness table |
+| `memory` | Memory effect (single-shot and/or campaign) |
+| `craft` | Slop, judge craft, pairwise, Craft Score |
+| `efficiency` | Cost / time / turns table |
+| `blast-radius` | Out-of-scope file excursions |
+
+An unknown axis fails fast with the accepted set enumerated. The cross-task
+insight callout and the observational tails (Reliability, Excluded cells,
+Behavioral signals) are full-report only and are dropped in a focused render.
+`report.json` is always the complete payload — `--focus` only narrows the
+rendered `report.md`, so it composes with `--report` for an offline re-render.
 
 ### The benchmark matrix: variant × task × executor model
 

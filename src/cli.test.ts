@@ -13,6 +13,7 @@ import {
   loadVariants,
   parseConcurrency,
   parseDelayMs,
+  parseFocus,
   parseModels,
   parseRepeats,
   resultSortComparator,
@@ -123,6 +124,24 @@ test("parseRepeats: zero, negative, and non-numeric throw", () => {
   assert.throws(() => parseRepeats("-2"), /positive integer|>= 1/);
   assert.throws(() => parseRepeats("abc"), /positive integer/);
   assert.throws(() => parseRepeats("2.5"), /positive integer/);
+});
+
+test("parseFocus: missing → undefined (full report)", () => {
+  assert.equal(parseFocus(undefined), undefined);
+});
+
+test("parseFocus: each accepted axis passes through (trimmed)", () => {
+  assert.equal(parseFocus("correctness"), "correctness");
+  assert.equal(parseFocus("memory"), "memory");
+  assert.equal(parseFocus("craft"), "craft");
+  assert.equal(parseFocus("efficiency"), "efficiency");
+  assert.equal(parseFocus(" blast-radius "), "blast-radius");
+});
+
+test("parseFocus: unknown axis throws, naming the accepted set", () => {
+  assert.throws(() => parseFocus("reliability"), /--focus must be one of/);
+  assert.throws(() => parseFocus("reliability"), /blast-radius/);
+  assert.throws(() => parseFocus(""), /--focus must be one of/);
 });
 
 test("formatTestResultsSummary: none / pass / fail / counted", () => {
