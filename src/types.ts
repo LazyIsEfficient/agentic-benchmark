@@ -649,8 +649,20 @@ export interface CellJudgeResult {
  * from the diff by hand.
  */
 export interface SlopMetrics {
-  /** Count of duplicated added-line windows in the diff (normalized). */
+  /**
+   * Count of duplicated added-line windows in the diff (normalized), over
+   * PRODUCTION files only — doc and test files are excluded so thoroughness the
+   * Craft judge rewards is not double-penalized here (issue #43).
+   */
   duplicationDelta: number;
+  /**
+   * Per-file audit trail for {@link duplicationDelta}: a capped array of the
+   * windows that actually repeated, so a bare count can be checked against the
+   * source — repetitive production bloat vs. a false positive. Mirrors
+   * {@link testTamper}'s evidence. Optional for backward-compat: legacy slop
+   * objects (old report.json) lack it; computeSlopMetrics always sets it.
+   */
+  duplicationEvidence?: { file: string; excerpt: string }[];
   /**
    * Campaign links only: fraction of lines added by earlier links that this
    * link deletes — high churn means the chain is rewriting its own work.

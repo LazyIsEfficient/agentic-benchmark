@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { addedLines, computeSlopMetrics, removedLines } from "./slop.js";
+import { addedLines, computeSlopMetrics, isTestFile, removedLines } from "./slop.js";
 
 // --- Fixture diffs (unified git diff strings) --------------------------------
 
@@ -248,6 +248,92 @@ test("windows with fewer than 3 non-empty lines are skipped even when duplicated
 
 test("windows under 40 significant chars (brace noise) are skipped even when duplicated", () => {
   assert.equal(computeSlopMetrics({ diff: DUP_BRACE_NOISE }).duplicationDelta, 0);
+});
+
+test("duplication carries capped per-file evidence for the windows that repeated", () => {
+  const m = computeSlopMetrics({ diff: DUP_TWICE_ONE_FILE });
+  assert.equal(m.duplicationDelta, 1);
+  assert.equal(m.duplicationEvidence?.length, 1);
+  assert.equal(m.duplicationEvidence?.[0]?.file, "src/a.ts");
+  assert.match(m.duplicationEvidence?.[0]?.excerpt ?? "", /const total = items\.reduce/);
+});
+
+test("a clean production diff records no duplication evidence", () => {
+  const m = computeSlopMetrics({ diff: DUP_ACROSS_FILES.replace(/src\/b\.ts/g, "docs/b.md") });
+  // (a.ts still holds the block once; nothing repeats in production) → no evidence
+  assert.equal(m.duplicationDelta, 0);
+  assert.deepEqual(m.duplicationEvidence, []);
+});
+
+// --- doc/test exclusion from production-code hygiene (#43) -------------------------
+
+/** The duplicated block twice in a TEST file — must NOT inflate duplication. */
+const DUP_IN_TEST_FILE = `diff --git a/src/a.test.ts b/src/a.test.ts
+--- a/src/a.test.ts
++++ b/src/a.test.ts
+@@ -1,2 +1,11 @@
+${BLOCK}
++function separatorBetweenCopies() {}
+${BLOCK}
+`;
+
+/** The duplicated block twice in a DOC file — must NOT inflate duplication. */
+const DUP_IN_DOC_FILE = `diff --git a/docs/guide.md b/docs/guide.md
+--- a/docs/guide.md
++++ b/docs/guide.md
+@@ -1,2 +1,11 @@
+${BLOCK}
++function separatorBetweenCopies() {}
+${BLOCK}
+`;
+
+/** Residue markers shipped inside a TEST file — must NOT count as production residue. */
+const RESIDUE_IN_TEST_FILE = `diff --git a/test/webhooks.test.mjs b/test/webhooks.test.mjs
+--- a/test/webhooks.test.mjs
++++ b/test/webhooks.test.mjs
+@@ -1,1 +1,4 @@
++// TODO: wire this up properly
++console.log("debug", x);
++  debugger;
+`;
+
+test("a repetitive TEST file does not inflate duplication (and records no evidence)", () => {
+  const m = computeSlopMetrics({ diff: DUP_IN_TEST_FILE });
+  assert.equal(m.duplicationDelta, 0);
+  assert.deepEqual(m.duplicationEvidence, []);
+});
+
+test("a repetitive DOC file does not inflate duplication (and records no evidence)", () => {
+  const m = computeSlopMetrics({ diff: DUP_IN_DOC_FILE });
+  assert.equal(m.duplicationDelta, 0);
+  assert.deepEqual(m.duplicationEvidence, []);
+});
+
+test("a repetitive PRODUCTION file STILL inflates duplication", () => {
+  // Same block, same shape — only the path differs from the test/doc fixtures.
+  assert.equal(computeSlopMetrics({ diff: DUP_TWICE_ONE_FILE }).duplicationDelta, 1);
+});
+
+test("residue in a TEST file is not counted as production residue", () => {
+  const m = computeSlopMetrics({ diff: RESIDUE_IN_TEST_FILE });
+  assert.deepEqual(m.residue, { todos: 0, debugLogging: 0, commentedOutCode: 0 });
+});
+
+test("testTamper STILL counts weakening inside a test file (the deliberate exception)", () => {
+  // TAMPER_DIFF lives in src/a.test.ts; the exclusion must NOT silence it.
+  const m = computeSlopMetrics({ diff: TAMPER_DIFF });
+  assert.equal(m.testTamper.hits, 11);
+});
+
+test("isTestFile matches infix and directory-segment forms, case-insensitively", () => {
+  assert.equal(isTestFile("src/foo.test.ts"), true);
+  assert.equal(isTestFile("test/webhooks.test.mjs"), true);
+  assert.equal(isTestFile("src/bar.spec.ts"), true);
+  assert.equal(isTestFile("__tests__/helpers.mjs"), true);
+  assert.equal(isTestFile("packages/x/tests/run.ts"), true);
+  assert.equal(isTestFile("SPEC/Contract.ts"), true);
+  assert.equal(isTestFile("src/latest.ts"), false); // "test" only as a substring, not a segment/infix
+  assert.equal(isTestFile("src/contest.ts"), false);
 });
 
 // --- churnRatio -------------------------------------------------------------------
@@ -554,6 +640,7 @@ test("empty diff → everything zero, churnRatio null, no tamper evidence", () =
   const m = computeSlopMetrics({ diff: EMPTY_DIFF });
   assert.deepEqual(m, {
     duplicationDelta: 0,
+    duplicationEvidence: [],
     churnRatio: null,
     residue: { todos: 0, debugLogging: 0, commentedOutCode: 0 },
     testTamper: { hits: 0, evidence: [] },

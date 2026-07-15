@@ -1,3 +1,4 @@
+import { isDocFile } from "./surface.js";
 import type { SlopMetrics } from "./types.js";
 
 /**
@@ -25,6 +26,10 @@ const DUP_MIN_SIGNIFICANT_CHARS = 40;
 const TAMPER_EVIDENCE_MAX = 10;
 /** Max chars of a quoted line excerpt in tamper evidence. */
 const TAMPER_EXCERPT_MAX_CHARS = 80;
+/** Distinct duplicated windows cited as evidence — capped like tamper evidence. */
+const DUP_EVIDENCE_MAX = 10;
+/** Max chars of a quoted (multi-line) duplicated-window excerpt. */
+const DUP_EXCERPT_MAX_CHARS = 200;
 
 // --- Diff line extraction --------------------------------------------------------
 
@@ -60,28 +65,87 @@ export function removedLines(diff: string): string[] {
 }
 
 /**
- * Added lines grouped per changed file, so duplication windows can never
- * straddle a file boundary (4 lines that only line up when two files are
- * concatenated are not a copy-paste). A `diff --git` or `+++` header starts a
- * new group; lines before any header land in an implicit first group so
- * header-less fixture diffs still work.
+ * The new-file path a `+++` header names, `b/`-prefix stripped and any trailing
+ * `\t`-delimited metadata dropped. null for `/dev/null` (a deletion) or an
+ * unparseable header. Only `+++` is parsed — every git file section that can
+ * carry ADDED lines emits one, so it is the reliable path source.
  */
-function addedLinesByFile(diff: string): string[][] {
-  const groups: string[][] = [];
+function fileFromPlusHeader(line: string): string | null {
+  const rest = (line.slice(3).split("\t")[0] ?? "").trim();
+  if (rest === "" || rest === "/dev/null") return null;
+  return rest.replace(/^[ab]\//, "");
+}
+
+/**
+ * Added lines grouped per changed file — each group tagged with its path so
+ * doc/test files can be excluded from production-code metrics — and so
+ * duplication windows can never straddle a file boundary (4 lines that only
+ * line up when two files are concatenated are not a copy-paste). A `diff --git`
+ * or `+++` header starts a new group; the path comes from `+++`. Lines before
+ * any header land in an implicit first group (`file: null`) so header-less
+ * fixture diffs still work — a null path is treated as production code.
+ */
+function addedLinesByFile(diff: string): { file: string | null; lines: string[] }[] {
+  const groups: { file: string | null; lines: string[] }[] = [];
+  let currentFile: string | null = null;
   let current: string[] = [];
   const flush = (): void => {
-    if (current.length > 0) groups.push(current);
+    if (current.length > 0) groups.push({ file: currentFile, lines: current });
     current = [];
   };
   for (const line of diff.split("\n")) {
-    if (line.startsWith("diff --git ") || line.startsWith("+++")) {
+    if (line.startsWith("diff --git ")) {
       flush();
+      currentFile = null; // the following +++ header sets the real path
+      continue;
+    }
+    if (line.startsWith("+++")) {
+      flush();
+      currentFile = fileFromPlusHeader(line);
       continue;
     }
     if (line.startsWith("+")) current.push(line.slice(1));
   }
   flush();
   return groups;
+}
+
+/**
+ * True when a path is a TEST file: its filename carries a `.test.`/`.spec.`
+ * infix, OR any path segment is `test`/`tests`/`__tests__`/`spec`. Path-based
+ * and case-insensitive (no fs, no content read), mirroring {@link isDocFile}.
+ * WHY: the production-code-hygiene metrics (duplication, residue,
+ * literalDensity, helperReuse) must not PENALIZE the thoroughness — extra
+ * tests and docs — the Craft judge REWARDS (issue #43). testTamper is the
+ * deliberate exception: it operates ON test files and keeps counting them.
+ */
+export function isTestFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  const filename = lower.slice(lower.lastIndexOf("/") + 1);
+  if (filename.includes(".test.") || filename.includes(".spec.")) return true;
+  return lower
+    .split("/")
+    .some((seg) => seg === "test" || seg === "tests" || seg === "__tests__" || seg === "spec");
+}
+
+/** True when a file is excluded from production-code metrics: a doc or test file. */
+function isNonProductionFile(file: string | null): boolean {
+  return file !== null && (isDocFile(file) || isTestFile(file));
+}
+
+/**
+ * Added lines from PRODUCTION files only — doc and test files dropped. The flat
+ * input to the code-hygiene metrics (residue, literalDensity, helperReuse) so
+ * they grade only shipped production code, never the tests/docs the Craft judge
+ * rewards separately (issue #43).
+ */
+function productionAddedLines(diff: string): string[] {
+  const out: string[] = [];
+  for (const group of addedLinesByFile(diff)) {
+    if (isNonProductionFile(group.file)) continue;
+    out.push(...group.lines);
+  }
+  return out;
 }
 
 // --- duplicationDelta ------------------------------------------------------------
@@ -97,19 +161,30 @@ function normalizeForDuplication(line: string): string {
   return line.trim().replace(/\s+/g, " ");
 }
 
+/** One duplicated window quoted for audit: the file it first appeared in + a capped excerpt. */
+type DuplicationEvidence = SlopMetrics["duplicationEvidence"];
+
 /**
- * Count of duplicated added-line windows. Per changed file: slide a
+ * Count of duplicated added-line windows, plus per-file evidence. Per changed
+ * PRODUCTION file (doc/test files are skipped — issue #43): slide a
  * {@link DUP_WINDOW_LINES}-line window over that file's normalized added lines
  * (in order); skip windows below the non-empty / significant-char floors; then
- * count, across the WHOLE diff, every extra occurrence of an identical window
- * (N identical windows → N−1). WHY windows and not whole functions: a
- * 4-consecutive-line exact match is the smallest unit that is almost never
- * coincidental once brace/import noise is filtered out, and it needs no parser.
+ * count, across the whole PRODUCTION diff, every extra occurrence of an
+ * identical window (N identical windows → N−1). WHY windows and not whole
+ * functions: a 4-consecutive-line exact match is the smallest unit that is
+ * almost never coincidental once brace/import noise is filtered out, and it
+ * needs no parser.
+ *
+ * Evidence mirrors testTamper's: a capped ({@link DUP_EVIDENCE_MAX}) array of
+ * {file, excerpt} for the windows that actually repeated, so the count is
+ * auditable — a reader can tell repetitive production bloat from a
+ * false-positive without re-deriving the whole diff.
  */
-function duplicationDelta(diff: string): number {
-  const occurrences = new Map<string, number>();
-  for (const fileLines of addedLinesByFile(diff)) {
-    const normalized = fileLines.map(normalizeForDuplication);
+function duplicationDelta(diff: string): { count: number; evidence: DuplicationEvidence } {
+  const occurrences = new Map<string, { count: number; file: string; window: string[] }>();
+  for (const group of addedLinesByFile(diff)) {
+    if (isNonProductionFile(group.file)) continue;
+    const normalized = group.lines.map(normalizeForDuplication);
     for (let i = 0; i + DUP_WINDOW_LINES <= normalized.length; i++) {
       const window = normalized.slice(i, i + DUP_WINDOW_LINES);
       const nonEmpty = window.filter((l) => l !== "").length;
@@ -120,12 +195,30 @@ function duplicationDelta(diff: string): number {
       );
       if (significantChars < DUP_MIN_SIGNIFICANT_CHARS) continue;
       const key = window.join("\n");
-      occurrences.set(key, (occurrences.get(key) ?? 0) + 1);
+      const existing = occurrences.get(key);
+      if (existing !== undefined) existing.count++;
+      else occurrences.set(key, { count: 1, file: group.file ?? "(unknown)", window });
     }
   }
-  let delta = 0;
-  for (const n of occurrences.values()) if (n > 1) delta += n - 1;
-  return delta;
+  let count = 0;
+  const evidence: { file: string; excerpt: string }[] = [];
+  for (const occ of occurrences.values()) {
+    if (occ.count <= 1) continue;
+    count += occ.count - 1;
+    if (evidence.length < DUP_EVIDENCE_MAX) {
+      evidence.push({ file: occ.file, excerpt: excerptWindow(occ.window) });
+    }
+  }
+  return { count, evidence };
+}
+
+/** Quote a duplicated window for evidence: non-empty lines joined, capped at {@link DUP_EXCERPT_MAX_CHARS}. */
+function excerptWindow(window: string[]): string {
+  const joined = window
+    .map((l) => l.trim())
+    .filter((l) => l !== "")
+    .join(" / ");
+  return joined.length > DUP_EXCERPT_MAX_CHARS ? joined.slice(0, DUP_EXCERPT_MAX_CHARS) : joined;
 }
 
 // --- churnRatio --------------------------------------------------------------------
@@ -485,12 +578,19 @@ export function computeSlopMetrics(inputs: {
 }): SlopMetrics {
   const added = addedLines(inputs.diff);
   const removed = removedLines(inputs.diff);
+  // Production-code-hygiene metrics grade shipped production code only: doc and
+  // test files are excluded so thoroughness the Craft judge rewards is not
+  // double-penalized here (issue #43). testTamper stays on the FULL diff — it
+  // operates on test files by design.
+  const productionAdded = productionAddedLines(inputs.diff);
+  const dup = duplicationDelta(inputs.diff);
   return {
-    duplicationDelta: duplicationDelta(inputs.diff),
+    duplicationDelta: dup.count,
+    duplicationEvidence: dup.evidence,
     churnRatio: computeChurnRatio(removed, inputs.earlierAddedLines),
-    residue: countResidue(added),
+    residue: countResidue(productionAdded),
     testTamper: detectTestTamper(added, removed),
-    helperReuse: helperReuseCount(added),
-    literalDensity: literalDensityCount(added),
+    helperReuse: helperReuseCount(productionAdded),
+    literalDensity: literalDensityCount(productionAdded),
   };
 }
