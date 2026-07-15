@@ -359,7 +359,14 @@ const craft = (score: 0 | 1 | 2 | 3 | 4 | "unknown" = 2): CraftScore =>
 
 function makeVerdict(over: Partial<CellJudgeResult> = {}): CellJudgeResult {
   return {
-    craft: { naming: craft(), structure: craft(), consistency: craft(), economy: craft() },
+    craft: {
+      naming: craft(),
+      structure: craft(),
+      consistency: craft(),
+      economy: craft(),
+      documentation: craft(),
+      testing: craft(),
+    },
     blastRadius: [],
     correctnessAssessment: null,
     flags: [],
@@ -613,6 +620,8 @@ test("runCell: a judge failure is absorbed — fail-closed verdict, judgeFailure
         structure: craft("unknown"),
         consistency: craft("unknown"),
         economy: craft("unknown"),
+        documentation: craft("unknown"),
+        testing: craft("unknown"),
       },
       flags: ["judge-transport-failure"],
     }),

@@ -53,6 +53,7 @@ import type {
   CraftScoreValue,
   PairwiseDimension,
   PairwiseResult,
+  PairwiseSeverity,
   PairwiseWinner,
   Report,
   RunMetrics,
@@ -98,6 +99,8 @@ function craftScores(
     structure: score(overrides.structure ?? 3),
     consistency: score(overrides.consistency ?? 3),
     economy: score(overrides.economy ?? 3),
+    documentation: score(overrides.documentation ?? 3),
+    testing: score(overrides.testing ?? 3),
   };
 }
 
@@ -135,6 +138,7 @@ function pairwiseResult(
   variantB: string,
   winner: PairwiseWinner,
   extra: Partial<PairwiseResult> = {},
+  severity: PairwiseSeverity = "style",
 ): PairwiseResult {
   const dim = (): PairwiseDimension => ({
     winner,
@@ -146,8 +150,15 @@ function pairwiseResult(
     executorModel: "sonnet",
     variantA,
     variantB,
-    dimensions: { naming: dim(), structure: dim(), consistency: dim(), economy: dim() },
-    overall: { winner, rationale: "why" },
+    dimensions: {
+      naming: dim(),
+      structure: dim(),
+      consistency: dim(),
+      economy: dim(),
+      documentation: dim(),
+      testing: dim(),
+    },
+    overall: { winner, rationale: "why", severity },
     ...extra,
   };
 }
@@ -802,7 +813,8 @@ test("campaign links fold into judge-craft medians; disqualified and failed link
   ]);
   const md = renderJudgeCraft([single], [camp]);
   // Contributing: single cell (naming 2) + link 0 (naming 4) → lower median 2 over 2 cells.
-  assert.match(md, /\| v \| sonnet \| 2 \| 3 \| 3 \| 3 \| 0 \| 2 \|/);
+  // Columns: naming | structure | consistency | economy | documentation | testing | unknown | cells.
+  assert.match(md, /\| v \| sonnet \| 2 \| 3 \| 3 \| 3 \| 3 \| 3 \| 0 \| 2 \|/);
   assert.doesNotMatch(md, /No judge craft verdicts/);
 });
 
@@ -948,14 +960,15 @@ test("aggregateCraft: lower median — odd count, even count, unknowns excluded-
     cell("m", "t1", {
       judge: judgeResult({
         craft: craftScores({
-          naming: "unknown", structure: "unknown", consistency: "unknown", economy: "unknown",
+          naming: "unknown", structure: "unknown", consistency: "unknown",
+          economy: "unknown", documentation: "unknown", testing: "unknown",
         }),
       }),
     }),
   ];
   const agg2 = aggregateCraft(allUnknown)[0]!;
   assert.equal(agg2.median.naming, null);
-  assert.equal(agg2.unknownCount, 4);
+  assert.equal(agg2.unknownCount, 6);
 });
 
 test("renderJudgeCraft renders — for all-unknown dimensions and reports the unknown count", () => {
@@ -963,12 +976,13 @@ test("renderJudgeCraft renders — for all-unknown dimensions and reports the un
     cell("m", "t1", {
       judge: judgeResult({
         craft: craftScores({
-          naming: "unknown", structure: "unknown", consistency: "unknown", economy: "unknown",
+          naming: "unknown", structure: "unknown", consistency: "unknown",
+          economy: "unknown", documentation: "unknown", testing: "unknown",
         }),
       }),
     }),
   ]);
-  assert.match(md, /\| m \| sonnet \| — \| — \| — \| — \| 4 \| 1 \|/);
+  assert.match(md, /\| m \| sonnet \| — \| — \| — \| — \| — \| — \| 6 \| 1 \|/);
   assert.doesNotMatch(md, /undefined|NaN/);
 });
 
@@ -1042,6 +1056,69 @@ test("aggregatePairwise resolves winners through variantA/variantB, not the lett
   assert.deepEqual(agg.pairs, [
     { variantX: "bravo", variantY: "alpha", winsX: 1, winsY: 0, ties: 0 },
   ]);
+});
+
+test("aggregatePairwise severity weighting: one soundness win is not outweighed by stylistic nits (issue #35)", () => {
+  // The 51fdf398 pathology: `sound` won ONCE on a real defect (open redirect);
+  // `stylist` won THREE stylistic nits. Raw tally is 1–3; severity-weighted the
+  // soundness win counts as 3, so the head-to-head rate is even (0.5), not 0.25.
+  const comparisons = [
+    pairwiseResult("sound", "stylist", "A", {}, "soundness"), // sound wins, soundness
+    pairwiseResult("sound", "stylist", "B"), // stylist wins, style
+    pairwiseResult("sound", "stylist", "B"), // stylist wins, style
+    pairwiseResult("sound", "stylist", "B"), // stylist wins, style
+  ];
+  const agg = aggregatePairwise(comparisons);
+  const sound = agg.variants.find((v) => v.variant === "sound")!;
+  // Raw counts stay honest for display: 1 win, 3 losses.
+  assert.equal(sound.wins, 1);
+  assert.equal(sound.losses, 3);
+  assert.deepEqual(sound.headToHead, [{ opponent: "stylist", wins: 1, losses: 3 }]);
+  // Weighted rate: wWins 3 / (3 + wLosses 3) = 0.5 — no longer outweighed.
+  assert.equal(sound.headToHeadWinRate, 0.5);
+  assert.equal(sound.winRate, 0.5);
+});
+
+test("aggregatePairwise severity is fail-closed: a missing/ordinary severity never inflates the rate", () => {
+  // Identical to the pathology above but the sole win is ORDINARY (style):
+  // weighting must NOT apply, so the rate degrades to the raw 1/4 = 0.25.
+  const comparisons = [
+    pairwiseResult("sound", "stylist", "A"), // default severity "style"
+    pairwiseResult("sound", "stylist", "B"),
+    pairwiseResult("sound", "stylist", "B"),
+    pairwiseResult("sound", "stylist", "B"),
+  ];
+  const sound = aggregatePairwise(comparisons).variants.find((v) => v.variant === "sound")!;
+  assert.equal(sound.headToHeadWinRate, 0.25);
+  assert.equal(sound.winRate, 0.25);
+});
+
+test("aggregateCraft folds in the documentation dimension median", () => {
+  const cells = [
+    cell("v", "t1", { judge: judgeResult({ craft: craftScores({ documentation: 4 }) }) }),
+    cell("v", "t2", { judge: judgeResult({ craft: craftScores({ documentation: 2 }) }) }),
+    cell("v", "t3", { judge: judgeResult({ craft: craftScores({ documentation: 3 }) }) }),
+  ];
+  const agg = aggregateCraft(cells)[0]!;
+  assert.equal(agg.median.documentation, 3); // median of [2,3,4]
+  // The documentation median also reaches the rendered table (5th score column).
+  const md = renderJudgeCraft(cells);
+  assert.match(md, /\| Documentation \|/);
+  assert.match(md, /\| v \| sonnet \| 3 \| 3 \| 3 \| 3 \| 3 \| 3 \| 0 \| 3 \|/);
+});
+
+test("aggregateCraft folds in the testing dimension median", () => {
+  const cells = [
+    cell("v", "t1", { judge: judgeResult({ craft: craftScores({ testing: 1 }) }) }),
+    cell("v", "t2", { judge: judgeResult({ craft: craftScores({ testing: 4 }) }) }),
+    cell("v", "t3", { judge: judgeResult({ craft: craftScores({ testing: 2 }) }) }),
+  ];
+  const agg = aggregateCraft(cells)[0]!;
+  assert.equal(agg.median.testing, 2); // lower median of [1,2,4]
+  // The testing median also reaches the rendered table (6th score column).
+  const md = renderJudgeCraft(cells);
+  assert.match(md, /\| Testing \|/);
+  assert.match(md, /\| v \| sonnet \| 3 \| 3 \| 3 \| 3 \| 3 \| 2 \| 0 \| 3 \|/);
 });
 
 test("aggregatePairwise: shuffled orientations fold into one pair; ties excluded from win rate; bias audited", () => {
@@ -1385,14 +1462,16 @@ test("aggregateReliability: stddev + craft ranges + anchor agreement on a 3-repe
   assert.deepEqual(g!.craftRange.structure, { min: 3, max: 3 });
   assert.equal(g!.craftUnknowns, 1);
   assert.deepEqual(g!.anchorGrades, ["held-by-literal", "held-by-literal", "held-by-literal"]);
-  // Per-run mean-of-dimensions dispersion: rep1 [2,3,3]=2.67, rep2 [4,3,3,3]=3.25, rep3 3.0.
-  assert.ok(Math.abs(g!.craftScore!.min - 2.6667) < 0.001);
-  assert.ok(Math.abs(g!.craftScore!.max - 3.25) < 0.001);
+  // Per-run mean-of-dimensions dispersion (documentation=3 + testing=3 fold in):
+  // rep1 [2,3,3,3,3]=2.8, rep2 [4,3,3,3,3,3]=3.167, rep3 [3,3,3,3,3,3]=3.0.
+  assert.ok(Math.abs(g!.craftScore!.min - 2.8) < 0.001);
+  assert.ok(Math.abs(g!.craftScore!.max - 3.16667) < 0.001);
   // No testResults and no judge correctness assessment → no correctness verdict.
   assert.equal(g!.verdictRuns, 0);
 
   const md = renderReliability(rs);
-  assert.match(md, /\| `t` × v \[sonnet\] \| 3 \| — \| 2\.7 \/ 3\.0 \/ 3\.3 \| \$0\.0082 \| 1\.6s \| 2–4 \| 3 \| 3 \| 3 \| 1 \| 3\/3 identical \|/);
+  // Columns: … | Naming | Structure | Consistency | Economy | Documentation | Testing | Craft unknowns | Anchor grades.
+  assert.match(md, /\| `t` × v \[sonnet\] \| 3 \| — \| 2\.8 \/ 3\.0 \/ 3\.2 \| \$0\.0082 \| 1\.6s \| 2–4 \| 3 \| 3 \| 3 \| 3 \| 3 \| 1 \| 3\/3 identical \|/);
   assert.match(md, /Craft score \(min\/mean\/max\)/);
   assert.match(md, /Targeting: spend repeats on the high-variance/);
   assert.match(md, /prisma-tx-deadlock/);

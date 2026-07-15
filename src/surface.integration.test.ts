@@ -120,6 +120,8 @@ const CRAFT: CellCraft = {
   structure: UNKNOWN(),
   consistency: UNKNOWN(),
   economy: UNKNOWN(),
+  documentation: UNKNOWN(),
+  testing: UNKNOWN(),
 };
 
 function judgeWith(blastRadius: BlastRadiusEntry[]): CellJudgeResult {

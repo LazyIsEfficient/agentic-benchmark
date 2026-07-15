@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { expectedSurfaceFor, filesOutsideExpectedSurface, globToRegExp } from "./surface.js";
+import {
+  expectedSurfaceFor,
+  filesOutsideExpectedSurface,
+  globToRegExp,
+  isDocFile,
+} from "./surface.js";
 
 // --- globToRegExp: ** semantics ------------------------------------------------
 
@@ -137,20 +142,60 @@ test("no touched files means no excursions, whatever the surface", () => {
   assert.deepEqual(filesOutsideExpectedSurface([], ["src/**"]), []);
 });
 
-test("an explicit empty surface puts every touched file out of scope", () => {
+test("an explicit empty surface puts every touched CODE file out of scope (docs exempt)", () => {
   // The undefined/[] distinction carries meaning: expectedSurfaceFor only ever
   // produces [] from an explicit declaration, and "may touch nothing" must
-  // flag everything — not silently disable scoping.
-  assert.deepEqual(filesOutsideExpectedSurface(["a.ts", "docs/b.md"], []), ["a.ts", "docs/b.md"]);
+  // flag everything — not silently disable scoping. Documentation files are the
+  // one exception (issue #38): a proactive doc is not scope risk, so `docs/b.md`
+  // is NOT flagged even under an explicit touch-nothing surface.
+  assert.deepEqual(filesOutsideExpectedSurface(["a.ts", "docs/b.md"], []), ["a.ts"]);
 });
 
-test("files matching any pattern are in scope; the rest are returned", () => {
+test("files matching any pattern are in scope; the rest are returned (docs never returned)", () => {
   const got = filesOutsideExpectedSurface(
     ["src/a.ts", "docs/guide.md", "scripts/build.sh", "README.md"],
     ["src/**", "*.md"],
   );
-  // *.md is single-segment: README.md is in scope, docs/guide.md is not.
-  assert.deepEqual(got, ["docs/guide.md", "scripts/build.sh"]);
+  // docs/guide.md and README.md are documentation → never an excursion (issue
+  // #38); src/a.ts is in scope; only the non-doc scripts/build.sh is returned.
+  assert.deepEqual(got, ["scripts/build.sh"]);
+});
+
+// --- isDocFile + blast-radius doc exemption (issue #38) ------------------------
+
+test("isDocFile recognizes doc EXTENSIONS only — location under docs/ never qualifies code", () => {
+  // Doc file extensions (case-insensitive), any location incl. under docs/.
+  for (const p of ["README.md", "a.MD", "notes.mdx", "guide.markdown", "x.rst", "y.adoc"]) {
+    assert.equal(isDocFile(p), true, `${p} should be a doc file`);
+  }
+  assert.equal(isDocFile("docs/guide.md"), true);
+  assert.equal(isDocFile("Docs/guide.MD"), true); // case-insensitive path + ext
+  assert.equal(isDocFile("./docs/b.md"), true); // leading ./ normalized
+  // NOT documentation: a code/config file is still code/config even under docs/.
+  // It MUST remain visible to blast-radius (could be overreach/adversarial).
+  for (const p of [
+    "docs/evil.ts",
+    "docs/adr/0001.ts",
+    "packages/api/docs/schema.json",
+    "docs/build.sh",
+    "src/a.ts",
+    "config.json",
+    "README.ts",
+    "mdx/loader.ts",
+  ]) {
+    assert.equal(isDocFile(p), false, `${p} should NOT be a doc file`);
+  }
+});
+
+test("filesOutsideExpectedSurface skips proactive docs but still flags code hidden under docs/", () => {
+  // A DATA_MODEL.md / docs/*.md volunteered outside the surface is not scope
+  // risk (issue #38) → skipped. But an unrequested CODE file still reaches
+  // blast-radius — including a build script hidden in docs/ (docs/evil.ts).
+  const got = filesOutsideExpectedSurface(
+    ["src/handler.ts", "DATA_MODEL.md", "docs/adr/0002.md", "docs/evil.ts", "src/sneaky.ts"],
+    ["src/handler.ts"],
+  );
+  assert.deepEqual(got, ["docs/evil.ts", "src/sneaky.ts"]);
 });
 
 test("first-seen order is preserved", () => {
