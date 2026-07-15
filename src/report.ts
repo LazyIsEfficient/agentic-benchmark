@@ -998,6 +998,194 @@ export function renderBlastRadius(
   ].join("\n");
 }
 
+// --- Cross-task insight (synthesized narrative, NOT scored) ------------------
+
+/** The report axes a `--focus <axis>` run can isolate. */
+export type FocusAxis =
+  | "correctness"
+  | "memory"
+  | "craft"
+  | "efficiency"
+  | "blast-radius";
+
+/** The accepted `--focus` axis tokens, in help/error-message order. */
+export const FOCUS_AXES: readonly FocusAxis[] = [
+  "correctness",
+  "memory",
+  "craft",
+  "efficiency",
+  "blast-radius",
+];
+
+/** Round to one decimal, rendering whole ratios as `2×` and the rest as `~2.8×`. */
+function fmtRatio(x: number): string {
+  const r = Math.round(x * 10) / 10;
+  return Number.isInteger(r) ? `${r}×` : `~${r.toFixed(1)}×`;
+}
+
+/** `2.8× cost` when `a ≥ b`, else `2× lower cost` — always the larger-over-smaller magnitude. */
+function ratioClause(a: number, b: number, noun: string): string {
+  return a >= b ? `${fmtRatio(a / b)} ${noun}` : `${fmtRatio(b / a)} lower ${noun}`;
+}
+
+/** Thousands-separated integer, e.g. `1166` → `1,166`. */
+function fmtLoc(n: number): string {
+  return Math.round(n).toLocaleString("en-US");
+}
+
+/** Mean over a non-empty numeric sample. */
+function meanOf(values: number[]): number {
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+/** Distinct variants in first-seen order. */
+function distinctVariants(results: VariantTaskResult[]): string[] {
+  const seen: string[] = [];
+  for (const r of results) if (!seen.includes(r.variant)) seen.push(r.variant);
+  return seen;
+}
+
+/**
+ * CROSS-TASK INSIGHT — a short synthesized narrative derived ENTIRELY from data
+ * already in the report payload (Behavioral sub-agent counts + diff LOC,
+ * Efficiency cost/time, and the composite Craft Score). No new capture. Leads
+ * with the biggest cross-variant diff-shape gap on a shared task and frames it
+ * against sub-agent usage and cost/time multipliers, then adds a one-line craft
+ * ranking. Returns "" when there is no behavioral data or nothing notable to
+ * compare — the caller then omits the whole section. Observational, never
+ * scored.
+ */
+export function renderCrossTaskInsight(report: Report): string {
+  const results = report.results;
+  const behavioral = results.filter((r) => r.behavior !== undefined);
+  if (behavioral.length === 0) return "";
+
+  const variants = distinctVariants(behavioral);
+  const tasks = distinctTasks(behavioral);
+
+  // Per (task, variant) mean linesAdded — the diff-size proxy for the contrast.
+  const locOf = (taskId: string, variant: string): number | null => {
+    const cells = behavioral.filter(
+      (r) => r.taskId === taskId && r.variant === variant,
+    );
+    if (cells.length === 0) return null;
+    return meanOf(cells.map((r) => r.behavior!.changedFileShape.linesAdded));
+  };
+
+  // Featured contrast: the shared task with the widest lean/heavy LOC spread.
+  let featured:
+    | { taskId: string; lean: string; heavy: string; leanLoc: number; heavyLoc: number }
+    | undefined;
+  for (const taskId of tasks) {
+    const present = variants
+      .map((v) => ({ v, loc: locOf(taskId, v) }))
+      .filter((x): x is { v: string; loc: number } => x.loc !== null);
+    if (present.length < 2) continue;
+    const lean = present.reduce((a, b) => (b.loc < a.loc ? b : a));
+    const heavy = present.reduce((a, b) => (b.loc > a.loc ? b : a));
+    const spread = heavy.loc - lean.loc;
+    if (spread <= 0) continue;
+    if (featured === undefined || spread > featured.heavyLoc - featured.leanLoc) {
+      featured = {
+        taskId,
+        lean: lean.v,
+        heavy: heavy.v,
+        leanLoc: lean.loc,
+        heavyLoc: heavy.loc,
+      };
+    }
+  }
+
+  // Sub-agent usage per variant: distinct tasks used on / distinct tasks seen.
+  const subAgentUsage = (variant: string): { used: number; total: number } => {
+    const seen = new Set<string>();
+    const used = new Set<string>();
+    for (const r of behavioral.filter((x) => x.variant === variant)) {
+      seen.add(r.taskId);
+      if (r.behavior!.subAgents.count > 0) used.add(r.taskId);
+    }
+    return { used: used.size, total: seen.size };
+  };
+
+  // Variant cost/time totals (summed executor spend over every cell of the
+  // variant, across tasks/models) for the efficiency multipliers.
+  const totalOf = (
+    variant: string,
+    pick: (r: VariantTaskResult) => number | undefined,
+  ): number | null => {
+    const vals = results
+      .filter((r) => r.variant === variant)
+      .map(pick)
+      .filter((v): v is number => v !== undefined);
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) : null;
+  };
+
+  const sentences: string[] = [];
+
+  if (featured !== undefined) {
+    const leanUse = subAgentUsage(featured.lean);
+    const heavyUse = subAgentUsage(featured.heavy);
+    const leanCost = totalOf(featured.lean, (r) => r.metrics.executor.costUsd);
+    const heavyCost = totalOf(featured.heavy, (r) => r.metrics.executor.costUsd);
+    const leanWall = totalOf(featured.lean, (r) => r.metrics.executor.wallMs);
+    const heavyWall = totalOf(featured.heavy, (r) => r.metrics.executor.wallMs);
+    const effParts: string[] = [];
+    if (leanCost !== null && heavyCost !== null && heavyCost > 0 && leanCost > 0) {
+      effParts.push(ratioClause(leanCost, heavyCost, "cost"));
+    }
+    if (leanWall !== null && heavyWall !== null && heavyWall > 0 && leanWall > 0) {
+      effParts.push(ratioClause(leanWall, heavyWall, "wall time"));
+    }
+    const eff = effParts.length > 0 ? ` at ${effParts.join(" and ")}` : "";
+    const diffClause = `produced a leaner diff than \`${featured.heavy}\` on \`${featured.taskId}\` (+${fmtLoc(featured.leanLoc)} vs +${fmtLoc(featured.heavyLoc)} LOC)${eff}`;
+    if (leanUse.used > 0) {
+      // Coherent pairing: the lean variant DID use sub-agents, so citing its
+      // usage alongside the leaner-diff claim reads as one consistent story.
+      sentences.push(
+        `\`${featured.lean}\` used sub-agents on ${leanUse.used}/${leanUse.total} tasks and ${diffClause}.`,
+      );
+    } else {
+      // The lean variant used NO sub-agents. Pairing "0/N" with "leaner diff"
+      // reads as if leanness came *despite* them — a misleading juxtaposition.
+      // Lead with the diff and, when it applies, cite the HEAVIER variant's
+      // sub-agent usage as the coherent contrast (heavier diff, more agents).
+      const heavyClause =
+        heavyUse.used > 0
+          ? ` \`${featured.heavy}\` used sub-agents on ${heavyUse.used}/${heavyUse.total} tasks.`
+          : "";
+      sentences.push(`\`${featured.lean}\` ${diffClause}.${heavyClause}`);
+    }
+  } else {
+    // Degenerate: one variant, or no shared task to contrast. Emit a modest
+    // single-variant sub-agent line (or nothing) rather than a fabricated gap.
+    const lead = variants.find((v) => subAgentUsage(v).total > 0);
+    if (lead === undefined) return "";
+    const su = subAgentUsage(lead);
+    if (su.used === 0) return "";
+    sentences.push(
+      `\`${lead}\` used sub-agents on ${su.used}/${su.total} tasks with behavioral data.`,
+    );
+  }
+
+  // Secondary: composite Craft Score leader vs trailer, when ≥2 are scored.
+  const craft = aggregateCraftScore(
+    report.results,
+    report.pairwise,
+    report.campaigns,
+  ).filter((a) => a.score !== null);
+  if (craft.length >= 2) {
+    const top = craft[0]!;
+    const bottom = craft[craft.length - 1]!;
+    if (top.variant !== bottom.variant) {
+      sentences.push(
+        `On composite Craft Score, \`${top.variant}\` led (${top.score}) over \`${bottom.variant}\` (${bottom.score}).`,
+      );
+    }
+  }
+
+  return sentences.length > 0 ? `> ${sentences.join(" ")}` : "";
+}
+
 // --- Report assembly --------------------------------------------------------
 
 /**
@@ -1006,8 +1194,13 @@ export function renderBlastRadius(
  * Five-axis LEXICOGRAPHIC layout — Correctness, Adherence (memory effect),
  * Craft, Efficiency, Reliability — followed by blast radius and the
  * observational sections. Axes are never combined into a weighted sum.
+ *
+ * `focus` restricts the render to one concern: only that axis's section(s) plus
+ * the run header are emitted (the cross-task insight and the other axes are
+ * dropped). The section renderers themselves are unchanged — selection happens
+ * here, in the assembly.
  */
-export function renderReportMarkdown(report: Report): string {
+export function renderReportMarkdown(report: Report, focus?: FocusAxis): string {
   const meta = [
     `- **Run ID**: \`${report.runId}\``,
     `- **Task**: ${report.taskTitle} (\`${report.taskId}\`)`,
@@ -1016,57 +1209,90 @@ export function renderReportMarkdown(report: Report): string {
     `- **Generated**: ${report.generatedAt}`,
   ];
 
+  const show = (section: FocusAxis): boolean =>
+    focus === undefined || focus === section;
+
   // ADHERENCE — deterministic anchor readouts. Each renders only when the run
   // carried the corresponding data; absent ⇒ the section is omitted entirely.
-  const memoryEffectSection = hasMemoryEffect(report.results)
-    ? [`## Memory effect (not scored)`, "", renderMemoryEffect(report.results), ""]
+  const memoryEffectSection =
+    show("memory") && hasMemoryEffect(report.results)
+      ? [`## Memory effect (not scored)`, "", renderMemoryEffect(report.results), ""]
+      : [];
+  const campaignSection =
+    show("memory") && hasCampaigns(report)
+      ? [
+          `## Memory effect (campaign, not scored)`,
+          "",
+          renderCampaignMemoryEffect(report.campaigns!),
+          "",
+        ]
+      : [];
+
+  // Cross-task insight callout — full reports only; a focused render drops it.
+  const insight = focus === undefined ? renderCrossTaskInsight(report) : "";
+  const insightSection =
+    insight.length > 0 ? [`## Cross-task insight`, "", insight, ""] : [];
+
+  // Focus note — makes a truncated report self-explanatory.
+  const focusNote =
+    focus === undefined
+      ? []
+      : [
+          `_Focused report: \`${focus}\` only. Re-run without \`--focus\` for the full multi-axis report._`,
+          "",
+        ];
+
+  const correctnessSection = show("correctness")
+    ? [`## Correctness`, "", renderCorrectness(report.results, report.campaigns), ""]
     : [];
-  const campaignSection = hasCampaigns(report)
-    ? [
-        `## Memory effect (campaign, not scored)`,
-        "",
-        renderCampaignMemoryEffect(report.campaigns!),
-        "",
-      ]
+  const craftSection = show("craft")
+    ? [`## Craft`, "", renderCraft(report.results, report.pairwise, report.campaigns), ""]
     : [];
+  const efficiencySection = show("efficiency")
+    ? [`## Efficiency`, "", renderRunMetrics(report.results), ""]
+    : [];
+  const blastSection = show("blast-radius")
+    ? [`## Blast radius`, "", renderBlastRadius(report.results, report.campaigns), ""]
+    : [];
+
+  // Reliability + the observational tails have no --focus axis of their own, so
+  // they render on the FULL report only. Reliability keeps its original slot
+  // BETWEEN Efficiency and Blast radius; the observational tails close the report.
+  const reliabilitySection =
+    focus === undefined
+      ? [`## Reliability`, "", renderReliability(report.results), ""]
+      : [];
+  const observationalTail =
+    focus === undefined
+      ? [
+          `## Excluded cells (not scored)`,
+          "",
+          renderExcludedCells(report.results),
+          "",
+          `## Behavioral signals (not scored)`,
+          "",
+          "_What each run actually did — sub-agent usage, tool calls, and diff shape. Observational only; these prove different CLAUDE.md variants produce genuinely different behavior, not just different scores._",
+          "",
+          renderBehaviorComparison(report.results),
+          "",
+        ]
+      : [];
 
   return [
     `# CLAUDE.md Variant Benchmark Report`,
     "",
     meta.join("\n"),
     "",
-    `## Correctness`,
-    "",
-    renderCorrectness(report.results, report.campaigns),
-    "",
+    ...focusNote,
+    ...insightSection,
+    ...correctnessSection,
     ...memoryEffectSection,
     ...campaignSection,
-    `## Craft`,
-    "",
-    renderCraft(report.results, report.pairwise, report.campaigns),
-    "",
-    `## Efficiency`,
-    "",
-    renderRunMetrics(report.results),
-    "",
-    `## Reliability`,
-    "",
-    renderReliability(report.results),
-    "",
-    `## Blast radius`,
-    "",
-    renderBlastRadius(report.results, report.campaigns),
-    "",
-    `## Excluded cells (not scored)`,
-    "",
-    renderExcludedCells(report.results),
-    "",
-    `## Behavioral signals (not scored)`,
-    "",
-    "_What each run actually did — sub-agent usage, tool calls, and diff shape. Observational only; these prove different CLAUDE.md variants produce genuinely different behavior, not just different scores._",
-    "",
-    renderBehaviorComparison(report.results),
-    "",
+    ...craftSection,
+    ...efficiencySection,
+    ...reliabilitySection,
+    ...blastSection,
+    ...observationalTail,
   ].join("\n");
 }
 
@@ -1662,16 +1888,21 @@ export function buildReportJson(report: Report): unknown {
   };
 }
 
-/** Write report.json and report.md into the run's own folder (`outDir`). */
+/**
+ * Write report.json and report.md into the run's own folder (`outDir`). The
+ * JSON payload is always the full report; `focus` only narrows the rendered
+ * markdown (report.md) to one axis.
+ */
 export async function writeReport(
   report: Report,
   outDir: string,
+  focus?: FocusAxis,
 ): Promise<{ jsonPath: string; mdPath: string }> {
   await fs.mkdir(outDir, { recursive: true });
   const jsonPath = path.join(outDir, "report.json");
   const mdPath = path.join(outDir, "report.md");
   await fs.writeFile(jsonPath, JSON.stringify(buildReportJson(report), null, 2));
-  await fs.writeFile(mdPath, renderReportMarkdown(report));
+  await fs.writeFile(mdPath, renderReportMarkdown(report, focus));
   return { jsonPath, mdPath };
 }
 
@@ -1683,6 +1914,7 @@ export async function writeReport(
  */
 export async function regenerateReport(
   target: string,
+  focus?: FocusAxis,
 ): Promise<{ jsonPath: string; mdPath: string }> {
   const stat = await fs.stat(target).catch(() => null);
   const jsonPath =
@@ -1694,5 +1926,5 @@ export async function regenerateReport(
   if (!Array.isArray(report.results)) {
     throw new Error(`${jsonPath} is not a valid report.json (missing results[]).`);
   }
-  return writeReport(report, outDir);
+  return writeReport(report, outDir, focus);
 }

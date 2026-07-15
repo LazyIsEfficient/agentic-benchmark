@@ -25,6 +25,7 @@ import {
   regenerateReport,
   renderBehaviorComparison,
   renderBlastRadius,
+  renderCrossTaskInsight,
   renderCampaignMemoryEffect,
   renderCorrectness,
   renderCraft,
@@ -1443,6 +1444,116 @@ test("a legacy (pre-five-axis) report renders through the new layout without ret
   assert.match(md, /## Correctness/);
   assert.match(md, /\| alpha \| sonnet \| — \| — \|/); // legacy correctness row
   assert.match(md, /No craft data/); // craft one-liner for legacy results
+});
+
+// --- Cross-task insight (#18) -------------------------------------------------
+
+/** A cell carrying a behavior block with the given LOC/sub-agent/cost/time. */
+function behavCell(
+  variant: string,
+  taskId: string,
+  linesAdded: number,
+  subCount: number,
+  costUsd: number,
+  wallMs: number,
+): VariantTaskResult {
+  return cell(variant, taskId, {
+    metrics: { executor: { wallMs, costUsd, numTurns: 5 } },
+    behavior: behavior({
+      subAgents: {
+        count: subCount,
+        byType: subCount > 0 ? { engineer: subCount } : {},
+        dispatches: [],
+      },
+      changedFileShape: { source: 2, test: 1, docs: 0, linesAdded, linesRemoved: 10 },
+    }),
+  });
+}
+
+test("renderCrossTaskInsight: synthesizes the diff/efficiency contrast from behavioral fields", () => {
+  const report = makeReport({
+    executorModels: ["sonnet"],
+    results: [
+      behavCell("agentic-os", "safe-redirect", 195, 1, 0.2, 100_000),
+      behavCell("naked", "safe-redirect", 1166, 0, 0.1, 50_000),
+      behavCell("agentic-os", "csv-export", 120, 1, 0.2, 100_000),
+      behavCell("naked", "csv-export", 130, 0, 0.1, 50_000),
+    ],
+  });
+  const insight = renderCrossTaskInsight(report);
+  // Leans on the widest gap (safe-redirect), names both variants + computed LOC.
+  assert.match(insight, /^> /); // rendered as a blockquote callout
+  assert.match(insight, /`agentic-os` used sub-agents on 2\/2 tasks/);
+  assert.match(insight, /leaner diff than `naked` on `safe-redirect`/);
+  assert.match(insight, /\(\+195 vs \+1,166 LOC\)/);
+  // cost 0.40/0.20 = 2×; wall 200k/100k = 2× — both whole, so no tilde.
+  assert.match(insight, /at 2× cost and 2× wall time\./);
+  assert.doesNotMatch(insight, /undefined|NaN/);
+});
+
+test("renderCrossTaskInsight: lean variant used no sub-agents → drops the misleading 0/N pairing", () => {
+  // agentic-os owns the HEAVY diff and the sub-agents; naked is lean with none.
+  // Pairing "naked used sub-agents on 0/1 tasks, and produced a leaner diff"
+  // would read as if leanness came despite them — so the clause must be dropped.
+  const report = makeReport({
+    taskId: "safe-redirect",
+    results: [
+      behavCell("agentic-os", "safe-redirect", 1166, 1, 0.2, 100_000),
+      behavCell("naked", "safe-redirect", 195, 0, 0.1, 50_000),
+    ],
+  });
+  const insight = renderCrossTaskInsight(report);
+  assert.match(insight, /`naked` produced a leaner diff than `agentic-os`/);
+  assert.doesNotMatch(insight, /used sub-agents on 0\//); // no misleading pairing
+  // The heavier variant's sub-agent usage is the coherent contrast instead.
+  assert.match(insight, /`agentic-os` used sub-agents on 1\/1 tasks\./);
+  assert.doesNotMatch(insight, /undefined|NaN/);
+});
+
+test("renderCrossTaskInsight: no behavioral data → empty; assembly omits the section", () => {
+  const report = makeReport({ results: [cell("alpha", "t1"), cell("bravo", "t1")] });
+  assert.equal(renderCrossTaskInsight(report), "");
+  assert.doesNotMatch(renderReportMarkdown(report), /## Cross-task insight/);
+});
+
+test("renderCrossTaskInsight: single variant degrades to a modest sub-agent line", () => {
+  const report = makeReport({
+    results: [
+      behavCell("agentic-os", "t1", 100, 1, 0.2, 100_000),
+      behavCell("agentic-os", "t2", 90, 0, 0.2, 100_000),
+    ],
+  });
+  const insight = renderCrossTaskInsight(report);
+  assert.match(insight, /`agentic-os` used sub-agents on 1\/2 tasks with behavioral data\./);
+  assert.doesNotMatch(insight, /leaner diff/); // no cross-variant contrast to draw
+});
+
+// --- Focused report (--focus, #20) -------------------------------------------
+
+test("renderReportMarkdown(focus): renders only the named axis + header", () => {
+  const report = makeReport({
+    taskId: "t1",
+    results: [
+      behavCell("agentic-os", "t1", 100, 1, 0.2, 100_000),
+      behavCell("naked", "t1", 400, 0, 0.1, 50_000),
+    ],
+  });
+
+  const craftMd = renderReportMarkdown(report, "craft");
+  assert.match(craftMd, /# CLAUDE.md Variant Benchmark Report/); // header stays
+  assert.match(craftMd, /Focused report: `craft` only/);
+  assert.match(craftMd, /## Craft/);
+  assert.doesNotMatch(craftMd, /## Correctness/);
+  assert.doesNotMatch(craftMd, /## Efficiency/);
+  assert.doesNotMatch(craftMd, /## Reliability/);
+  assert.doesNotMatch(craftMd, /## Blast radius/);
+  assert.doesNotMatch(craftMd, /## Cross-task insight/); // insight dropped in focus mode
+  assert.doesNotMatch(craftMd, /## Behavioral signals/);
+
+  const effMd = renderReportMarkdown(report, "efficiency");
+  assert.match(effMd, /## Efficiency/);
+  assert.doesNotMatch(effMd, /## Craft/);
+  assert.doesNotMatch(effMd, /## Correctness/);
 });
 
 // --- JSON payload --------------------------------------------------------------
