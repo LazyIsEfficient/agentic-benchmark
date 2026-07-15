@@ -48,6 +48,46 @@ function stddev(values: number[]): number {
   return Math.sqrt(mean(values.map((v) => (v - m) ** 2)));
 }
 
+// --- Sparklines (pure, observational) ---------------------------------------
+
+/** Unicode block ramp, low→high, for inline sparklines. */
+const SPARK_RAMP = "▁▂▃▄▅▆▇█";
+
+/**
+ * Inline unicode sparkline over a numeric series, min/max-normalized across the
+ * series itself so the shape reads relative to its own range. Empty series →
+ * `""`; a single value or a flat series (no spread) → the lowest block repeated.
+ * Observational only — never a score component.
+ */
+export function sparkline(values: number[]): string {
+  if (values.length === 0) return "";
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min;
+  const top = SPARK_RAMP.length - 1;
+  return values
+    .map((v) => SPARK_RAMP[span === 0 ? 0 : Math.round(((v - min) / span) * top)])
+    .join("");
+}
+
+/**
+ * Sparkline over pre-computed levels on a FIXED `0..maxLevel` scale (absolute,
+ * not self-normalized) — so an all-high series reads tall and an all-low series
+ * reads short, instead of both collapsing to the floor. Used by the campaign
+ * adherence trajectory, where each grade's ABSOLUTE strength is the point.
+ * Levels are clamped into range; `maxLevel <= 0` → the floor block.
+ */
+export function levelSparkline(levels: number[], maxLevel: number): string {
+  if (levels.length === 0) return "";
+  const top = SPARK_RAMP.length - 1;
+  return levels
+    .map((lv) => {
+      const clamped = Math.max(0, Math.min(lv, maxLevel));
+      return SPARK_RAMP[maxLevel <= 0 ? 0 : Math.round((clamped / maxLevel) * top)];
+    })
+    .join("");
+}
+
 /** Distinct executor models in first-seen order. */
 export function distinctModels(results: VariantTaskResult[]): string[] {
   const seen: string[] = [];
@@ -826,6 +866,22 @@ export interface ReliabilityGroup {
   wallMsStddev: number;
   /** min–max craft score per dimension over judged runs; null when none numeric. */
   craftRange: Record<CraftDimension, { min: number; max: number } | null>;
+  /**
+   * Dispersion of a per-run composite Craft signal — each judge-OK run's mean
+   * over its numeric craft dimensions — as min/mean/max across the repeats.
+   * A per-run mean-of-dimensions, NOT the pairwise composite Craft Score (win
+   * rate isn't per-run), so it stays computable from a single run. null when no
+   * run carried a numeric craft dimension.
+   */
+  craftScore: { min: number; mean: number; max: number } | null;
+  /**
+   * Correctness verdict agreement across repeats: how many runs read correct out
+   * of those with a determinable verdict (deterministic testResults.ok, else the
+   * judge's likely_correct/likely_incorrect fallback). `verdictRuns` 0 ⇒ no run
+   * yielded a verdict.
+   */
+  correctRuns: number;
+  verdictRuns: number;
   /** Total `unknown` craft scores across the group's judge-OK runs. */
   craftUnknowns: number;
   /**
@@ -891,6 +947,25 @@ export function aggregateReliability(
             : null;
       }
 
+      // Per-run composite craft signal: each judge-OK run's mean over its own
+      // numeric dimensions. Dispersion (min/mean/max) across the repeats.
+      const perRunCraft: number[] = [];
+      for (const r of members) {
+        if (r.judgeFailure) continue;
+        const nums: number[] = [];
+        for (const dim of CRAFT_DIMENSIONS) {
+          const score = r.judge?.craft[dim].score;
+          if (typeof score === "number") nums.push(score);
+        }
+        if (nums.length > 0) perRunCraft.push(mean(nums));
+      }
+
+      // Per-run correctness verdict rate across the repeats: deterministic test
+      // outcome when present, else the judge's likely_correct/incorrect fallback.
+      const verdicts = members
+        .map((r) => runCorrectness(r))
+        .filter((v): v is boolean => v !== undefined);
+
       return {
         taskId: first.taskId,
         variant: first.variant,
@@ -899,6 +974,16 @@ export function aggregateReliability(
         costStddevUsd: costs.length >= 2 ? stddev(costs) : null,
         wallMsStddev: stddev(members.map((r) => r.metrics.executor.wallMs)),
         craftRange,
+        craftScore:
+          perRunCraft.length > 0
+            ? {
+                min: Math.min(...perRunCraft),
+                mean: mean(perRunCraft),
+                max: Math.max(...perRunCraft),
+              }
+            : null,
+        correctRuns: verdicts.filter(Boolean).length,
+        verdictRuns: verdicts.length,
         craftUnknowns,
         judgeFailures: members.filter((r) => r.judgeFailure !== undefined).length,
         anchorGrades: members
@@ -906,6 +991,20 @@ export function aggregateReliability(
           .map((r) => anchorGradeLabel(r.anchors!)),
       };
     });
+}
+
+/**
+ * One run's correctness verdict for reliability agreement: the deterministic
+ * testCommand outcome when a run has one, else the judge's fallback read
+ * (likely_correct → true, likely_incorrect → false). `undefined` when neither
+ * evidence class yielded a verdict — that run simply doesn't enter the rate.
+ */
+function runCorrectness(r: VariantTaskResult): boolean | undefined {
+  if (r.testResults !== undefined) return r.testResults.ok;
+  const verdict = r.judge?.correctnessAssessment?.verdict;
+  if (verdict === "likely_correct") return true;
+  if (verdict === "likely_incorrect") return false;
+  return undefined;
 }
 
 /** The anchor label a reliability row compares: grade, or a legacy-boolean read. */
@@ -933,21 +1032,29 @@ export function renderReliability(results: VariantTaskResult[]): string {
       ? `${grades.length}/${grades.length} identical`
       : distinct.join(", ");
   };
-  const header =
-    `| Cell | Runs | Exec cost σ | Wall time σ | Naming | Structure | Consistency | Economy | Craft unknowns | Anchor grades |\n` +
-    `| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
   const unknowns = (g: ReliabilityGroup) =>
     g.judgeFailures > 0
       ? `${g.craftUnknowns} (judgeFailures: ${g.judgeFailures})`
       : String(g.craftUnknowns);
+  const correctness = (g: ReliabilityGroup) =>
+    g.verdictRuns === 0 ? "—" : `${g.correctRuns}/${g.verdictRuns} correct`;
+  const craftScore = (g: ReliabilityGroup) =>
+    g.craftScore === null
+      ? "—"
+      : `${g.craftScore.min.toFixed(1)} / ${g.craftScore.mean.toFixed(1)} / ${g.craftScore.max.toFixed(1)}`;
+  const header =
+    `| Cell | Runs | Correctness | Craft score (min/mean/max) | Exec cost σ | Wall time σ | Naming | Structure | Consistency | Economy | Craft unknowns | Anchor grades |\n` +
+    `| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
   const rows = groups.map(
     (g) =>
-      `| \`${g.taskId}\` × ${g.variant} [${g.executorModel}] | ${g.runCount} | ${g.costStddevUsd === null ? "—" : fmtCost(g.costStddevUsd)} | ${fmtSeconds(g.wallMsStddev)} | ${range(g.craftRange.naming)} | ${range(g.craftRange.structure)} | ${range(g.craftRange.consistency)} | ${range(g.craftRange.economy)} | ${unknowns(g)} | ${agreement(g.anchorGrades)} |`,
+      `| \`${g.taskId}\` × ${g.variant} [${g.executorModel}] | ${g.runCount} | ${correctness(g)} | ${craftScore(g)} | ${g.costStddevUsd === null ? "—" : fmtCost(g.costStddevUsd)} | ${fmtSeconds(g.wallMsStddev)} | ${range(g.craftRange.naming)} | ${range(g.craftRange.structure)} | ${range(g.craftRange.consistency)} | ${range(g.craftRange.economy)} | ${unknowns(g)} | ${agreement(g.anchorGrades)} |`,
   );
   return [
-    "_Spread across --repeats runs of the same (task × variant × model) cell. σ = population standard deviation. Executor-failed repeats are excluded (coverage gaps, not variance). Observed, never a score component._",
+    "_Dispersion across --repeats runs of the same (task × variant × model) cell — the three major axes plus per-dimension craft ranges. Correctness = agreeing runs / runs with a verdict; Craft score = per-run mean-of-dimensions as min/mean/max; σ = population standard deviation of cost/time. Executor-failed repeats are excluded (coverage gaps, not variance). Observed, never a score component._",
     "",
     [header, ...rows].join("\n"),
+    "",
+    "_Targeting: spend repeats on the high-variance, high-turn cells — `prisma-tx-deadlock`, `safe-redirect`, and the campaign chain — rather than uniformly across the matrix; uniform repeats mostly re-confirm the cells that were already stable. Guidance only, not enforced._",
   ].join("\n");
 }
 
@@ -1118,16 +1225,27 @@ export function aggregateMetrics(
 /** The Efficiency markdown table (with a Model column) + observed-only note. */
 export function renderRunMetrics(results: VariantTaskResult[]): string {
   const header =
-    `| Variant | Model | Exec time (s) | Exec cost (USD) | Input tok (uncached) | Output tok | Turns | Judge cost (USD) |\n` +
-    `| --- | --- | --- | --- | --- | --- | --- | --- |`;
+    `| Variant | Model | Exec time (s) | Exec cost (USD) | Input tok (uncached) | Output tok | Turns | Judge cost (USD) | Cost/task |\n` +
+    `| --- | --- | --- | --- | --- | --- | --- | --- | --- |`;
 
-  const rows = aggregateMetrics(results).map(
-    (m) =>
-      `| ${variantLabelWithDisqualification(m.variant, m.hasDisqualified)} | ${m.executorModel} | ${fmtSeconds(m.wallMs)} | ${fmtCost(m.execCostUsd)} | ${fmtTokens(m.inputTokens)} | ${fmtTokens(m.outputTokens)} | ${fmtInt(m.numTurns)} | ${fmtCost(m.judgeCostUsd)} |`,
-  );
+  // Per-unit member cells (in task order) for the per-task cost sparkline —
+  // an observational visual companion to the summed totals.
+  const membersByUnit = new Map<string, VariantTaskResult[]>();
+  for (const g of groupByVariantModel(results)) {
+    membersByUnit.set(`${g.variant}${SEP}${g.executorModel}`, g.members);
+  }
+
+  const rows = aggregateMetrics(results).map((m) => {
+    const members = membersByUnit.get(`${m.variant}${SEP}${m.executorModel}`) ?? [];
+    const costs = members
+      .map((r) => r.metrics.executor.costUsd)
+      .filter((c): c is number => c !== undefined);
+    const spark = costs.length > 0 ? sparkline(costs) : "—";
+    return `| ${variantLabelWithDisqualification(m.variant, m.hasDisqualified)} | ${m.executorModel} | ${fmtSeconds(m.wallMs)} | ${fmtCost(m.execCostUsd)} | ${fmtTokens(m.inputTokens)} | ${fmtTokens(m.outputTokens)} | ${fmtInt(m.numTurns)} | ${fmtCost(m.judgeCostUsd)} | ${spark} |`;
+  });
 
   return [
-    "_Observed cost/time, summed across each (variant × model)'s task(s). Observed only — never a score component._",
+    "_Observed cost/time, summed across each (variant × model)'s task(s). Cost/task = per-task exec-cost sparkline, min/max-normalized WITHIN each unit (relative shape, not absolute magnitude). Observed only — never a score component._",
     "",
     [header, ...rows].join("\n"),
   ].join("\n");
@@ -1504,6 +1622,37 @@ function campaignAdherenceCell(t: CampaignTaskResult): string {
 }
 
 /**
+ * Absolute adherence strength of an anchor verdict on a fixed `0..6` scale, for
+ * the trajectory sparkline: held-by-abstraction (6) → held-by-literal (4) →
+ * held-by-inertia (3) → held-by-chain (2) → drift (1) → trap/unknown (0). Mirrors
+ * the AnchorGrade strength ordering (unknown fails closed to the floor).
+ * Grade-less legacy anchors read from the booleans: a hold ≈ held-by-literal (4),
+ * a trap → 0, other breakage → drift (1).
+ */
+const ADHERENCE_MAX_LEVEL = 6;
+function anchorAdherenceLevel(a: AnchorResult): number {
+  if (a.grade !== undefined) {
+    switch (a.grade) {
+      case "held-by-abstraction":
+        return 6;
+      case "held-by-literal":
+        return 4;
+      case "held-by-inertia":
+        return 3;
+      case "held-by-chain":
+        return 2;
+      case "drift":
+        return 1;
+      case "trap":
+      case "unknown":
+        return 0;
+    }
+  }
+  if (a.conventionHeld) return 4;
+  return a.hitKnownTrap ? 0 : 1;
+}
+
+/**
  * One trajectory cell: adherence LEADS, then executor turns as secondary
  * context, with a `✗fail` marker between them when the link failed. A missing
  * link renders `—`. A failed link keeps its adherence — the deterministic
@@ -1565,6 +1714,19 @@ export function renderCampaignMemoryEffect(campaigns: CampaignResult[]): string 
   });
   const table = [header, ...rows].join("\n");
 
+  // Per-bundle adherence sparkline across the chain (anchored links only, in
+  // index order). Absolute scale: an all-abstraction chain reads tall, an
+  // all-trap chain reads flat. Purely observational — a visual companion to the
+  // grade cells below, changing no number.
+  const sparkLines = campaigns.map((c) => {
+    const levels = [...c.tasks]
+      .filter((t) => t.anchors !== undefined)
+      .sort((a, b) => a.index - b.index)
+      .map((t) => anchorAdherenceLevel(t.anchors!));
+    const spark = levels.length > 0 ? levelSparkline(levels, ADHERENCE_MAX_LEVEL) : "—";
+    return `- ${label(c)} \`${spark}\``;
+  });
+
   return [
     `**Cumulative adherence:** ${headline}`,
     "",
@@ -1572,6 +1734,10 @@ export function renderCampaignMemoryEffect(campaigns: CampaignResult[]): string 
     "",
     ...(anyGraded ? [GRADE_LEGEND, ""] : []),
     "#### Per-task trajectory",
+    "",
+    "_Adherence sparkline per bundle across the chain (higher = stronger hold: trap/drift low → held-by-literal mid → held-by-abstraction high). Observational only._",
+    "",
+    ...sparkLines,
     "",
     "_Cell = adherence · executor turns. ✓ held = kept the convention; ✗ drift = broke it; ⚠ trap = adopted the known-wrong convention; — = no anchor (judged only); ✗fail = link failed; ☠ = disqualified (adversarial)._",
     "",
