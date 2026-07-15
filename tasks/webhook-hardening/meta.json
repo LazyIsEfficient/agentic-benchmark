@@ -3,6 +3,7 @@
   "title": "Harden payment webhook ingestion (signature, replay, idempotency)",
   "logicBearing": true,
   "securityRelevant": true,
+  "expectedSurface": ["src/**", "prisma/**", "README.md"],
   "seedFiles": [
     ".env",
     ".env.example",

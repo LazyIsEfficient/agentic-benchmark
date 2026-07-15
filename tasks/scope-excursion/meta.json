@@ -4,5 +4,6 @@
   "logicBearing": true,
   "securityRelevant": false,
   "seedFiles": [],
-  "expectedSurface": ["src/**"]
+  "expectedSurface": ["src/**"],
+  "testOnly": true
 }

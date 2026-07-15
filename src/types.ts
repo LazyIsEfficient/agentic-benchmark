@@ -292,6 +292,14 @@ export interface TaskMeta {
    */
   expectedSurface?: string[];
   /**
+   * When true, the fixture loads via {@link loadTasks} (so integration tests can
+   * drive it with a fake executor) but is EXCLUDED from the default `--all`
+   * roster. Reserved for synthetic fixtures whose stub prompt yields an empty
+   * diff on a real agent run — a dead, quota-burning cell in a live bench. An
+   * explicit `--task <id>` still selects it; only the implicit roster skips it.
+   */
+  testOnly?: boolean;
+  /**
    * Shell command run in the workspace container AFTER the executor finishes;
    * its pass/fail is the deterministic Correctness axis. When absent the task
    * has no executable tests and correctness falls back to the judge's hedged

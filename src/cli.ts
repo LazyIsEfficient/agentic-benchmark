@@ -431,7 +431,10 @@ function selectVariants(all: Variant[], names: string[]): Variant[] {
 }
 
 function selectTasks(all: Task[], taskId?: string): Task[] {
-  if (!taskId) return all;
+  // Implicit roster (`--all`): drop `testOnly` fixtures — synthetic tasks whose
+  // stub prompt yields an empty diff on a real run and only exist to feed the
+  // fake-executor integration tests. An explicit `--task <id>` still selects one.
+  if (!taskId) return all.filter((task) => !task.meta.testOnly);
   const t = all.filter((task) => task.meta.id === taskId);
   if (t.length === 0) throw new Error(`Unknown task id: ${taskId}`);
   return t;
