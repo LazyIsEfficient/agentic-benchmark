@@ -101,6 +101,14 @@ test("extractJudgeJson skips a decoy brace and finds the real outermost object",
   assert.deepEqual(extractJudgeJson(envelope(result)), validPayload);
 });
 
+test("extractJudgeJson returns the real verdict, not a leading complete example", () => {
+  // The judge sometimes echoes a format example (a valid object) BEFORE the real
+  // verdict. Last-parseable selection dodges the example.
+  const result =
+    'Format example: {"winner":"agent_a"}\n\nActual verdict: {"winner":"agent_b"}';
+  assert.deepEqual(extractJudgeJson(envelope(result)), { winner: "agent_b" });
+});
+
 test("extractJudgeJson still throws on truly unrecoverable garbage in the block", () => {
   // Unquoted tokens cannot be repaired into valid JSON — fail closed.
   const result = "```json\n{ codeQuality: nonsense here, no quotes at all\n```";
@@ -271,6 +279,22 @@ test("parseCellJudgeResult finds the real object past a decoy brace in prose", (
   const raw = "The config { key } is unrelated. Verdict:\n" + JSON.stringify(validCellPayload);
   const r = parseCellJudgeResult(raw);
   assert.equal(r.craft.consistency.score, 4);
+});
+
+test("parseCellJudgeResult returns the real verdict past a leading complete example object", () => {
+  // A full, valid example payload precedes the real one; last-parseable wins.
+  const example = withCraftDim("naming", {
+    score: 0,
+    evidence: ["example — ignore me"],
+  });
+  const raw =
+    "Example of the format:\n```json\n" +
+    JSON.stringify(example) +
+    "\n```\n\nActual verdict:\n```json\n" +
+    JSON.stringify(validCellPayload) +
+    "\n```";
+  const r = parseCellJudgeResult(raw);
+  assert.equal(r.craft.naming.score, 3); // the verdict's 3, not the example's 0
 });
 
 test("parseCellJudgeResult still fails closed on true garbage (no fabricated verdict)", () => {

@@ -45,9 +45,10 @@ export function truncateEvidence(
   };
 }
 
-/** Cap on how many `{` start positions we probe per region — bounds the
- * enumeration cost on pathological input while comfortably covering any real
- * judge response (which carries at most a handful of top-level braces). */
+/** Cap on how many `{` start positions we probe per region. Bounds worst-case
+ * cost at O(MAX_OBJECT_STARTS × region length) on brace-heavy/adversarial input;
+ * 200 sits far above any real judge response (a handful of top-level braces plus
+ * their nesting) while keeping the scan cheap. */
 const MAX_OBJECT_STARTS = 200;
 
 /**
@@ -86,7 +87,9 @@ function stripTrailingCommas(text: string): string {
 
 /**
  * Scan a brace/bracket-balanced object starting at `start` (which must index a
- * `{`), string/escape aware. Returns:
+ * `{`), string/escape aware. Returns `{ text, end }` where `end` is the source
+ * index just past the object (so the caller can skip its interior braces and
+ * advance to the next TOP-LEVEL object):
  * - the exact object span when it closes cleanly (trailing content ignored);
  * - a REPAIR-CLOSED span when the text is truncated mid-object — an open string
  *   is closed and every still-open container is closed, in reverse order.
@@ -95,7 +98,7 @@ function stripTrailingCommas(text: string): string {
  * (e.g. a truncated `"key":` with no value) is caught by the caller's
  * `JSON.parse` gate, which rejects the candidate. Pure.
  */
-function scanObject(text: string, start: number): string | null {
+function scanObject(text: string, start: number): { text: string; end: number } {
   const closers: string[] = [];
   let inStr = false;
   let esc = false;
@@ -113,15 +116,15 @@ function scanObject(text: string, start: number): string | null {
     else if (c === "}" || c === "]") {
       if (closers.length === 0) break; // stray closer — not our object
       closers.pop();
-      if (closers.length === 0) return text.slice(start, i + 1);
+      if (closers.length === 0) return { text: text.slice(start, i + 1), end: i + 1 };
     }
   }
   // Truncated: the object never closed. Rebuild by closing an open string and
-  // the outstanding containers (innermost first).
+  // the outstanding containers (innermost first). Source is consumed to the end.
   let repaired = text.slice(start);
   if (inStr) repaired += '"';
   for (let k = closers.length - 1; k >= 0; k--) repaired += closers[k];
-  return repaired;
+  return { text: repaired, end: text.length };
 }
 
 /**
@@ -138,31 +141,49 @@ function scanObject(text: string, start: number): string | null {
  * null`, returning JSON object *text* ready for `JSON.parse`.
  */
 export function extractJsonObjectText(text: string): string | null {
-  // Search regions in priority order: a ```json fence, then a bare ``` fence,
-  // then the whole text. First region to yield a parseable object wins.
+  // Search regions in priority order: the LAST ```json fence, then the LAST bare
+  // ``` fence, then the whole text. First region to yield a parseable object
+  // wins. We take the LAST fence (not the first) for the same reason we take the
+  // last object within a region — the judge emits any format example / echoed
+  // schema in an earlier fence and the real verdict in the final one.
+  const lastMatch = (re: RegExp): string | undefined => {
+    let body: string | undefined;
+    for (const m of text.matchAll(re)) body = m[1];
+    return body;
+  };
   const regions: string[] = [];
-  const jsonFence = text.match(/```json\s*([\s\S]*?)```/i);
-  if (jsonFence?.[1] !== undefined) regions.push(jsonFence[1]);
-  const bareFence = text.match(/```\s*([\s\S]*?)```/);
-  if (bareFence?.[1] !== undefined) regions.push(bareFence[1]);
+  const jsonFence = lastMatch(/```json\s*([\s\S]*?)```/gi);
+  if (jsonFence !== undefined) regions.push(jsonFence);
+  const bareFence = lastMatch(/```\s*([\s\S]*?)```/g);
+  if (bareFence !== undefined) regions.push(bareFence);
   regions.push(text);
 
   for (const region of regions) {
     let starts = 0;
+    // Keep the LAST parseable candidate, not the first: the judge emits the real
+    // verdict last, after any format example / echoed-schema object, so
+    // last-parseable dodges those leading decoys. A truncated verdict is also
+    // the last object, so this still recovers the truncation case.
+    let lastValid: string | null = null;
     for (let i = 0; i < region.length; i++) {
       if (region[i] !== "{") continue;
       if (++starts > MAX_OBJECT_STARTS) break;
-      const candidate = scanObject(region, i);
-      if (candidate === null) continue;
+      const { text: candidate, end } = scanObject(region, i);
       const cleaned = stripTrailingCommas(candidate);
       try {
         JSON.parse(cleaned);
-        return cleaned;
+        lastValid = cleaned;
+        // Parsed cleanly — skip this object's interior so its nested
+        // sub-objects are never weighed as candidates; resume at the next
+        // TOP-LEVEL brace (loop's i++ lands on `end`).
+        i = end - 1;
       } catch {
-        // This `{` did not open a parseable object (decoy brace, unrecoverable
-        // truncation, or invalid JSON) — try the next candidate start.
+        // Not a parseable object (decoy brace, an unclosed brace that
+        // over-consumed a later real object, or invalid JSON). Do NOT skip —
+        // advance by one so a nested or later object still gets its chance.
       }
     }
+    if (lastValid !== null) return lastValid;
   }
   return null;
 }
