@@ -444,6 +444,31 @@ const LINKAGE_STOPLIST: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Domain FIELD-NAME identifiers excluded from counting as carried-abstraction
+ * linkage. These are the schema/column nouns every link in a chain naturally
+ * touches (`id`, `uuid`, `createdAt`, `updatedAt`, `timestamp`) — a later link
+ * re-emitting one is applying the rule's SURFACE, not reusing a helper the chain
+ * introduced, so crediting it as linkage manufactured false ✓A.
+ *
+ * DELIBERATELY DECOUPLED from `appliesIf`. Rule applicability must stay broad —
+ * `[a-z]Id\b` in `appliesIf` is what catches camelCase id drift (`userId =
+ * nanoid()`) — but that same pattern would drag a genuine helper name into the
+ * exclusion set (`mintId` matches `[a-z]Id\b`), killing the very ✓A path linkage
+ * exists to reward. So exclusion uses THIS curated, anchored set instead of the
+ * anchor's `appliesIf`. Each pattern is `^…$`-anchored to the WHOLE identifier,
+ * so a helper whose name merely CONTAINS a field noun — `mintId`,
+ * `stampCreatedAt` — survives harvest and can still earn ✓A, while the bare field
+ * noun itself stays excluded.
+ */
+const LINKAGE_DOMAIN_FIELD_NAMES: readonly RegExp[] = [
+  /^id$/i,
+  /^uuid$/i,
+  /^createdAt$/,
+  /^updatedAt$/,
+  /^timestamp$/,
+];
+
+/**
  * Declaration NAMES bound on a code line — the identifier introduced by a
  * `function` / `const` / `let` / `var` / `class` declaration. Only a name the
  * bundle INTRODUCED can be a carried abstraction, so linkage is harvested from
@@ -501,26 +526,37 @@ function extractAddedLineGroups(diff: string): string[][] {
   return groups;
 }
 
+/** A harvested linkage identifier plus the required-marker it was found beside. */
+interface LinkageCandidate {
+  /** The declaration name harvested near a missing-required marker. */
+  ident: string;
+  /** Index into the anchor's `required` array of the marker this credits. */
+  markerIdx: number;
+}
+
 /**
  * Harvest candidate linkage identifiers from a cumulative diff: for every added
- * line matching ANY `markerRequired` pattern, collect the DECLARATION NAMES (see
+ * line matching a MISSING required marker, collect the DECLARATION NAMES (see
  * {@link declaredNames}) introduced within ±{@link LINKAGE_WINDOW} added lines of
  * it (same-file window), deduplicated in first-seen order, MINUS two classes of
  * non-abstraction:
  *
  *  - the stoplist (JS keywords / primitive type names), and
- *  - `ruleVocabulary` — any name matching a `required` OR `appliesIf` pattern of
- *    the anchor itself. Those are the rule's OWN field/domain terms (`createdAt`,
- *    `updatedAt`, `timestamp`, an `…Id` field, `ulid_`) shared by every link, so
- *    a later link re-emitting one is applying the rule's surface, NOT reusing a
- *    carried helper — crediting it as linkage produced false ✓A.
+ *  - {@link LINKAGE_DOMAIN_FIELD_NAMES} — the curated schema/field nouns (`id`,
+ *    `uuid`, `createdAt`, `updatedAt`, `timestamp`) shared by every link. This is
+ *    a SEPARATE, anchored vocabulary — NOT the anchor's `appliesIf` — so a broad
+ *    applicability pattern like `[a-z]Id\b` can catch camelCase id drift without
+ *    excluding a genuine `mintId` helper from linkage.
  *
- * `markerRequired` is the required patterns ABSENT from the current link (the
+ * `missingMarkers` carries each required pattern ABSENT from the current link
+ * paired with its ORIGINAL index in the anchor's `required` array (the
  * conventions being credited to the CHAIN), NOT every required pattern. Scoping
  * to the missing markers is what proves the ABSTRACTION: linkage must sit beside
  * the literal the link no longer emits (`ulid_` held via a helper), never beside
  * a marker the link DID emit — otherwise a link self-links via its own function
- * name declared next to a literal it wrote itself.
+ * name declared next to a literal it wrote itself. The retained `markerIdx` lets
+ * the caller's evidence name the marker linkage ACTUALLY credited, not the first
+ * missing one.
  *
  * What survives is the helper's own name (`mintId`) and the locals it declared —
  * identifiers this bundle genuinely INTRODUCED beside the convention literal. A
@@ -528,24 +564,24 @@ function extractAddedLineGroups(diff: string): string[][] {
  */
 function harvestLinkageIdentifiers(
   groups: string[][],
-  markerRequired: RegExp[],
-  ruleVocabulary: RegExp[],
-): string[] {
+  missingMarkers: readonly { re: RegExp; srcIdx: number }[],
+): LinkageCandidate[] {
   const seen = new Set<string>();
-  const out: string[] = [];
-  const isRuleVocabulary = (ident: string): boolean =>
-    ruleVocabulary.some((re) => re.test(ident));
+  const out: LinkageCandidate[] = [];
+  const isDomainFieldName = (ident: string): boolean =>
+    LINKAGE_DOMAIN_FIELD_NAMES.some((re) => re.test(ident));
   for (const group of groups) {
     for (let i = 0; i < group.length; i++) {
-      if (!markerRequired.some((re) => re.test(group[i]!))) continue;
+      const marker = missingMarkers.find((m) => m.re.test(group[i]!));
+      if (marker === undefined) continue;
       const lo = Math.max(0, i - LINKAGE_WINDOW);
       const hi = Math.min(group.length - 1, i + LINKAGE_WINDOW);
       for (let j = lo; j <= hi; j++) {
         for (const ident of declaredNames(group[j]!)) {
           if (ident.length < 3 || LINKAGE_STOPLIST.has(ident) || seen.has(ident)) continue;
-          if (isRuleVocabulary(ident)) continue;
+          if (isDomainFieldName(ident)) continue;
           seen.add(ident);
-          out.push(ident);
+          out.push({ ident, markerIdx: marker.srcIdx });
         }
       }
     }
@@ -599,8 +635,8 @@ function gradeFromLegacy(
  *     are harvested from the cumulative diff as DECLARATION NAMES the bundle
  *     introduced within ±LINKAGE_WINDOW lines of each required-matching line
  *     (same-file window, wide enough to reach a helper's declaration line from
- *     its body), MINUS the stoplist and the anchor's own rule vocabulary
- *     (`required` ∪ `appliesIf` — field/domain names shared by every link).
+ *     its body), MINUS the stoplist and a curated domain field-name set
+ *     ({@link LINKAGE_DOMAIN_FIELD_NAMES} — decoupled from `appliesIf`).
  *     Evidence = at least one surviving identifier appears as a whole TOKEN in
  *     the link diff's added lines (e.g. a `generateId` helper declared beside the
  *     `ulid_` marker earlier, and `generateId()` called here):
@@ -709,19 +745,23 @@ function detectRuleGraded(config: RuleAnchor, step: FinalStep, diffs: GradedDiff
     if (required.every(matchesCumulative)) {
       // Linkage is credited only for the required markers ABSENT from this link
       // (the conventions held via the chain), so a link can never self-link via a
-      // marker it emitted itself. Exclusion still spans the FULL rule vocabulary.
-      const missingRequired = required.filter((re) => !matchesLink(re));
-      const ruleVocabulary = [...required, ...(appliesIf ?? [])];
-      const candidates = harvestLinkageIdentifiers(cumulativeGroups, missingRequired, ruleVocabulary);
+      // marker it emitted itself. Each missing marker keeps its ORIGINAL index so
+      // the evidence can name the one linkage actually credited. Exclusion uses a
+      // curated domain field-name set (NOT appliesIf) — see
+      // LINKAGE_DOMAIN_FIELD_NAMES.
+      const missingMarkers = required
+        .map((re, srcIdx) => ({ re, srcIdx }))
+        .filter((m) => !matchesLink(m.re));
+      const candidates = harvestLinkageIdentifiers(cumulativeGroups, missingMarkers);
       // TOKEN-boundary match (not substring): the identifier must appear as a
       // whole token in the link's added lines, so `id` never matches inside
       // `mintId` and a domain field never spoofs a helper call.
       const linkTokens = new Set(linkAdded.flatMap(lineIdentifiers));
-      const linkage = candidates.find((ident) => linkTokens.has(ident));
+      const linkage = candidates.find((c) => linkTokens.has(c.ident));
       if (linkage !== undefined) {
         return held(
           "held-by-abstraction",
-          `required /${requiredSrc[missingIdx]}/ absent from link diff but all required matched cumulative-diff added lines; linkage via identifier "${linkage}" reused in this link's diff`,
+          `required /${requiredSrc[linkage.markerIdx]}/ absent from link diff but all required matched cumulative-diff added lines; linkage via identifier "${linkage.ident}" reused in this link's diff`,
         );
       }
       if (appliesIf !== undefined) {
