@@ -249,6 +249,63 @@ test("renderCorrectness: legacy rows render em dashes; disqualified cells carry 
   assert.match(md, /\| dq ☠ DISQUALIFIED \| sonnet \| 1\/1 pass \| — \|/);
 });
 
+// Regression guard for issue #9: the Correctness render must keep the three
+// deterministic-verdict states visibly distinct, and must shout when a whole
+// matrix ran with ZERO deterministic verdicts (the failure that shipped in run
+// 5e89e754 — every cell silently fell back to the judge).
+test("renderCorrectness: ran+passed / ran+failed / not-run are three DISTINCT Tests tokens", () => {
+  const passed = renderCorrectness([cell("pass", "t1", { testResults: makeTestResults(true, 2, 0) })]);
+  const failed = renderCorrectness([cell("fail", "t1", { testResults: makeTestResults(false, 0, 2) })]);
+  const notRun = renderCorrectness([
+    cell("skip", "t1", {
+      judge: judgeResult({
+        correctnessAssessment: { verdict: "likely_correct", evidence: ["looks wired"] },
+      }),
+    }),
+  ]);
+  assert.match(passed, /\| pass \| sonnet \| 1\/1 pass \|/); // ran + passed
+  assert.match(failed, /\| fail \| sonnet \| 0\/1 pass \|/); // ran + failed (verdict, not absent)
+  assert.match(notRun, /\| skip \| sonnet \| — \|/); // not run → em dash
+  // A ran-but-failed verdict must NEVER collapse into the same token as not-run.
+  assert.doesNotMatch(failed, /\| fail \| sonnet \| — \|/);
+});
+
+test("renderCorrectness: all-empty Tests column across the matrix raises a loud warning (issue #9)", () => {
+  const allJudgeFallback = [
+    cell("a", "t1", {
+      judge: judgeResult({
+        correctnessAssessment: { verdict: "likely_correct", evidence: ["ok"] },
+      }),
+    }),
+    cell("a", "t2", {
+      judge: judgeResult({
+        correctnessAssessment: { verdict: "likely_incorrect", evidence: ["nope"] },
+      }),
+    }),
+  ];
+  const md = renderCorrectness(allJudgeFallback);
+  assert.match(md, /No deterministic test verdict ran/);
+  assert.match(md, /testCommand/);
+});
+
+test("renderCorrectness: warning is SUPPRESSED once any cell carries a deterministic verdict", () => {
+  const armed = [
+    cell("a", "t1", { testResults: makeTestResults(true, 1, 0) }),
+    cell("a", "t2", {
+      judge: judgeResult({
+        correctnessAssessment: { verdict: "likely_correct", evidence: ["ok"] },
+      }),
+    }),
+  ];
+  assert.doesNotMatch(renderCorrectness(armed), /No deterministic test verdict ran/);
+});
+
+test("renderCorrectness: a legacy-only report (no evidence at all) does NOT trip the #9 warning", () => {
+  // Neither testResults nor judge anywhere — nothing to score yet, so the
+  // warning would be noise, not signal.
+  assert.doesNotMatch(renderCorrectness([cell("old", "t1")]), /No deterministic test verdict ran/);
+});
+
 // --- Axis 2: Adherence — grade symbols + legacy fallback -----------------------
 
 test("gradeSymbol maps every grade to its compact symbol", () => {

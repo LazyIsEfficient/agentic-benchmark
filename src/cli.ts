@@ -647,8 +647,12 @@ export async function runCell(
   if (!artifacts.executorOk) {
     emit(`  executor: FAILED — ${artifacts.failureReason}`);
   } else {
+    // Report the DETERMINISTIC test verdict, not `testFilesPresent` (which only
+    // means "the diff touched a test file"). Printing presence-as-a-boolean here
+    // read like "tests ran/passed" and masked an empty Correctness column for a
+    // whole matrix (issue #9). `none` = no testCommand ran for this cell.
     emit(
-      `  executor: ok (${artifacts.changedFiles.length} files, tests=${artifacts.testFilesPresent})`,
+      `  executor: ok (${artifacts.changedFiles.length} files, tests: ${formatTestResultsSummary(artifacts.testResults)})`,
     );
   }
 

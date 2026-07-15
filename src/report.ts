@@ -264,7 +264,8 @@ export function renderCorrectness(
   const header =
     `| Variant | Model | Tests | Judge fallback (untested cells) |\n` +
     `| --- | --- | --- | --- |`;
-  const rows = aggregateCorrectness(withCampaignLinks(results, campaigns)).map((c) => {
+  const aggregates = aggregateCorrectness(withCampaignLinks(results, campaigns));
+  const rows = aggregates.map((c) => {
     const name = variantLabelWithDisqualification(c.variant, c.hasDisqualified);
     if (c.legacy) return `| ${name} | ${c.executorModel} | — | — |`;
     const tests =
@@ -279,9 +280,29 @@ export function renderCorrectness(
   });
   return [
     "_Tested cells report the deterministic testCommand verdict; untested cells report the judge's hedged read. Two different evidence classes — never blended into one number._",
+    ...correctnessCoverageWarning(aggregates),
     "",
     [header, ...rows].join("\n"),
   ].join("\n");
+}
+
+/**
+ * Regression guard for issue #9: a full matrix where the Tests column is `—` for
+ * EVERY cell means 100% of Correctness silently fell back to the judge's hedged
+ * read — the deterministic axis never contributed. That looked like a normal
+ * report last time and shipped unnoticed. Surface it loudly instead: if there is
+ * scored (non-legacy) correctness evidence but not a single deterministic test
+ * verdict anywhere, prepend a warning. Returns [] (no warning) when the axis is
+ * armed (some cell tested) or when there is nothing to score yet.
+ */
+function correctnessCoverageWarning(aggregates: CorrectnessAggregate[]): string[] {
+  const scored = aggregates.some((c) => !c.legacy);
+  const anyTested = aggregates.some((c) => c.testedCount > 0);
+  if (!scored || anyTested) return [];
+  return [
+    "",
+    "> ⚠️ **No deterministic test verdict ran in this matrix** — every Correctness cell fell back to the judge's hedged read. Declare a `testCommand` in the task's `meta.json` to arm the deterministic axis before trusting these numbers.",
+  ];
 }
 
 // --- Axis 3: Craft --------------------------------------------------------------
