@@ -57,8 +57,15 @@ const MEMORY_FILE = path.join(".claude", "memory", "conventions.md");
  * Memory-carrying agent: records R1 on link 1 and R2 on link 2 (proving memory
  * accumulates), reads them back on link 3 (proving persistence across the reset),
  * and writes convention-ADHERING code on links 3/4/5.
+ *
+ * On link 4 it INTRODUCES a named id-minting helper (`mintId`, ulid_ literal in
+ * its body) — the abstraction. `reuseHelper` decides link 5's generalization:
+ *  - true  → link 5 mints the revision id by CALLING `mintId` (no ulid_ literal
+ *            in this link) → the strongest grade, held-by-abstraction (✓A);
+ *  - false → link 5 RE-EMITS the ulid_ literal inline → held-by-literal (✓L).
+ * Same memory, same conventions held — only the bundle's generalization differs.
  */
-function makeCarrying(): ExecutorRunner {
+function makeCarrying(reuseHelper = true): ExecutorRunner {
   let call = 0;
   return async ({ workspaceDir }) => {
     call++;
@@ -75,7 +82,23 @@ function makeCarrying(): ExecutorRunner {
       assert.match(note, /ulid_/, "R2 note must persist into link 3");
       await write(workspaceDir, "src/createdAt.ts", "export const stamp = () => Math.floor(Date.now() / 1000);\n");
     } else if (call === 4) {
-      await write(workspaceDir, "src/attach.ts", "export const mint = () => `ulid_${Math.random().toString(36).slice(2, 10)}`;\n");
+      // Introduce the NAMED helper (ulid_ lives in its body), then use it.
+      await write(
+        workspaceDir,
+        "src/ids.ts",
+        "export function mintId(): string {\n  return `ulid_${Math.random().toString(36).slice(2, 10)}`;\n}\n",
+      );
+      await write(
+        workspaceDir,
+        "src/attach.ts",
+        "import { mintId } from './ids';\nexport const attach = (filename: string) => ({ id: mintId(), filename });\n",
+      );
+    } else if (reuseHelper) {
+      await write(
+        workspaceDir,
+        "src/revision.ts",
+        "import { mintId } from './ids';\nexport const rev = () => ({ at: Math.floor(Date.now() / 1000), id: mintId() });\n",
+      );
     } else {
       await write(
         workspaceDir,
@@ -179,15 +202,23 @@ test("campaign: memory-carrying adheres on every anchored link, memory persists,
     // Anchored links are t3/t4/t5 (indices 2,3,4); all held → cumulative 3/3.
     assert.equal(anchoredCount(rows), 3, "three links carry a rule anchor");
     assert.equal(adheredCount(rows), 3, "memory-carrying adheres on all three");
+    // t3 emits the R1 literal, t4 introduces the helper (ulid_ in its body) → both
+    // literal holds; t5 REUSES the helper (no ulid_ literal) → held-by-abstraction.
+    const expectedGrade: Record<number, string> = {
+      2: "held-by-literal",
+      3: "held-by-literal",
+      4: "held-by-abstraction",
+    };
     for (const r of rows.filter((x) => x.hasAnchor)) {
       assert.equal(r.verdict?.conventionHeld, true, `link ${r.index} (${r.campaignTaskId}) held`);
-      // Each link re-emits the convention markers in its OWN diff → literal hold.
       assert.equal(
         r.verdict?.grade,
-        "held-by-literal",
-        `link ${r.index} (${r.campaignTaskId}) grades a literal hold`,
+        expectedGrade[r.index],
+        `link ${r.index} (${r.campaignTaskId}) grade`,
       );
     }
+    // The ✓A proof: t5 generalized via the helper introduced on t4.
+    assert.match(rows[4]!.verdict!.evidence, /linkage via identifier "mintId"/);
 
     // Per-link isolation: link 3's diff is its OWN change, not link 1's committed work.
     const link3 = rows[2]!;
@@ -199,6 +230,30 @@ test("campaign: memory-carrying adheres on every anchored link, memory persists,
       assert.doesNotMatch(r.diff, /conventions\.md/, `link ${r.index} diff must not contain the memory note`);
       assert.doesNotMatch(r.diff, /\.claude\/memory/, `link ${r.index} diff must not contain .claude/memory`);
     }
+  });
+});
+
+test("campaign: ✓A vs ✓L on t5 — same memory, only the bundle's generalization differs", async () => {
+  await withTmp(async (runResultsDir) => {
+    const task = await getCampaignTask();
+    // Same t4 helper introduction; t5 REUSES it (abstraction) vs RE-EMITS ulid_.
+    // Distinct variant names so the two runs get isolated workspaces.
+    const reuse = await runAndAnchor(V_CARRYING, task, makeCarrying(true), runResultsDir);
+    const literal = await runAndAnchor(
+      { ...V_CARRYING, name: "agentic-os-lit" },
+      task,
+      makeCarrying(false),
+      runResultsDir,
+    );
+
+    // Both hold the convention (cumulative 3/3), but t5 grades differently.
+    assert.equal(adheredCount(reuse), 3);
+    assert.equal(adheredCount(literal), 3);
+    assert.equal(reuse[4]!.verdict?.grade, "held-by-abstraction", "reusing the helper → ✓A");
+    assert.equal(literal[4]!.verdict?.grade, "held-by-literal", "re-emitting ulid_ inline → ✓L");
+    // t4 (helper introduction, ulid_ in the link diff) is a literal hold either way.
+    assert.equal(reuse[3]!.verdict?.grade, "held-by-literal");
+    assert.equal(literal[3]!.verdict?.grade, "held-by-literal");
   });
 });
 
@@ -263,6 +318,7 @@ test("campaign: the 3/3-vs-0/3 divergence renders in the Memory effect (campaign
     // Graded verdicts render grade symbols (with the legend), not the legacy strings.
     assert.match(md, /✓L = held-by-literal/, "grade legend renders for graded links");
     assert.match(md, /✓L/, "carrying links render the literal-hold symbol");
+    assert.match(md, /✓A/, "t5 reuse renders the held-by-abstraction symbol");
     assert.match(md, /⚠/, "the memoryless trap link renders the trap symbol");
   });
 });

@@ -15,6 +15,7 @@ import {
   buildReportJson,
   cellText,
   distinctModels,
+  campaignAdherenceBreakdown,
   excludedReasonOf,
   formatScore,
   gradeSymbol,
@@ -566,6 +567,29 @@ test("#15: the cumulative headline distinguishes drift from trap at the aggregat
   assert.match(md, /naked 0\/3 adhered \(0 held · 0 drift · 3 trap\)/);
   assert.match(md, /drifter 0\/3 \(0 held · 3 drift · 0 trap\)/);
   // Same 0/3 adhered, opposite failure mode — the whole point of the split.
+});
+
+test("#15: a fail-closed unknown gets its OWN bucket — drift stays strictly 'wrote something else'", () => {
+  const mixed: CampaignResult = {
+    variant: "os",
+    executorModel: "sonnet",
+    campaignId: "c",
+    tasks: [
+      campaignTaskResult(2, "t3", {
+        anchors: { conventionHeld: true, hitKnownTrap: false, evidence: "e", grade: "held-by-literal" },
+      }),
+      campaignTaskResult(3, "t4", {
+        anchors: { conventionHeld: false, hitKnownTrap: false, evidence: "e", grade: "unknown" },
+      }),
+      campaignTaskResult(4, "t5", {
+        anchors: { conventionHeld: false, hitKnownTrap: false, evidence: "e", grade: "drift" },
+      }),
+    ],
+  };
+  const { held, drift, trap, unknown } = campaignAdherenceBreakdown(mixed);
+  assert.deepEqual({ held, drift, trap, unknown }, { held: 1, drift: 1, trap: 0, unknown: 1 });
+  const md = renderCampaignMemoryEffect([mixed]);
+  assert.match(md, /os 1\/3 adhered \(1 held · 1 drift · 0 trap · 1 unknown\)/);
 });
 
 test("campaign trajectory cells show grade symbols + legend when graded", () => {

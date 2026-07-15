@@ -1262,27 +1262,31 @@ export function campaignAdherence(c: CampaignResult): {
 }
 
 /**
- * Partition a campaign's anchored links into the three cumulative failure/hold
- * modes (issue #15): `held` (kept the convention), `trap` (adopted the
- * known-wrong convention), and `drift` (broke it some OTHER way — everything
- * anchored that neither held nor tripped the trap, incl. fail-closed unknowns).
- * The buckets are mutually exclusive (a graded verdict is at most one of held /
- * trap) and sum to `anchored`. Distinguishing drift from trap matters because
- * they are different diagnoses at different costs: a drift wrote something else
- * (often burning turns to still be wrong), a trap blindly re-applied a stale
- * memory. The plain `1/3 vs 0/3` cumulative line collapsed the two.
+ * Partition a campaign's anchored links into cumulative failure/hold modes
+ * (issue #15): `held` (kept the convention), `trap` (adopted the known-wrong
+ * convention), `unknown` (fail-closed — the detector could NOT observe the link,
+ * e.g. an empty/ungradable diff), and `drift` (broke it some OTHER way —
+ * everything anchored that is none of the above). The buckets are mutually
+ * exclusive and sum to `anchored`. `unknown` is split OUT of `drift` on purpose:
+ * drift must mean strictly "the bundle wrote something else and got it wrong",
+ * not "we couldn't tell". Distinguishing drift from trap matters because they
+ * are different diagnoses at different costs — a drift burned turns to still be
+ * wrong, a trap blindly re-applied a stale memory. The plain `1/3 vs 0/3`
+ * cumulative line collapsed all of these.
  */
 export function campaignAdherenceBreakdown(c: CampaignResult): {
   held: number;
   drift: number;
   trap: number;
+  unknown: number;
   anchored: number;
 } {
   const anchored = c.tasks.filter((t) => t.anchors !== undefined);
   const held = anchored.filter((t) => t.anchors!.conventionHeld).length;
   const trap = anchored.filter((t) => !t.anchors!.conventionHeld && t.anchors!.hitKnownTrap).length;
-  const drift = anchored.length - held - trap;
-  return { held, drift, trap, anchored: anchored.length };
+  const unknown = anchored.filter((t) => t.anchors!.grade === "unknown").length;
+  const drift = anchored.length - held - trap - unknown;
+  return { held, drift, trap, unknown, anchored: anchored.length };
 }
 
 /** Distinct executor models across campaigns, first-seen order. */
@@ -1363,9 +1367,10 @@ export function renderCampaignMemoryEffect(campaigns: CampaignResult[]): string 
   // "adopted the known-wrong convention" into one number.
   const headline = campaigns
     .map((c, i) => {
-      const { held, drift, trap, anchored } = campaignAdherenceBreakdown(c);
+      const { held, drift, trap, unknown, anchored } = campaignAdherenceBreakdown(c);
       const suffix = i === 0 ? " adhered" : "";
-      return `${label(c)} ${held}/${anchored}${suffix} (${held} held · ${drift} drift · ${trap} trap)`;
+      const unknownNote = unknown > 0 ? ` · ${unknown} unknown` : "";
+      return `${label(c)} ${held}/${anchored}${suffix} (${held} held · ${drift} drift · ${trap} trap${unknownNote})`;
     })
     .join(" | ");
 
