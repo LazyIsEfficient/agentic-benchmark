@@ -463,6 +463,14 @@ export interface SlopAggregate {
   helperReuse: number;
   /** Summed inlined magic-literal count (legacy cells lacking the field contribute 0). */
   literalDensity: number;
+  /**
+   * Whether ANY contributing cell shipped production code (added lines outside
+   * doc/test files). False only when every cell is a new-format cell with zero
+   * production-added lines; legacy cells (no `productionAddedLineCount`) count
+   * as production signal so their SlopHealth is unchanged. Gates SlopHealth to
+   * null so an all-doc/test aggregate can't read as a perfect 1.0 (issue #43).
+   */
+  hasProductionCode: boolean;
 }
 
 /**
@@ -497,6 +505,9 @@ export function aggregateSlop(results: VariantTaskResult[]): SlopAggregate[] {
       testTamperHits: slops.reduce((a, s) => a + s.testTamper.hits, 0),
       helperReuse: slops.reduce((a, s) => a + (s.helperReuse ?? 0), 0),
       literalDensity: slops.reduce((a, s) => a + (s.literalDensity ?? 0), 0),
+      // `?? 1` treats a legacy cell (no field) as HAVING production signal, so
+      // only an aggregate that is entirely new-format AND all-doc/test is false.
+      hasProductionCode: slops.some((s) => (s.productionAddedLineCount ?? 1) > 0),
     };
   });
 }
@@ -921,10 +932,14 @@ export interface CraftScoreAggregate {
  * `SlopHealth = clamp(1 − min(meanDupΔ/10,1) − 0.1·(residueTotal/cells)
  * − 0.5·(tamperHits/cells), 0, 1)`. testTamper is a SOFT penalty here — it lowers
  * health but never disqualifies. null when the group carries no scorable slop
- * cell (all disqualified, or legacy cells without slop).
+ * cell (all disqualified, or legacy cells without slop), OR when the group
+ * shipped NO production code (all doc/test cells): clean-by-absence must not
+ * read as a perfect 1.0 and become a slop-only Craft 100 (issue #43).
  */
 function slopHealthOf(a: SlopAggregate): number | null {
-  if (a.cellCount === 0 || a.meanDuplicationDelta === null) return null;
+  if (a.cellCount === 0 || a.meanDuplicationDelta === null || !a.hasProductionCode) {
+    return null;
+  }
   const residueTotal =
     a.residue.todos + a.residue.debugLogging + a.residue.commentedOutCode;
   const dupPenalty = Math.min(a.meanDuplicationDelta / CRAFT_DUP_CAP, 1);

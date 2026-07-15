@@ -112,12 +112,19 @@ function addedLinesByFile(diff: string): { file: string | null; lines: string[] 
 
 /**
  * True when a path is a TEST file: its filename carries a `.test.`/`.spec.`
- * infix, OR any path segment is `test`/`tests`/`__tests__`/`spec`. Path-based
- * and case-insensitive (no fs, no content read), mirroring {@link isDocFile}.
+ * infix, OR any path segment is `test`/`tests`/`__tests__`. Path-based and
+ * case-insensitive (no fs, no content read), mirroring {@link isDocFile}.
  * WHY: the production-code-hygiene metrics (duplication, residue,
  * literalDensity, helperReuse) must not PENALIZE the thoroughness — extra
  * tests and docs — the Craft judge REWARDS (issue #43). testTamper is the
  * deliberate exception: it operates ON test files and keeps counting them.
+ *
+ * NOTE: a bare `spec` PATH SEGMENT is deliberately NOT matched — a production
+ * `spec/` directory (OpenAPI / JSON-schema / API specs) is real code whose slop
+ * must stay measured. The `.spec.` INFIX (`foo.spec.ts`) is unambiguously a
+ * test file and IS matched. Under-matching (missing e.g. `foo_test.go`,
+ * `test_foo.py`) is the safe direction for a TS harness — a missed test file
+ * only leaves it measured, never wrongly excludes production code.
  */
 export function isTestFile(path: string): boolean {
   const lower = path.toLowerCase();
@@ -125,7 +132,7 @@ export function isTestFile(path: string): boolean {
   if (filename.includes(".test.") || filename.includes(".spec.")) return true;
   return lower
     .split("/")
-    .some((seg) => seg === "test" || seg === "tests" || seg === "__tests__" || seg === "spec");
+    .some((seg) => seg === "test" || seg === "tests" || seg === "__tests__");
 }
 
 /** True when a file is excluded from production-code metrics: a doc or test file. */
@@ -587,6 +594,7 @@ export function computeSlopMetrics(inputs: {
   return {
     duplicationDelta: dup.count,
     duplicationEvidence: dup.evidence,
+    productionAddedLineCount: productionAdded.length,
     churnRatio: computeChurnRatio(removed, inputs.earlierAddedLines),
     residue: countResidue(productionAdded),
     testTamper: detectTestTamper(added, removed),

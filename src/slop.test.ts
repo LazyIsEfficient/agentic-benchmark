@@ -328,12 +328,16 @@ test("testTamper STILL counts weakening inside a test file (the deliberate excep
 test("isTestFile matches infix and directory-segment forms, case-insensitively", () => {
   assert.equal(isTestFile("src/foo.test.ts"), true);
   assert.equal(isTestFile("test/webhooks.test.mjs"), true);
-  assert.equal(isTestFile("src/bar.spec.ts"), true);
+  assert.equal(isTestFile("src/bar.spec.ts"), true); // .spec. infix IS a test file
   assert.equal(isTestFile("__tests__/helpers.mjs"), true);
   assert.equal(isTestFile("packages/x/tests/run.ts"), true);
-  assert.equal(isTestFile("SPEC/Contract.ts"), true);
+  assert.equal(isTestFile("Src/Foo.Test.TS"), true); // case-insensitive
   assert.equal(isTestFile("src/latest.ts"), false); // "test" only as a substring, not a segment/infix
   assert.equal(isTestFile("src/contest.ts"), false);
+  // A bare `spec/` directory is a PRODUCTION API/schema spec, NOT a test file —
+  // its slop must stay measured (reviewer should-fix on #43).
+  assert.equal(isTestFile("spec/openapi.yaml"), false);
+  assert.equal(isTestFile("api/spec/user.schema.ts"), false);
 });
 
 // --- churnRatio -------------------------------------------------------------------
@@ -641,6 +645,7 @@ test("empty diff → everything zero, churnRatio null, no tamper evidence", () =
   assert.deepEqual(m, {
     duplicationDelta: 0,
     duplicationEvidence: [],
+    productionAddedLineCount: 0,
     churnRatio: null,
     residue: { todos: 0, debugLogging: 0, commentedOutCode: 0 },
     testTamper: { hits: 0, evidence: [] },

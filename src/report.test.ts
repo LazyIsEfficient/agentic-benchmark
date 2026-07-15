@@ -1444,6 +1444,21 @@ test("aggregateCraftScore: missing pairwise drops the winRate term → round(100
   assert.match(md, /\| 1 \| solo \| sonnet \| 100 \| _\(slop-only\)_ \| 1\.00 \|/);
 });
 
+test("aggregateCraftScore: an all-doc/test aggregate (zero production lines) → null SlopHealth, not a slop-only 100 (#43)", () => {
+  // productionAddedLineCount 0 = shipped no production code; clean-by-absence
+  // must NOT read as a perfect 1.0 and become a slop-only Craft 100.
+  const docOnly = [cs("docsonly", { productionAddedLineCount: 0 })];
+  const [agg] = aggregateCraftScore(docOnly, undefined);
+  assert.equal(agg!.slopHealth, null);
+  assert.equal(agg!.score, null);
+
+  // A cell WITH production code (and clean) still computes a real 1.0 → 100.
+  const withCode = [cs("realcode", { productionAddedLineCount: 12 })];
+  const [agg2] = aggregateCraftScore(withCode, undefined);
+  assert.equal(agg2!.slopHealth, 1);
+  assert.equal(agg2!.score, 100);
+});
+
 test("aggregateCraftScore: a win rate below the min-decisive threshold is untrusted → slop-only", () => {
   // "lo" has only 2 decisive comparisons (< 3) → its 100% rate is not trusted.
   const results = [cs("lo", {}), cs("hi", {})];

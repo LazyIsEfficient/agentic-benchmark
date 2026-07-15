@@ -664,6 +664,16 @@ export interface SlopMetrics {
    */
   duplicationEvidence?: { file: string; excerpt: string }[];
   /**
+   * Count of ADDED lines from PRODUCTION files (doc/test files excluded) that
+   * fed the code-hygiene metrics. 0 means the diff shipped no production code —
+   * an all-doc/test cell whose clean metrics would otherwise read as a perfect
+   * SlopHealth of 1.0 (and, via the slop-only Craft path, a misleading Craft
+   * 100). SlopHealth is null'd when a whole aggregate has zero of these (issue
+   * #43). Optional for backward-compat: legacy report.json cells lack it and are
+   * treated as HAVING production signal so their SlopHealth is unchanged.
+   */
+  productionAddedLineCount?: number;
+  /**
    * Campaign links only: fraction of lines added by earlier links that this
    * link deletes — high churn means the chain is rewriting its own work.
    * null for single-shot cells, where there is no earlier link to churn.
