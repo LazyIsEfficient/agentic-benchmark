@@ -695,6 +695,91 @@ diff --git a/src/ids.ts b/src/ids.ts
   assert.doesNotMatch(r.evidence, /held-by-abstraction/);
 });
 
+// --- issue #28: appliesIf decoupled from the ✓A linkage-exclusion set --------
+
+// The id rule as it ships in tasks/campaign-conventions/meta.json: `appliesIf`
+// carries `[a-z]Id\b` so camelCase id drift (`userId = nanoid()`) EXERCISES the
+// rule, while the ✓A linkage-exclusion set is a SEPARATE curated field-name
+// vocabulary — so a genuine `mintId` helper is NOT wrongly excluded.
+const ID_RULE_CAMEL: AnchorConfig = {
+  kind: "rule",
+  label: "R2 ulid_ format",
+  required: ["ulid_"],
+  forbidden: ["\\brandomUUID\\b"],
+  appliesIf: ["\\bid\\b", "[a-z]Id\\b", "\\buuid|\\bUUID"],
+};
+
+test("graded rule (#28): camelCase `userId = nanoid()` drift is caught by [a-z]Id\\b appliesIf", () => {
+  // Regression: removing [a-z]Id\b from appliesIf (the coupling workaround) let a
+  // camelCase, non-randomUUID, no-bare-`id` mint slip to held-by-inertia. With
+  // appliesIf restored the rule is exercised and the wrong-way mint grades drift.
+  const linkDiff = `diff --git a/src/user.ts b/src/user.ts
+--- a/src/user.ts
++++ b/src/user.ts
+@@ -1,1 +1,2 @@
++const userId = nanoid();
+`;
+  const r = detectAnchorGraded(ID_RULE_CAMEL, step(linkDiff), { linkDiff });
+  assert.equal(r.grade, "drift");
+  assert.equal(r.conventionHeld, false);
+  assert.equal(r.hitKnownTrap, false);
+  assert.doesNotMatch(r.evidence, /held-by-inertia/, "the rule surface WAS exercised (camelCase id)");
+});
+
+test("graded rule (#28): a genuine `mintId` helper still grades ✓A despite matching [a-z]Id\\b", () => {
+  // The exclusion set is decoupled from appliesIf, so `mintId` — which matches the
+  // `[a-z]Id\b` applicability pattern — is NOT excluded from linkage. The early
+  // link declares the helper (ulid_ in its body); the later link calls it.
+  const cumulative = `diff --git a/src/ids.ts b/src/ids.ts
+--- a/src/ids.ts
++++ b/src/ids.ts
+@@ -1,1 +1,4 @@
++export function mintId(): string {
++  return "ulid_" + crockford(randomBytes(16));
++}
+`;
+  const linkDiff = `diff --git a/src/order.ts b/src/order.ts
+--- a/src/order.ts
++++ b/src/order.ts
+@@ -1,1 +1,2 @@
++const orderId = mintId();
+`;
+  const r = detectAnchorGraded(ID_RULE_CAMEL, step(linkDiff), { linkDiff, cumulativeDiff: cumulative });
+  assert.equal(r.grade, "held-by-abstraction");
+  assert.equal(r.conventionHeld, true);
+  assert.match(r.evidence, /linkage via identifier "mintId"/, "the helper name survives the decoupled exclusion set");
+  assert.match(r.evidence, /\/ulid_\/ absent from link diff/, "evidence names the marker linkage credited");
+});
+
+test("graded rule (#28): a drift link reusing the domain noun `createdAt` stays drift (no false ✓A regression)", () => {
+  // `createdAt` is a DECLARATION name harvested next to the Date.now()/1000 marker
+  // AND is reused as a token in the drift link — so ONLY the curated exclusion set
+  // (^createdAt$) prevents a false ✓A here. The merged domain-noun fix must hold.
+  const r1: AnchorConfig = {
+    kind: "rule",
+    label: "R1 epoch-seconds",
+    required: ["Date\\.now\\(\\)\\s*/\\s*1000"],
+    forbidden: ["toISOString", "new Date\\(", "date-fns|dayjs|moment"],
+    appliesIf: ["createdAt|updatedAt|timestamp", "\\bDate\\b"],
+  };
+  const cumulative = `diff --git a/src/time.ts b/src/time.ts
+--- a/src/time.ts
++++ b/src/time.ts
+@@ -1,1 +1,2 @@
++const createdAt = Math.floor(Date.now() / 1000);
+`;
+  const linkDrift = `diff --git a/src/revision.ts b/src/revision.ts
+--- a/src/revision.ts
++++ b/src/revision.ts
+@@ -1,1 +1,2 @@
++row.createdAt = clock.seconds();
+`;
+  const r = detectAnchorGraded(r1, step(linkDrift), { linkDiff: linkDrift, cumulativeDiff: cumulative });
+  assert.equal(r.grade, "drift", "the shared field noun createdAt must not manufacture ✓A");
+  assert.equal(r.conventionHeld, false);
+  assert.doesNotMatch(r.evidence, /held-by-abstraction/);
+});
+
 test("graded rule: cumulative hold WITHOUT linkage grades drift when the link exercised the surface", () => {
   // The rev_/Math.random repro: the link mints an id (appliesIf matches) using a
   // wrong-way scheme; the ulid_ marker exists only in an earlier link's diff and
