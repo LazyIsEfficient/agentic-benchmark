@@ -516,6 +516,24 @@ test("a deleted assertion with no re-added counterpart still counts as tamper", 
   );
 });
 
+test("KNOWN BLIND SPOT: same-subject value-weakening rewrite nets to 0 (intentional)", () => {
+  // Deleting a strong expected value and re-adding a weakened one for the SAME
+  // subject nets to zero, because the shape deliberately excludes the expected
+  // value. This is an accepted tradeoff (see assertionShape docstring): the
+  // alternative re-introduces false positives on every legitimate expected-value
+  // update. Pinned so a future reader knows this is intentional, not an accident.
+  const diff = `diff --git a/src/store.test.ts b/src/store.test.ts
+--- a/src/store.test.ts
++++ b/src/store.test.ts
+@@ -1,2 +1,2 @@
+-  assert.deepEqual(store.all(), [{ title: "Todo", body: "clean the house" }]);
++  assert.deepEqual(store.all(), []);
+`;
+  const m = computeSlopMetrics({ diff });
+  assert.equal(m.testTamper.hits, 0);
+  assert.deepEqual(m.testTamper.evidence, []);
+});
+
 test("evidence excerpts are trimmed and capped at 80 chars", () => {
   const longTail = "x".repeat(120);
   const diff = `diff --git a/src/a.test.ts b/src/a.test.ts

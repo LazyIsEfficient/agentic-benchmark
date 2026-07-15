@@ -261,6 +261,15 @@ const ASSERTION_CALLEE = /(?<![\w$.])(expect|assert(?:\.[A-Za-z_$][\w$]*)*)\s*\(
  * not, so a delete + re-add of the same assertion share a shape and net to
  * zero. Returns null when no assertion callee is found; the caller then treats
  * a removal as a real, unmatched deletion.
+ *
+ * KNOWN BLIND SPOT (deliberate): because the shape excludes the expected value,
+ * a value-WEAKENING rewrite of the same subject — delete
+ * `assert.deepEqual(x, STRONG)`, add `assert.deepEqual(x, WEAK)` — also nets to
+ * zero and goes undetected. This is an accepted tradeoff: including the expected
+ * value would re-introduce the false positive on every legitimate expected-value
+ * update (the exact bug this fix removed), and the metric is intentionally
+ * conservative — a false positive on ordinary code is worse than missing some
+ * slop. Weakened-value tampering is left for the qualitative judge to catch.
  */
 function assertionShape(line: string): string | null {
   const m = ASSERTION_CALLEE.exec(line);
