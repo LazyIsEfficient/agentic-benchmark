@@ -477,6 +477,45 @@ test("ADDED assertions are not tamper; only removed ones are", () => {
   assert.deepEqual(m.testTamper.evidence, []);
 });
 
+test("rewriting an assertion for a changed data shape nets to 0 tamper hits", () => {
+  // t3-created-at pattern: adding a `createdAt` field forces the expected value
+  // to change, so the old deepEqual is deleted and an updated one re-added.
+  const diff = `diff --git a/src/store.test.ts b/src/store.test.ts
+--- a/src/store.test.ts
++++ b/src/store.test.ts
+@@ -1,6 +1,6 @@
+-  assert.deepEqual(store.all(), [{ title: "Todo", body: "clean the house" }]);
+-  assert.deepEqual(store.get("Shopping List"), {
++  assert.deepEqual(store.all(), [{ title: "Todo", body: "clean the house", createdAt: ts }]);
++  assert.deepEqual(store.get("Shopping List"), {
+     title: "Shopping List",
++    createdAt: ts,
+   });
+`;
+  const m = computeSlopMetrics({ diff });
+  assert.equal(m.testTamper.hits, 0);
+  assert.deepEqual(m.testTamper.evidence, []);
+});
+
+test("a deleted assertion with no re-added counterpart still counts as tamper", () => {
+  // Two subjects removed; only ONE is re-asserted → the other is a net deletion.
+  const diff = `diff --git a/src/store.test.ts b/src/store.test.ts
+--- a/src/store.test.ts
++++ b/src/store.test.ts
+@@ -1,4 +1,2 @@
+-  assert.deepEqual(store.all(), [{ title: "Todo" }]);
+-  assert.equal(store.size(), 1);
++  assert.deepEqual(store.all(), [{ title: "Todo", createdAt: ts }]);
+`;
+  const m = computeSlopMetrics({ diff });
+  assert.equal(m.testTamper.hits, 1);
+  assert.equal(m.testTamper.evidence.length, 1);
+  assert.equal(
+    m.testTamper.evidence[0],
+    "deleted-assertion: assert.equal(store.size(), 1);",
+  );
+});
+
 test("evidence excerpts are trimmed and capped at 80 chars", () => {
   const longTail = "x".repeat(120);
   const diff = `diff --git a/src/a.test.ts b/src/a.test.ts
