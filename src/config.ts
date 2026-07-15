@@ -77,6 +77,14 @@ export const JUDGE_TIMEOUT_MS = Number(
 );
 
 /**
+ * Timeout for a task's optional `testCommand` container (default 300s). Test
+ * suites in fixtures are tiny; a hang here is a broken command, not slowness.
+ */
+export const TEST_TIMEOUT_MS = Number(
+  process.env.BENCH_TEST_TIMEOUT_MS ?? 300_000,
+);
+
+/**
  * Retry budgets for transient container failures (Opus occasionally errors under
  * load). The judge is pure/idempotent so it gets more attempts; the executor
  * mutates its workspace so each retry starts from a fresh one. Env-overridable.
@@ -161,27 +169,34 @@ export const MAX_TRANSCRIPT_BYTES = Number(
 );
 
 /**
- * Rubric weights (max points per dimension). These are the fixed weights from
- * prompt.md and must sum to 100. Centralized here so no magic numbers leak into
- * scoring or reporting code.
+ * Whether pairwise A/B craft judging runs after the per-cell judges. On by
+ * default because head-to-head comparisons are the stable half of the craft
+ * signal; disable (`BENCH_PAIRWISE=0` or `false`) to halve judge cost on
+ * exploratory runs. Any other value — including unset — means enabled, so a
+ * typo'd env var can't silently drop the signal.
  */
-export const DIMENSION_MAX = {
-  codeQuality: 30,
-  testingCoverage: 40,
-  securityQuality: 20,
-  documentation: 10,
-} as const;
-
-export const TOTAL_MAX = 100;
-
-/** Deterministic cap ceilings applied as a backstop after judging (prompt.md). */
-export const TESTING_CAP_WHEN_NO_TESTS = 10;
-export const SECURITY_CAP_WHEN_NO_REVIEW = 8;
+function resolvePairwiseEnabled(): boolean {
+  const raw = process.env.BENCH_PAIRWISE?.trim().toLowerCase();
+  return raw !== "0" && raw !== "false";
+}
+export const PAIRWISE_ENABLED = resolvePairwiseEnabled();
 
 /**
- * Total-score ceiling applied when a correctness-gated task's core requirement
- * was not met (judge taskSolved=false). Unlike the per-dimension caps, this
- * clamps the headline TOTAL — an agent that never solved the task must not score
- * well no matter how tidy the incidental code was. Env-overridable.
+ * How many times each (variant × task × model) cell runs. Repeats exist because
+ * a single executor run is a noisy sample; >1 lets aggregates report variance.
+ * Validated to a positive integer like DEFAULT_CONCURRENCY: a garbage/zero/
+ * negative BENCH_REPEATS falls back to 1 rather than yielding NaN loop bounds.
  */
-export const CORRECTNESS_CAP_WHEN_UNSOLVED = Number(process.env.BENCH_CORRECTNESS_CAP ?? 30);
+function resolveRepeats(): number {
+  const n = Number(process.env.BENCH_REPEATS);
+  return Number.isInteger(n) && n >= 1 ? n : 1;
+}
+export const REPEATS = resolveRepeats();
+
+/**
+ * Max words per quoted snippet in judge evidence strings ("file:line — quote").
+ * Keeps every verdict auditable against the diff while stopping the judge from
+ * pasting whole hunks as "evidence". Fixed, not env-tunable: comparability of
+ * evidence across runs matters more than flexibility.
+ */
+export const EVIDENCE_QUOTE_MAX_WORDS = 10;

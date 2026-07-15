@@ -183,6 +183,15 @@ export interface RuleAnchor {
   /** Regex sources that must NOT match the diff (each is a trap). */
   forbidden?: string[];
   /**
+   * Regex sources describing where the rule APPLIES — the code surface that
+   * exercises it (e.g. "this diff mints an id"). When present and NONE match a
+   * link's own diff, that link never faced the rule, so a graded detector
+   * reports `held-by-inertia` (vacuously held) instead of crediting a literal
+   * or abstraction hold. Omitted = applicability unknown; grading falls back
+   * to the required/forbidden signals alone.
+   */
+  appliesIf?: string[];
+  /**
    * Step `id` the anchor is evaluated against (default: the last step). Shared
    * with the other {@link AnchorConfig} members so generic consumers can read
    * `anchor.evaluatedStepId` without narrowing by `kind`.
@@ -224,6 +233,19 @@ export interface CampaignTask {
    * absent, no anchor verdict is computed for the link.
    */
   anchor?: AnchorConfig;
+  /**
+   * Per-link override of {@link TaskMeta.expectedSurface}: glob patterns of
+   * files THIS link is expected to touch. Campaign links usually have narrower
+   * surfaces than the chain as a whole, so blast-radius judging needs the
+   * per-link scope, not the campaign-wide one.
+   */
+  expectedSurface?: string[];
+  /**
+   * Per-link test command (see {@link TaskMeta.testCommand}). Campaign links
+   * accrete code, so later links typically need a wider command than earlier
+   * ones — hence per-link, not chain-wide.
+   */
+  testCommand?: string;
 }
 
 /** Task metadata from tasks/<id>/meta.json. */
@@ -261,6 +283,21 @@ export interface TaskMeta {
    * single-task behavior (unchanged).
    */
   campaign?: CampaignTask[];
+  /**
+   * Glob patterns of the files the task is EXPECTED to touch. When present,
+   * the harness lists every changed file that matches no pattern and hands
+   * that list to the judge for blast-radius classification — scope is decided
+   * mechanically, the judge only grades the excursions. When absent, no
+   * out-of-scope list is computed (every file is in scope).
+   */
+  expectedSurface?: string[];
+  /**
+   * Shell command run in the workspace container AFTER the executor finishes;
+   * its pass/fail is the deterministic Correctness axis. When absent the task
+   * has no executable tests and correctness falls back to the judge's hedged
+   * {@link CorrectnessAssessment}.
+   */
+  testCommand?: string;
 }
 
 /** A resolved task: metadata + the prompt handed to the executor. */
@@ -371,6 +408,13 @@ export interface RunArtifacts {
   testFilesPresent: boolean;
   /** The executor model alias this run used (benchmark dimension). */
   executorModel: string;
+  /**
+   * Outcome of the task's optional `testCommand`, run in the workspace
+   * container after the executor finished. Absent when the task declares no
+   * command — downstream that absence IS the "no executable tests" signal that
+   * arms the judge's fail-closed correctness fallback.
+   */
+  testResults?: TestResults;
   /** Observed executor cost/time (wall-clock + CLI result fields). */
   executorMetrics: CallMetrics;
   /** True if the executor container exited cleanly within the timeout. */
@@ -383,33 +427,31 @@ export interface RunArtifacts {
   behavior?: Behavior;
 }
 
-/** One dimension's score plus the judge's justification. */
-export interface DimensionScore {
-  score: number;
-  justification: string;
-}
-
-/** The four dimensions the judge returns, plus its review determination + summary. */
-export interface JudgeResult {
-  codeQuality: DimensionScore;
-  testingCoverage: DimensionScore;
-  securityQuality: DimensionScore;
-  documentation: DimensionScore;
-  /**
-   * The judge's own determination of whether a visible security review was
-   * performed. Drives the deterministic security cap (semantic judgment, not
-   * mechanically checkable). Defaults to true when the judge omits it, so the
-   * punitive cap only fires on a positive "no review" signal.
-   */
-  securityReviewPerformed: boolean;
-  /**
-   * The judge's determination that the change satisfies the task's
-   * `successCriteria`. Only meaningful for correctness-gated tasks; drives the
-   * deterministic total cap. Left undefined by the judge for non-gated tasks.
-   */
-  taskSolved?: boolean;
-  summary: string;
-}
+/**
+ * Graded refinement of an anchor verdict — WHY the convention held (or didn't),
+ * not just whether. The boolean conventionHeld/hitKnownTrap pair can't tell a
+ * run that internalized the rule from one that pattern-matched a nearby literal
+ * or simply never touched the anchored surface, and those deserve different
+ * credit. Ordered strongest-to-weakest:
+ * `held-by-abstraction` > `held-by-literal` > `held-by-inertia` >
+ * `held-by-chain` > `drift` > `trap`; `unknown` is the fail-closed value when
+ * the detector cannot grade.
+ *
+ * `held-by-abstraction` requires LINK-LEVEL EVIDENCE that this link consumed an
+ * abstraction carrying the convention (not merely that the required markers
+ * exist somewhere in the chain's cumulative diff — that alone would let a link
+ * doing wrong-way work, or nothing at all, inherit the strongest grade).
+ * `held-by-chain` is the honest weaker label for cumulative-only holds where
+ * the detector has no applicability signal to adjudicate the link itself.
+ */
+export type AnchorGrade =
+  | "held-by-abstraction"
+  | "held-by-literal"
+  | "held-by-inertia"
+  | "held-by-chain"
+  | "drift"
+  | "trap"
+  | "unknown";
 
 /**
  * Deterministic verdict produced by an anchor detector for one run. Independent
@@ -428,17 +470,217 @@ export interface AnchorResult {
   hitKnownTrap: boolean;
   /** Human-readable justification for the verdict (what was observed). */
   evidence: string;
+  /**
+   * Graded refinement of conventionHeld/hitKnownTrap (ordering: abstraction >
+   * literal > inertia > chain > drift > trap). Optional because it is populated
+   * by the wave-2 detector work; existing detectors emit only the booleans.
+   */
+  grade?: AnchorGrade;
 }
 
-/** Records a single deterministic cap that fired after judging. */
-export interface AppliedCap {
-  dimension: "testingCoverage" | "securityQuality" | "total";
-  rawScore: number;
-  cappedTo: number;
-  reason: string;
+/**
+ * The four craft dimensions the cell judge scores. Craft is the qualitative
+ * residual the deterministic axes can't measure: naming (do identifiers say
+ * what things mean), structure (is the change shaped like the codebase),
+ * consistency (does it match surrounding conventions), economy (no more code
+ * than the task needs).
+ */
+export type CraftDimension = "naming" | "structure" | "consistency" | "economy";
+
+/**
+ * One craft dimension's value on a 0–4 ordinal scale. `"unknown"` is the
+ * fail-closed value for when the judge cannot assess (e.g. empty diff, judge
+ * output missing the dimension) — it is NEVER clamped to a number, so an
+ * unassessable dimension can't masquerade as a low-but-real score.
+ */
+export type CraftScoreValue = 0 | 1 | 2 | 3 | 4 | "unknown";
+
+/**
+ * One craft dimension's score plus the evidence that earned it. Evidence
+ * entries are `"file:line — quote"` strings with quotes capped at 10 words
+ * ({@link EVIDENCE_QUOTE_MAX_WORDS} in config), so a verdict is auditable
+ * against the diff without letting the judge paste whole hunks.
+ */
+export interface CraftScore {
+  score: CraftScoreValue;
+  /** `"file:line — quote"` citations backing the score (quotes ≤10 words). */
+  evidence: string[];
 }
 
-/** Final scored result for one (variant × task) after cap enforcement. */
+/** All four craft dimensions for one cell — the judge must score every one. */
+export interface CellCraft {
+  naming: CraftScore;
+  structure: CraftScore;
+  consistency: CraftScore;
+  economy: CraftScore;
+}
+
+/**
+ * How an out-of-scope file touch is judged. Ordered by escalating severity:
+ * - `necessary` — the task genuinely required it (e.g. a shared type).
+ * - `defensible` — arguable but reasonable (e.g. a drive-by typo fix).
+ * - `overreach` — unrequested scope creep that dilutes the diff.
+ * - `adversarial` — gaming the benchmark (e.g. editing tests to pass, touching
+ *   harness files); any single adversarial entry hard-disqualifies the cell.
+ */
+export type BlastClassification =
+  | "necessary"
+  | "defensible"
+  | "overreach"
+  | "adversarial";
+
+/**
+ * One file the run touched OUTSIDE the task's expected surface, with the
+ * judge's read on whether that excursion was warranted. The harness computes
+ * the out-of-scope list mechanically (expectedSurface globs vs changedFiles);
+ * the judge only classifies — it never decides what counts as out-of-scope.
+ */
+export interface BlastRadiusEntry {
+  /** Workspace-relative path of the out-of-scope file. */
+  file: string;
+  classification: BlastClassification;
+  /** Why this classification (what the change to the file actually does). */
+  evidence: string;
+}
+
+/**
+ * The cell judge's read on whether the change works, used ONLY when a task has
+ * no executable tests. `unknown` is deliberate and fail-closed: a judge that
+ * cannot tell must say so rather than guess, because "likely" here is already
+ * the weakest correctness signal in the system.
+ */
+export type CorrectnessVerdict = "likely_correct" | "likely_incorrect" | "unknown";
+
+/**
+ * The judge's fallback correctness verdict plus the observations behind it.
+ * Deliberately hedged naming (`likely_*`): a static read of a diff is not a
+ * test run, and downstream scoring must weight it accordingly.
+ */
+export interface CorrectnessAssessment {
+  verdict: CorrectnessVerdict;
+  /** What in the diff/transcript supports the verdict. */
+  evidence: string[];
+}
+
+/**
+ * Structured verdict of the cell judge — owns ONLY the qualitative residual;
+ * deterministic axes (tests, anchors, telemetry) are computed by the harness
+ * and passed to the judge read-only. Replaces the retired weighted-total
+ * rubric: instead of four weighted point totals, the judge emits ordinal
+ * craft scores, blast-radius classifications, and (when no tests exist) a
+ * hedged correctness read — nothing it returns is ever summed.
+ */
+export interface CellJudgeResult {
+  craft: CellCraft;
+  /**
+   * One entry per file outside the task's expected surface; `[]` when none.
+   * Any `"adversarial"` entry hard-disqualifies the cell.
+   */
+  blastRadius: BlastRadiusEntry[];
+  /**
+   * Fail-closed fallback used ONLY when the task has no executable tests;
+   * null otherwise (the deterministic testCommand verdict wins).
+   */
+  correctnessAssessment: CorrectnessAssessment | null;
+  /** Free-form judge observations that fit no dimension (never scored). */
+  flags: string[];
+}
+
+/**
+ * Mechanical slop signals computed by the harness from the diff — the
+ * quantifiable half of the craft/economy story, kept OUT of the judge so it
+ * can't be argued with. Each field is a count/ratio a reader can re-derive
+ * from the diff by hand.
+ */
+export interface SlopMetrics {
+  /** Count of duplicated added-line windows in the diff (normalized). */
+  duplicationDelta: number;
+  /**
+   * Campaign links only: fraction of lines added by earlier links that this
+   * link deletes — high churn means the chain is rewriting its own work.
+   * null for single-shot cells, where there is no earlier link to churn.
+   */
+  churnRatio: number | null;
+  /** Leftover work-in-progress artifacts the run shipped in its diff. */
+  residue: { todos: number; debugLogging: number; commentedOutCode: number };
+  /**
+   * Signals that the run weakened tests to pass (skipped/deleted/loosened
+   * assertions). Evidence entries cite the offending hunks.
+   */
+  testTamper: { hits: number; evidence: string[] };
+}
+
+/**
+ * Result of running a task's optional testCommand in the workspace container
+ * — the deterministic Correctness axis. Absence on a cell = "no executable
+ * tests" (test_results: none), which is what routes the judge to its
+ * {@link CorrectnessAssessment} fallback.
+ */
+export interface TestResults {
+  /** The shell command that was run (echoed for auditability). */
+  command: string;
+  /**
+   * Best-effort pass count parsed from the runner output (node:test / jest /
+   * vitest summaries). Absent when the output was unparseable — `ok` (exit
+   * code) stays authoritative; counts are never fabricated.
+   */
+  passed?: number;
+  /** Best-effort fail count parsed from the runner output; see {@link passed}. */
+  failed?: number;
+  /** True iff the command exited 0. */
+  ok: boolean;
+  /** Raw runner output, kept when it fits (for debugging surprising verdicts). */
+  raw?: string;
+}
+
+/** Which variant won one pairwise comparison (or neither, decisively). */
+export type PairwiseWinner = "A" | "B" | "tie";
+
+/**
+ * One craft dimension of an A/B comparison. Evidence is required for BOTH
+ * sides — a winner without cited evidence from each diff is unauditable.
+ */
+export interface PairwiseDimension {
+  winner: PairwiseWinner;
+  /** `"file:line — quote"` citation from variant A's diff. */
+  evidenceA: string;
+  /** `"file:line — quote"` citation from variant B's diff. */
+  evidenceB: string;
+}
+
+/**
+ * One A/B craft comparison of two variants' diffs for the same task/link/model
+ * (and same repeat index). Pairwise exists because absolute craft scores drift
+ * across judge calls; a same-context head-to-head is stabler. variantA/variantB
+ * record the RESOLVED mapping after per-call randomization (the A/B order is
+ * shuffled per call to cancel position bias), so a reader can always map the
+ * winner letter back to a variant name.
+ */
+export interface PairwiseResult {
+  taskId: string;
+  /** Campaign link index when comparing campaign links; absent for single-shot. */
+  linkIndex?: number;
+  /** The executor model both sides ran under (comparisons never cross models). */
+  executorModel: string;
+  /** 1-based repeat index when comparing --repeats runs; absent otherwise. */
+  repeat?: number;
+  /** Variant name presented to the judge as "A" (post-randomization). */
+  variantA: string;
+  /** Variant name presented to the judge as "B" (post-randomization). */
+  variantB: string;
+  dimensions: {
+    naming: PairwiseDimension;
+    structure: PairwiseDimension;
+    consistency: PairwiseDimension;
+    economy: PairwiseDimension;
+  };
+  /** The judge's overall call across the four dimensions, with its reasoning. */
+  overall: { winner: PairwiseWinner; rationale: string };
+  /** Set when the pairwise judge call failed; the comparison is unusable. */
+  judgeFailure?: string;
+}
+
+/** Scored result for one (variant × task × model) cell. */
 export interface VariantTaskResult {
   /** Per-(variant×task×model) id, unique within a run: `task__variant__modelSlug`. */
   cellId: string;
@@ -448,29 +690,36 @@ export interface VariantTaskResult {
   executorModel: string;
   /** Judge model — held FIXED across all runs so scores stay comparable. */
   judgeModel: string;
-  /** Scores exactly as the judge returned them. */
-  raw: JudgeResult;
-  /** Per-dimension scores after deterministic caps. */
-  final: {
-    codeQuality: number;
-    testingCoverage: number;
-    securityQuality: number;
-    documentation: number;
-  };
-  /** Sum of the four final scores. Computed by the harness, not the judge. */
-  total: number;
-  /** Any caps that were applied (empty when none fired). */
-  appliedCaps: AppliedCap[];
-  /** Signals used for capping and transparency. */
-  signals: {
-    /** Mechanical: a test file was created/updated (drives the testing cap). */
-    testFilesPresent: boolean;
-    /** The judge's determination (drives the security cap). */
-    securityReviewPerformed: boolean;
-    /** The judge's determination (drives the total cap); undefined for non-gated tasks. */
-    taskSolved?: boolean;
-    changedFiles: ChangedFile[];
-  };
+  /**
+   * Structured five-axis judge verdict (craft, blast radius, correctness
+   * fallback). Optional for backward-compat: cells judged by the old pipeline
+   * — and old report.json files — lack it.
+   */
+  judge?: CellJudgeResult;
+  /** Mechanical slop signals computed from the diff. Optional (see judge). */
+  slop?: SlopMetrics;
+  /**
+   * Deterministic testCommand verdict. Absent = the task declared no
+   * testCommand, i.e. "no executable tests" — NOT a failure.
+   */
+  testResults?: TestResults;
+  /**
+   * Changed files matching none of the task's expectedSurface globs — the
+   * mechanical input to blast-radius judging. Absent when the task declares
+   * no expectedSurface; `[]` when everything stayed in scope.
+   */
+  filesOutsideExpectedSurface?: string[];
+  /**
+   * True iff any blastRadius entry is `"adversarial"`. A disqualified cell is
+   * excluded from every aggregate, not scored low — gaming attempts must not
+   * be averaged away.
+   */
+  disqualified?: boolean;
+  /**
+   * 1-based repeat index for --repeats runs, so repeated cells of the same
+   * (variant × task × model) stay distinguishable. Absent for single runs.
+   */
+  repeat?: number;
   /** Observed cost/time KPIs for this run. Never scored. */
   metrics: RunMetrics;
   /**
@@ -482,7 +731,7 @@ export interface VariantTaskResult {
   /**
    * Deterministic anchor verdict for this run, when the task declared an
    * `anchor`. Optional for backward-compat: results in old report.json files
-   * lack it. Never folded into the /100 score — a separate, mechanical signal.
+   * lack it. Never folded into any score — a separate, mechanical signal.
    */
   anchors?: AnchorResult;
   /** Set when the executor failed; the run is scored as zero. */
@@ -493,7 +742,7 @@ export interface VariantTaskResult {
   evidenceTruncated?: boolean;
   /**
    * Whether this cell got a real judge verdict (executorOk AND no judge failure).
-   * Only scored cells fold into the /100 mean; excluded cells are coverage gaps,
+   * Only scored cells fold into aggregates; excluded cells are coverage gaps,
    * never a fabricated 0. Stamped onto report.json at write time; derived from
    * executorFailure/judgeFailure so it recomputes on regenerate.
    */
@@ -504,18 +753,31 @@ export interface VariantTaskResult {
 
 /**
  * Scored outcome of ONE link in a campaign chain — the per-task record that lets
- * a trajectory be read link-by-link. Lighter than {@link VariantTaskResult}: a
- * single optional `score` (not the four-dimension breakdown) plus the link's
- * deterministic `anchors` verdict and observed `metrics`, since a campaign's
- * signal is the SHAPE of the curve across links, not each link's full rubric.
+ * a trajectory be read link-by-link. Lighter than {@link VariantTaskResult}: the
+ * link's five-axis verdict plus its deterministic `anchors` verdict and observed
+ * `metrics`, since a campaign's signal is the SHAPE of the curve across links.
  */
 export interface CampaignTaskResult {
   /** The link's `id` (or its stringified index when the link had no `id`). */
   taskId: string;
   /** Zero-based position of this link within the campaign chain. */
   index: number;
-  /** The link's judge score, when it was judged. Absent on failure. */
-  score?: number;
+  /**
+   * Structured five-axis judge verdict for this link. Optional for
+   * backward-compat: old report.json files and old-pipeline links lack it.
+   */
+  judge?: CellJudgeResult;
+  /** Mechanical slop signals for this link's diff (incl. churnRatio vs earlier links). */
+  slop?: SlopMetrics;
+  /** Deterministic testCommand verdict. Absent = the link declared no testCommand. */
+  testResults?: TestResults;
+  /**
+   * Changed files matching none of the link's expectedSurface globs. Absent
+   * when no expectedSurface applies; `[]` when everything stayed in scope.
+   */
+  filesOutsideExpectedSurface?: string[];
+  /** True iff any blastRadius entry is `"adversarial"` — the link is excluded, not low-scored. */
+  disqualified?: boolean;
   /** Deterministic anchor verdict for this link, when it declared an `anchor`. */
   anchors?: AnchorResult;
   /** Observed executor cost/time for this link (never scored). */
@@ -537,6 +799,11 @@ export interface CampaignResult {
   executorModel: string;
   /** Identifier of the campaign chain (the `TaskMeta.id` that declared it). */
   campaignId: string;
+  /**
+   * 1-based repeat index for --repeats runs, so repeated campaigns of the same
+   * (variant × campaign × model) stay distinguishable. Absent for single runs.
+   */
+  repeat?: number;
   /** Per-link results in chain order. */
   tasks: CampaignTaskResult[];
 }
@@ -559,4 +826,10 @@ export interface Report {
    * single-shot runs omit it entirely (old report.json files lack the field).
    */
   campaigns?: CampaignResult[];
+  /**
+   * A/B craft comparisons across variant pairs, when pairwise judging ran
+   * (PAIRWISE_ENABLED). Optional for backward-compat: old report.json files
+   * and runs with pairwise disabled lack the field.
+   */
+  pairwise?: PairwiseResult[];
 }

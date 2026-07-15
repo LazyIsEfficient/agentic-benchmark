@@ -1,0 +1,8 @@
+{
+  "id": "scope-excursion",
+  "title": "Add a request handler under src/",
+  "logicBearing": true,
+  "securityRelevant": false,
+  "seedFiles": [],
+  "expectedSurface": ["src/**"]
+}

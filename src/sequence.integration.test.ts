@@ -210,29 +210,12 @@ async function drive(
 
 /** A scored VariantTaskResult carrying a real anchor verdict, for the report. */
 function scoredResult(artifacts: RunArtifacts, anchor: AnchorResult): VariantTaskResult {
-  const dim = (justification: string) => ({ score: 20, justification });
   return {
     cellId: artifacts.cellId,
     variant: artifacts.variant,
     taskId: artifacts.taskId,
     executorModel: artifacts.executorModel,
     judgeModel: "judge",
-    raw: {
-      codeQuality: dim("ok"),
-      testingCoverage: dim("ok"),
-      securityQuality: dim("ok"),
-      documentation: dim("ok"),
-      securityReviewPerformed: true,
-      summary: "fake judge summary",
-    },
-    final: { codeQuality: 20, testingCoverage: 20, securityQuality: 20, documentation: 15 },
-    total: 75,
-    appliedCaps: [],
-    signals: {
-      testFilesPresent: artifacts.testFilesPresent,
-      securityReviewPerformed: true,
-      changedFiles: artifacts.changedFiles,
-    },
     metrics: { executor: artifacts.executorMetrics },
     anchors: anchor,
     ...(artifacts.behavior ? { behavior: artifacts.behavior } : {}),

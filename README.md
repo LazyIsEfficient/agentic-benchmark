@@ -1,8 +1,11 @@
 # CLAUDE.md Variant Benchmarking Harness
 
-Measures how well different `CLAUDE.md` system-prompt variants perform on a real
-coding task, scored against a fixed rubric by a strong judge model. Turns "which
-doctrine feels better" into reproducible, weighted scores out of 100.
+Measures how well different `CLAUDE.md` system-prompt variants perform on real
+coding tasks, scored on five lexicographic axes — Correctness, Adherence, Craft,
+Efficiency, Reliability. Everything that can be measured deterministically is
+measured by the harness; a strong judge model scores only the qualitative
+residual. Turns "which doctrine feels better" into reproducible, auditable
+verdicts — never a weighted mega-score.
 
 Every agent and judge invocation runs through the official `claude` CLI inside a
 Docker container that is fully isolated from your real `~/.claude`. No Anthropic
@@ -22,10 +25,14 @@ API keys, no direct API calls, no Python.
                           │
   3. captureArtifacts  ──▶ git diff, classify files, extract transcript, signals
                           │
-  4. runJudge          ──▶ docker run claude -p (tools off, prompt over stdin)
-                          │        → parse JSON block from response, validate
+  4. deterministic axes ▶ testCommand run in-container, anchor grading, slop
+                          │        metrics, expected-surface scoping (harness)
                           │
-  5. applyCapsAndScore ──▶ deterministic total + rubric caps (harness, not judge)
+  5. runJudge          ──▶ docker run claude -p (tools off, prompt over stdin)
+                          │        diff + read-only deterministic context → strict
+                          │        JSON (craft, blast radius, correctness fallback)
+                          │
+  6. pairwise judging  ──▶ A/B craft comparisons per variant pair (on by default)
                           │
                  aggregate → reports/<run-folder>/{report.md, report.json, results/}
 ```
@@ -33,33 +40,182 @@ API keys, no direct API calls, no Python.
 The orchestrator runs on the host via `tsx` (no build step) and shells out to
 `docker run` for each container invocation.
 
-## The rubric (weights, out of 100)
+## The five axes
 
-| Dimension            | Weight | Focus |
-|----------------------|--------|-------|
-| Code Quality         | 30     | SOLID, separation of concerns, readability, naming |
-| Testing Coverage     | 40     | Real framework + meaningful happy-path & edge tests |
-| Security Quality     | 20     | Explicit security review, secure defaults, validation |
-| Documentation        | 10     | Docs created/updated as part of the work |
+**The judge only scores what cannot be measured deterministically.** Correctness
+(tests), adherence (anchors), efficiency (telemetry), and reliability (cross-run
+variance) are computed by the harness and handed to the judge as read-only
+context. The judge owns three things: the qualitative residual of Craft, intent
+classification for Blast Radius, and a fail-closed correctness assessment ONLY
+when no executable check exists.
 
-Two caps are enforced by the harness **after** the judge scores (the judge's
-arithmetic and totals are never trusted — the harness recomputes them):
+| Axis | Source | Judge role |
+|------|--------|------------|
+| **Correctness** | the task's optional `testCommand`, run in the workspace container after the executor finishes (pass = exit 0) | fallback verdict (`likely_correct` / `likely_incorrect` / `unknown`) only when the task declares no tests; fail-closed |
+| **Adherence** | graded anchors — `held-by-abstraction` > `held-by-literal` > `held-by-inertia` > `drift` > `trap` (harness, deterministic) | none — read-only context |
+| **Craft** | deterministic slop metrics (duplication windows, churn ratio, residue, test-tamper grep) + judge residual: naming / structure / consistency / economy, each 0–4 ordinal with cited evidence | scores the qualitative residual only |
+| **Efficiency** | tokens, turns, wall-clock, cost (telemetry) | none |
+| **Reliability** | cross-run variance via `--repeats N` | none |
 
-- **Testing cap (mechanical/deterministic):** if the task is **logic-bearing**
-  and no test file was created/updated (a `*.test.*` / `__tests__/` / test-config
-  file — a fact the harness checks directly from the diff), Testing Coverage is
-  capped at **10**.
-- **Security cap (judge-determined):** if the task is **security-relevant** and
-  the judge reports `securityReviewPerformed: false`, Security Quality is capped
-  at **8**. "Was a security review performed" is a semantic judgment, not
-  mechanically checkable (a keyword scan false-negatived and contradicted the
-  judge's own justification), so this signal comes from the judge. If the judge
-  omits the field it defaults to `true` (the cap is punitive, so it only fires on
-  a positive "no review" signal).
+Reporting is **lexicographic, never a weighted mega-score**:
 
-Shape/integer/range validation of the judge's JSON remains the deterministic
-trust backstop. Raw judge scores and final (post-cap) scores are both recorded so
-the report is transparent about any clamping.
+1. **Correctness gates everything.** A failing `testCommand` is a failing cell —
+   no amount of craft polish outranks it.
+2. **Adherence is the campaign headline** — did the convention hold, and *how*.
+3. **Craft** = slop deltas + judge medians + pairwise win-rates. Cross-bundle
+   ranking uses A/B pairwise judging with randomized assignment and a
+   position-bias audit — **absolute craft scores are never compared across
+   bundles**.
+4. **Efficiency** and **Reliability** are reported columns.
+
+### Correctness
+
+A task (or campaign link) may declare a `testCommand` in its `meta.json`; the
+harness runs it in the workspace container after the executor finishes
+(`BENCH_TEST_TIMEOUT_MS`, default 300 s) and the exit code is the verdict.
+Pass/fail counts are parsed best-effort from node:test / jest / vitest output —
+the exit code stays authoritative, counts are never fabricated. Campaign links
+may carry per-link `testCommand`s, since later links accrete code and typically
+need a wider command than earlier ones.
+
+When no `testCommand` exists, the judge supplies a deliberately hedged fallback
+verdict: `likely_correct` / `likely_incorrect` / `unknown`, based solely on
+reading the diff against the task. When in doubt it must say `unknown` — a
+static read of a diff is not a test run, and downstream reporting weights it
+accordingly.
+
+### Adherence — graded anchors
+
+Anchors are deterministic detectors (no judge involvement) over the run's diff
+and trace. The graded detector refines "did the convention hold" into *how*:
+
+- **`held-by-abstraction`** — the required signals are absent from this link's
+  own diff but present in the cumulative chain diff: the convention persists via
+  a helper built earlier in the chain (campaign mode). The strongest hold.
+- **`held-by-literal`** — the convention was re-emitted literally in this link's
+  own diff.
+- **`held-by-inertia`** — the link never exercised the rule's surface: none of
+  the rule's `appliesIf` regexes matched its diff, so the hold is vacuous, not
+  earned.
+- **`drift`** — the link added real code but the required signals are absent.
+- **`trap`** — a forbidden signal is present in the link's own diff.
+- **`unknown`** — fail-closed when the detector cannot grade (no added lines,
+  malformed rule pattern).
+
+For `rule` anchors the precedence is exact: trap → literal → inertia →
+abstraction → drift/unknown. Inertia is checked *before* abstraction so a link
+that never faced the rule can't be spuriously credited via the cumulative diff,
+and forbidden signals are only ever tested against the link's own diff — a
+marker inherited from an earlier link doesn't poison this link's grade.
+
+### Craft — mechanical slop + judged residual
+
+The mechanical half is computed by the harness from the diff (pure string
+functions — the numbers can't be argued with, and a reader can re-derive any
+count by hand):
+
+- **`duplicationDelta`** — duplicated 4-line added-line windows
+  (whitespace-normalized, never straddling a file boundary, brace/import noise
+  filtered); N identical windows count as N−1.
+- **`churnRatio`** — campaign links only: the fraction of lines added by earlier
+  links that this link deletes — high churn means the chain is rewriting its own
+  work. `null` for single-shot cells (not measurable, never a fake clean 0).
+- **`residue`** — shipped work-in-progress: TODO/FIXME markers, debug logging
+  (`console.log`/`debugger`), commented-out code — counted on added lines only.
+- **`testTamper`** — signals that the run weakened tests to pass: added
+  `.skip(` / `.only(` / `xit(` / `xdescribe(` / `test.todo(` / `eslint-disable` /
+  `@ts-nocheck` / `--passWithNoTests`, plus deleted `expect(`/`assert` lines —
+  each hit quoted as evidence.
+
+The judge scores only the residual — four dimensions, each on a 0–4 ordinal
+scale (definitions, not vibes):
+
+- **0 — actively harmful** (misleading names, structure that hides a bug,
+  copy-paste divergence waiting to happen)
+- **1 — poor** (works, but a maintainer would rewrite it)
+- **2 — acceptable** (unremarkable, no objections in review)
+- **3 — good** (a reviewer would approve without comments)
+- **4 — exemplary** (the solution a strong senior engineer would write;
+  teachable)
+
+Dimensions: **naming** (identifiers communicate intent), **structure**
+(right-sized functions/modules — both under-abstraction and speculative
+over-abstraction are penalized), **consistency** (matches the surrounding repo's
+idioms, judged against the seed code visible in diff context lines), and
+**economy** (the diff is proportionate to the task; no drive-by rewrites, no
+padding, no dead code). Every score must cite `file:line — quote` evidence from
+the diff (quotes capped at 10 words); a score without evidence is invalid and
+recorded as `unknown`. The judge is explicitly told to judge the diff, not the
+agent's narration; verbosity is not rewarded and brevity is not penalized.
+
+### Craft across bundles — pairwise A/B judging
+
+Absolute craft scores drift across judge calls and are not comparable across
+agent configurations, so cross-bundle ranking comes from pairwise win-rates
+instead: for each variant pair on the same (task/link × executor model ×
+repeat), a second judge call compares the two diffs head-to-head per craft
+dimension plus an overall verdict. The A/B assignment is randomized per call to
+cancel position bias, the resolved mapping is recorded so winners always map
+back to variant names, and the report carries a position-bias audit. `tie` is a
+legitimate and expected verdict; a judge failure degrades to all-tie (a dead
+judge can never move rankings). On by default — disable with `--no-pairwise` /
+`BENCH_PAIRWISE=0` to halve judge cost on exploratory runs.
+
+### Blast radius (`expectedSurface`)
+
+A task — or an individual campaign link, whose declaration overrides the task's
+wholesale, never merged — may declare `expectedSurface`: glob patterns of the
+files the agent is expected to touch. The harness mechanically lists every
+changed file matching no pattern; the judge only classifies each excursion — it
+never decides what counts as out-of-scope:
+
+- **`necessary`** — the task could not be completed without it
+- **`defensible`** — not required, but a reasonable reviewer would accept it
+- **`overreach`** — unrequested change with no task justification
+- **`adversarial`** — weakens a check to make the task appear complete
+  (test-expectation edits, disabled lint rules, skipped tests, loosened
+  assertions); must quote the exact weakened check
+
+Any single `adversarial` classification **hard-disqualifies the cell**: it is
+excluded from every aggregate and reported — a gaming attempt must never be
+averaged away. An absent `expectedSurface` means scoping is off for that task
+(deliberately fail-open: scoping is opt-in per fixture); an explicit `[]` means
+"this run may touch nothing", so every touched file is out of scope.
+
+### Fail-closed judge contract
+
+- **The judge sees the DIFF only, never the transcript.** Transcripts are
+  provider-fingerprinted (they leak which harness produced them), so craft is
+  judged from the diff alone. The deterministic context (anchor verdict, test
+  results, slop metrics, out-of-scope files) is rendered read-only in the
+  prompt; the judge is instructed not to re-derive or dispute it.
+- **Strict JSON output.** A parse failure triggers exactly one re-ask with the
+  raw output quoted back plus "Output valid JSON only."; a second failure
+  records the judge's fields as `unknown`/empty — the deterministic axes
+  survive intact.
+- **Out-of-range values are never clamped.** A craft score outside 0–4, or a
+  numeric score with no cited evidence, becomes `unknown` with a visible
+  `invalid:*` flag — a judge malfunction must not masquerade as a real low
+  score. Malformed blast-radius entries are dropped (flagged); an invalid
+  correctness verdict degrades to `unknown`.
+- **Evidence is capped** — 10 words per quoted snippet in-prompt, 120 chars
+  kept at parse — so verdicts stay auditable without republishing the diff.
+- **Truncation fails closed.** The diff embedded in the judge prompt is
+  byte-capped (`BENCH_MAX_DIFF_BYTES`) with a visible `[DIFF TRUNCATED]`
+  marker, and the prompt's own rule tells the judge to output `unknown` for
+  anything it cannot see.
+
+### Task metadata that feeds the axes (`meta.json`)
+
+- **`testCommand`** — arms the deterministic Correctness axis; campaign links
+  may carry per-link overrides.
+- **`expectedSurface`** — arms blast-radius scoping; a campaign link's
+  declaration replaces the task-level one wholesale.
+- **`appliesIf`** (on `rule` anchors) — regexes describing the code surface that
+  exercises the rule; when none match a link's diff the grade is
+  `held-by-inertia` (vacuous hold) instead of a credited literal/abstraction
+  hold. Omitted = applicability unknown; grading falls back to the
+  required/forbidden signals alone.
 
 ## Setup
 
@@ -105,6 +261,8 @@ npm run bench -- --task safe-redirect       # restrict to one task
 npm run bench -- --all --models fable,sonnet,opus   # compare across executor models
 npm run bench -- --all --concurrency 3      # run up to 3 cells in parallel
 npm run bench -- --all --delay-ms 5000      # pace cells to ease rate limits
+npm run bench -- --all --repeats 3          # run each cell 3× (Reliability: cross-run variance)
+npm run bench -- --all --no-pairwise        # skip A/B craft judging (halves judge cost)
 npm run bench -- --report reports/<run>/    # regenerate a report from a finished run (offline)
 ```
 
@@ -126,10 +284,10 @@ judge model.
 
 ### Concurrency
 
-`--concurrency N` (alias `-c`, default `1`) runs up to N matrix cells
-(`executorModel × task × variant`) at once through a bounded worker pool. At
-`N=1` the run is fully sequential with live per-line logging — identical to the
-default behavior. At `N>1` each cell's log lines are **buffered** and emitted as
+`--concurrency N` (alias `-c`, default `3`, or `BENCH_CONCURRENCY`) runs up to
+N matrix cells (`executorModel × task × variant`) at once through a bounded
+worker pool. At `N=1` the run is fully sequential with live per-line logging.
+At `N>1` each cell's log lines are **buffered** and emitted as
 one contiguous block with a `[k/total]` progress counter, so concurrent cells
 stay readable instead of interleaving.
 
@@ -144,7 +302,7 @@ above `16` are clamped. Invalid or `< 1` values are rejected with a clear error.
 
 ### Timeouts
 
-Each executor run is bounded by `BENCH_EXECUTOR_TIMEOUT_MS` (default 900 s;
+Each executor run is bounded by `BENCH_EXECUTOR_TIMEOUT_MS` (default 1800 s;
 judge by `BENCH_JUDGE_TIMEOUT_MS`, default 300 s). Enforcement is authoritative:
 on timeout the harness `docker kill`s the container **and** SIGKILLs the local
 `docker run` client, and if the client still hasn't exited within a grace window
@@ -212,13 +370,17 @@ Two ids, disambiguated:
 | `BENCH_IMAGE` | `claude-bench:latest` | Docker image tag |
 | `BENCH_EXECUTOR_MODEL` | `sonnet` | Model that does the coding |
 | `BENCH_JUDGE_MODEL` | `opus` | Model that scores |
-| `BENCH_EXECUTOR_TIMEOUT_MS` | `900000` | Per-executor-run timeout |
+| `BENCH_EXECUTOR_TIMEOUT_MS` | `1800000` | Per-executor-run timeout |
+| `BENCH_CONCURRENCY` | `3` | Default cell concurrency (overridden by `--concurrency`) |
 | `BENCH_JUDGE_TIMEOUT_MS` | `300000` | Per-judge-run timeout |
+| `BENCH_TEST_TIMEOUT_MS` | `300000` | Timeout for a task's `testCommand` container (Correctness axis) |
 | `BENCH_SETUP_TIMEOUT_MS` | `300000` | Per setup-bundle pre-step timeout |
 | `BENCH_CONTAINER_KILL_GRACE_MS` | `10000` | Grace before force-resolving a hung run after timeout |
 | `BENCH_INTER_CELL_DELAY_MS` | `0` | Default pause between cells (overridden by `--delay-ms`) |
+| `BENCH_PAIRWISE` | on | Pairwise A/B craft judging; only `0`/`false` disable (any other value, including a typo, stays on). Overridden by `--no-pairwise` |
+| `BENCH_REPEATS` | `1` | Runs per (variant × task × model) cell (Reliability axis). Overridden by `--repeats N` |
 | `BENCH_MAX_DIFF_BYTES` | `200000` | Byte cap on the diff shown to the judge |
-| `BENCH_MAX_TRANSCRIPT_BYTES` | `200000` | Byte cap on the transcript shown to the judge |
+| `BENCH_MAX_TRANSCRIPT_BYTES` | `200000` | Byte cap on the captured transcript (artifact only — the judge never sees it) |
 
 ### Evidence handling
 
@@ -228,17 +390,20 @@ Two ids, disambiguated:
   `.git/info/exclude` ignores `node_modules/`, `dist/`, `build/`, `coverage/`,
   `.next/`, `.turbo/`, `*.log`, `.DS_Store` (and the variant `CLAUDE.md`), so a
   legitimate `npm install` is not counted as the agent's work.
-- **Evidence is size-capped.** The redacted diff and transcript are each
-  truncated at `BENCH_MAX_DIFF_BYTES` / `BENCH_MAX_TRANSCRIPT_BYTES` before the
-  judge sees them, with a visible `[... truncated ...]` marker. Truncation sets
-  `evidenceTruncated` on the result and shows a note in the report; it does not
-  affect scores. The full redacted diff/transcript are still written to
-  `results/<runId>/`.
+- **Evidence is size-capped.** The redacted diff is truncated at
+  `BENCH_MAX_DIFF_BYTES` before the judge sees it, with a visible truncation
+  marker — and a truncated diff triggers the judge's own fail-closed rule
+  (output `unknown` for anything it cannot see). The transcript — which the
+  judge never sees — is still captured, redacted, and capped at
+  `BENCH_MAX_TRANSCRIPT_BYTES` as an artifact. Truncation sets
+  `evidenceTruncated` on the result and shows a note in the report. The full
+  redacted diff/transcript are still written to `results/<runId>/`.
 
-### Run metrics (cost & time KPIs) — observed, not scored
+### Run metrics (cost & time KPIs) — the Efficiency axis
 
 Each run also records how expensive and slow the variant was to execute. These
-are **purely observational** — they never affect scores, caps, or ranking.
+remain **observational per cell** and now surface as the **Efficiency axis** —
+a reported column, still never folded into the other axes or their ranking.
 
 - **Wall-clock time** (headline): host-measured around the whole `docker run`
   (spawn → exit), so it includes container startup, `npm install`, etc. — the
@@ -252,49 +417,68 @@ are **purely observational** — they never affect scores, caps, or ranking.
 
 Both the executor and judge calls are measured. Where they appear:
 
-- **Console** — appended to each run's line, e.g.
-  `judged: total 90/100  [exec 78.4s, $0.1234, 45.2k in / 3.1k out, 12 turns]`.
-- **`reports/report.md`** — a `## Run metrics (not scored)` table with a
-  **Model** column: exec time, exec cost, input/output tokens, turns, judge cost
-  per (variant × model). Absent CLI fields render as `—` (never
-  `undefined`/`NaN`). Cost/tokens/time are **summed** across each (variant ×
-  model)'s tasks (total spend).
+- **Console** — appended to each cell's judged log line, alongside that cell's
+  craft summary and anchor grade: exec wall time, cost, tokens in/out, turns.
+- **`reports/report.md`** — the Efficiency section: a per-(variant × model)
+  table with exec time, exec cost, input/output tokens, turns, judge cost.
+  Absent CLI fields render as `—` (never `undefined`/`NaN`). Cost/tokens/time
+  are **summed** across each (variant × model)'s tasks (total spend).
 - **`<runDir>/report.json`** and each **`<runDir>/results/<cellId>/result.json`**
   — the full raw `metrics` object (executor + judge `CallMetrics`, all fields).
 
 ### Report sections
 
-- **Single executor model**: `## Score matrix` (one row per variant), unchanged.
-- **Multiple executor models** (`--models`):
-  - `## Cross-model comparison (Total /100)` — headline table, rows = variant,
-    one column per executor model, `★` marking the best model per variant.
-  - `## Per-model score matrices` — the full dimension matrix once per model
-    under `### Model: <name>`, ranked within that model.
-  - The aggregation unit is `(variant × executorModel)` across tasks — scores
-    are **never averaged across models** (they aren't interchangeable). "Top
-    result" reports the best `(variant, model)` overall.
-- `report.json` keeps a flat `results` array (each entry tagged with
-  `executorModel`/`judgeModel`, so it's groupable by model, plus a derived
-  `scored` flag / `excludedReason`) plus an `executorModels` list, the fixed
-  `judgeModel`, and a `variantSummary` (per-unit `scoredCount`/`attemptedCount`/
-  `meanTotal`).
+`report.md` walks the axes in lexicographic order — the same priority the
+scoring uses:
+
+- **Correctness** — per-cell `testCommand` verdicts (pass/fail, plus parsed test
+  counts when the runner output was parseable); cells without executable tests
+  show the judge's hedged fallback verdict instead.
+- **Memory effect** (adherence) — the campaign headline: graded anchor verdicts,
+  rendered with graded symbols — `✓A` held-by-abstraction, `✓L` held-by-literal,
+  `~I` held-by-inertia, `✗` drift, `⚠` trap, `?` unknown.
+- **Craft** — the slop-metrics table, per-cell judge craft medians, and pairwise
+  win-rates with the position-bias audit. Absolute craft medians are comparable
+  only within a bundle; cross-bundle ranking reads the win-rates.
+- **Efficiency** — cost/time/token columns per (variant × model).
+- **Reliability** — cross-run variance when `--repeats N` > 1.
+- **Blast radius** — out-of-scope touches with the judge's classification;
+  adversarial entries are called out with the cell's disqualification.
+- Behavior comparison and **`## Excluded cells (not scored)`** — as before.
+
+Multi-model runs (`--models`) group each section per executor model. The
+aggregation unit is `(variant × executorModel)` across tasks — axis values are
+**never averaged or ranked across models** (they aren't interchangeable), and
+pairwise comparisons never cross models either.
+
+`report.json` keeps a flat `results` array (each entry tagged with
+`executorModel`/`judgeModel`, so it's groupable by model, plus a derived
+`scored` flag / `excludedReason`), an `executorModels` list, and the fixed
+`judgeModel`; runs that exercised campaigns or pairwise judging additionally
+carry `campaigns` (per-link trajectories) and `pairwise` (A/B comparisons)
+arrays.
 
 ### Scored vs excluded cells (only real verdicts count)
 
-The /100 mean is computed over **scored cells only** — a cell counts iff it
+Aggregates are computed over **scored cells only** — a cell counts iff it
 produced a real judge verdict (executor OK **and** no judge failure; timeouts
 already fail the executor). This keeps wall-clock (the executor timeout) from
 polluting the ranking:
 
-- A failed/timed-out cell is a **coverage gap, never a fabricated 0**. It is
-  excluded from the mean, shown as `⚠️ excluded` in the matrix, and listed under
-  **`## Excluded cells (not scored)`** with its reason.
-- Each matrix row shows **coverage** — e.g. `2/3 scored, 1 excluded`. A unit with
-  **zero** scored cells renders `⚠️ excluded` (not `0`) and ranks **last**.
-- A genuine judge-scored `0` (present output the judge rated 0) **does** count —
-  only the failure path is excluded, never a real verdict.
-- Time/cost KPIs are unchanged: they remain observational and still include
-  failed/timed-out attempts (honest cost accounting), and never feed the score.
+- A failed/timed-out cell is a **coverage gap, never a fabricated
+  bottom-of-scale verdict**. It is excluded from every aggregate and listed
+  under **`## Excluded cells (not scored)`** with its reason.
+- Per-unit **coverage** is reported — e.g. `2/3 scored, 1 excluded`. A unit with
+  **zero** scored cells reads as excluded, never as a real verdict, and ranks
+  **last**.
+- A genuine judged verdict — however unflattering — **does** count: only the
+  failure path is excluded, never a real verdict.
+- Disqualified cells (any `adversarial` blast-radius entry) are likewise
+  excluded from every aggregate and reported — gaming is surfaced, never
+  averaged away.
+- Time/cost KPIs are unchanged: Efficiency remains observational, still includes
+  failed/timed-out attempts (honest cost accounting), and never feeds the other
+  axes.
 
 ### Regenerating a report (`--report`, offline)
 
@@ -362,9 +546,9 @@ A variant is a `prompts/<name>/` directory. Its shape is declared by an optional
   registers **55 skills** into `<workspace>/.claude/skills` before the executor
   runs.
 
-The lone-CLAUDE.md variants are designed to produce genuinely different rubric
-outcomes so the harness visibly discriminates between doctrines; the bundles
-test whether a full skills/agents harness beats a plain prompt.
+The lone-CLAUDE.md variants are designed to produce genuinely different outcomes
+across the axes so the harness visibly discriminates between doctrines; the
+bundles test whether a full skills/agents harness beats a plain prompt.
 
 ### Bundle caveats
 
@@ -424,9 +608,9 @@ test whether a full skills/agents harness beats a plain prompt.
 allowlist)` that prevents open redirects (allowlisted scheme/host, rejects
 `javascript:`/`data:`/protocol-relative/credentials-in-URL, normalizes relative
 paths) plus a small Express-style handler. It is logic-bearing and
-security-relevant, exercising all four rubric dimensions. The task prompt states
-the requirement but deliberately does **not** ask for tests or a security review
-— that is exactly what the variants influence and the rubric measures.
+security-relevant. The task prompt states the requirement but deliberately does
+**not** ask for tests or a security review — that is exactly what the variants
+influence and the axes measure.
 
 ## Security & isolation model
 
@@ -447,7 +631,8 @@ the requirement but deliberately does **not** ask for tests or a security review
   throwaway workspace. It is never used on the host.
 - **The judge runs with `--tools ""`** (all tools disabled). It cannot read
   files or run commands; it only reasons over the evidence embedded in its
-  prompt. This keeps scoring reproducible and prevents the judge from wandering.
+  prompt — the diff plus read-only deterministic context, never the transcript.
+  This keeps scoring reproducible and prevents the judge from wandering.
 - **`--no-session-persistence`** (executor) keeps runs from leaking state into
   each other.
 - The variant `CLAUDE.md` is dropped into the workspace *after* the git baseline
@@ -478,10 +663,11 @@ npm run typecheck    # tsc --noEmit
 npm test             # node --test on the pure-function unit tests
 ```
 
-The harness dogfoods its own rubric: the pure scoring, classification, parsing,
-and reporting functions are unit-tested with the zero-dependency `node:test`
-runner. Container-dependent code paths (Docker spawn, executor, judge I/O) are
-exercised by the real benchmark run.
+The harness dogfoods its own scoring: the pure functions behind the axes — slop
+metrics, anchor grading, surface scoping, judge-output parsing, classification,
+reporting — are unit-tested with the zero-dependency `node:test` runner.
+Container-dependent code paths (Docker spawn, executor, judge I/O) are exercised
+by the real benchmark run.
 
 ## Layout
 
@@ -489,19 +675,23 @@ exercised by the real benchmark run.
 Dockerfile              pinned claude CLI image
 scripts/                build-image.sh, setup-auth.sh
 src/
-  config.ts             paths, image, models, weights, timeouts (env-overridable)
+  config.ts             paths, image, models, timeouts, scoring toggles (env-overridable)
   auth.ts               OAuth token resolution (env var → token file)
   types.ts              domain types
   variant.ts            variant.json manifest parse + defaults
-  rubric.ts             verbatim rubric, judge prompt + output contract, cap logic
+  rubric.ts             cell-judge prompt (craft/blast/correctness residual) + output contract
   docker.ts             docker run wrappers (executor, judge, auth probe)
   workspace.ts          per-run workspace prep + git baseline + bundle materialize
   capture.ts            diff, file classification, transcript, signals
+  anchors.ts            deterministic anchor detectors + graded verdicts (Adherence)
+  slop.ts               mechanical slop metrics over the diff (Craft, deterministic half)
+  surface.ts            expectedSurface glob scoping (blast radius, deterministic half)
   metrics.ts            parse cost/time KPIs from the result event + formatters
   pool.ts               bounded-concurrency worker pool (order-preserving)
   runmeta.ts            per-run GUID folder naming + reverse-time sort key
   executor.ts           run one (variant × task × model) cell
-  judge.ts              evidence bundle → judge → parse → cap-enforce
+  judge.ts              evidence → cell judge → fail-closed parse → verdict
+  pairwise.ts           A/B craft comparisons (randomized order, fail-closed ties)
   report.ts             markdown + JSON aggregation
   cli.ts                arg parsing, preflight, orchestration
 prompts/                variants under test — claude-md dirs + bundle dirs

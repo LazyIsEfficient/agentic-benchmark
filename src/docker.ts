@@ -11,7 +11,9 @@ import {
   OAUTH_TOKEN_ENV,
   REPO_ROOT,
   SETUP_TIMEOUT_MS,
+  TEST_TIMEOUT_MS,
 } from "./config.js";
+import type { TestResults } from "./types.js";
 
 /** The subset of `spawn` we depend on; injectable so the timeout/grace logic is
  * testable without invoking real docker. */
@@ -213,6 +215,80 @@ export async function runSetup(args: {
     command: ["bash", "-lc", args.setupCommand],
     timeoutMs: SETUP_TIMEOUT_MS,
   });
+}
+
+/** Tail of combined test output kept in TestResults.raw (bytes-ish; JS chars). */
+const TEST_RAW_TAIL = 4096;
+
+/**
+ * Best-effort test-count extraction from runner output. First matching runner
+ * format wins; within a format, a count is set ONLY when its number is literally
+ * present in the output (never fabricated — `ok` stays authoritative). Unknown
+ * output yields no counts at all.
+ */
+function parseTestCounts(output: string): { passed?: number; failed?: number } {
+  // node:test TAP summary: `# pass N` / `# fail N`
+  const tapPass = /^#\s*pass\s+(\d+)/m.exec(output);
+  const tapFail = /^#\s*fail\s+(\d+)/m.exec(output);
+  if (tapPass || tapFail) {
+    return {
+      ...(tapPass ? { passed: Number(tapPass[1]) } : {}),
+      ...(tapFail ? { failed: Number(tapFail[1]) } : {}),
+    };
+  }
+  // jest/vitest summary: `Tests: 2 failed, 5 passed, 7 total` (failed omitted at 0)
+  const jest = /Tests:\s+(?:(\d+) failed, )?(\d+) passed/.exec(output);
+  if (jest) {
+    return {
+      passed: Number(jest[2]),
+      ...(jest[1] !== undefined ? { failed: Number(jest[1]) } : {}),
+    };
+  }
+  // mocha epilogue: `12 passing (48ms)` / `3 failing` (failing omitted at 0)
+  const mochaPass = /(\d+) passing/.exec(output);
+  const mochaFail = /(\d+) failing/.exec(output);
+  if (mochaPass || mochaFail) {
+    return {
+      ...(mochaPass ? { passed: Number(mochaPass[1]) } : {}),
+      ...(mochaFail ? { failed: Number(mochaFail[1]) } : {}),
+    };
+  }
+  return {};
+}
+
+/**
+ * Run a task's `testCommand` in the workspace container — the deterministic
+ * Correctness axis. Same image and rw bind mount at {@link CONTAINER_WORK_DIR}
+ * as the executor, so node_modules/fixtures resolve identically; but NO claude
+ * CLI and NO auth env — the command is a plain `sh -lc`, and keeping the OAuth
+ * token out of a container that runs task-authored code shrinks the exposure
+ * surface. `ok` = exited 0 within the timeout; counts are best-effort parsed.
+ */
+export async function runTests(opts: {
+  workspaceDir: string;
+  command: string;
+  timeoutMs?: number;
+  /** Injectable spawn (tests only); defaults to node:child_process spawn. */
+  spawnFn?: SpawnFn;
+}): Promise<TestResults> {
+  const timeoutMs = opts.timeoutMs ?? TEST_TIMEOUT_MS;
+  const res = await runContainer({
+    dockerArgs: ["-v", `${opts.workspaceDir}:${CONTAINER_WORK_DIR}`, "-w", CONTAINER_WORK_DIR],
+    command: ["sh", "-lc", opts.command],
+    timeoutMs,
+    ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
+  });
+
+  const combined = res.stdout + res.stderr;
+  const tail = combined.slice(-TEST_RAW_TAIL);
+  return {
+    command: opts.command,
+    ok: !res.timedOut && res.exitCode === 0,
+    raw: res.timedOut
+      ? `${tail}\n[test command timed out after ${timeoutMs}ms; container killed]`
+      : tail,
+    ...parseTestCounts(combined),
+  };
 }
 
 /**

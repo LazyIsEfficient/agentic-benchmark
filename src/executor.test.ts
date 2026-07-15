@@ -8,9 +8,10 @@ import {
   runCampaign,
   runSequenceTask,
   runSetupPreStep,
+  runVariantTask,
   runWithExecutorRetry,
 } from "./executor.js";
-import type { ExecutorRunner } from "./executor.js";
+import type { ExecutorRunner, TestRunner } from "./executor.js";
 import { git, prepareWorkspace } from "./workspace.js";
 import type { ContainerResult } from "./docker.js";
 import type { RunArtifacts, Task, Variant } from "./types.js";
@@ -561,6 +562,274 @@ test("runCampaign: a mid-chain executor failure is captured AND the later link s
     assert.equal(results[2]!.artifacts.executorOk, true);
     assert.match(results[2]!.artifacts.diff, /last\.ts/);
     assert.doesNotMatch(results[2]!.artifacts.diff, /first\.ts/, "last link diff is isolated");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- Test execution (deterministic Correctness axis) --------------------------
+//
+// A task's optional testCommand runs in the workspace container AFTER a clean
+// executor run, via the same SequenceDeps seam as runExecutorFn (runTestsFn?).
+// No command, or a failed executor, leaves testResults undefined — downstream
+// that absence means "no executable tests", never a failure.
+
+/** Recording fake TestRunner: logs each call, returns a canned green result. */
+function fakeTestRunner(calls: { workspaceDir: string; command: string }[]): TestRunner {
+  return async (opts) => {
+    calls.push({ workspaceDir: opts.workspaceDir, command: opts.command });
+    return { command: opts.command, ok: true, passed: 3, failed: 0, raw: "# pass 3" };
+  };
+}
+
+/** Scaffolding for a single-shot task cell in a temp dir. */
+async function singleShotFixture(testCommand?: string) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "bench-testexec-"));
+  const runResultsDir = path.join(root, "results");
+  const taskDir = path.join(root, "task");
+  await fs.mkdir(runResultsDir, { recursive: true });
+  await fs.mkdir(taskDir, { recursive: true });
+  const task: Task = {
+    dir: taskDir,
+    prompt: "implement it",
+    meta: {
+      id: "single",
+      title: "Single",
+      logicBearing: true,
+      securityRelevant: false,
+      ...(testCommand ? { testCommand } : {}),
+    },
+  };
+  return { root, runResultsDir, task };
+}
+
+test("single-shot: meta.testCommand runs AFTER a clean executor; testResults attached", async () => {
+  const { root, runResultsDir, task } = await singleShotFixture("node --test");
+  const variant: Variant = { name: "cm", type: "claude-md", content: "# doctrine" };
+
+  const events: string[] = [];
+  const fakeExecutor: ExecutorRunner = async ({ workspaceDir, onStdout }) => {
+    events.push("executor");
+    onStdout?.('{"type":"result","subtype":"success"}\n');
+    await fs.mkdir(path.join(workspaceDir, "src"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "src", "impl.ts"), "export const a = 1;\n");
+    return fakeResult({ stdout: "" });
+  };
+  const testCalls: { workspaceDir: string; command: string }[] = [];
+  const runTestsFn: TestRunner = async (opts) => {
+    events.push("tests");
+    testCalls.push({ workspaceDir: opts.workspaceDir, command: opts.command });
+    return { command: opts.command, ok: true, passed: 3, failed: 0, raw: "# pass 3" };
+  };
+
+  try {
+    const res = await runVariantTask(variant, task, "sonnet", runResultsDir, {
+      runExecutorFn: fakeExecutor,
+      runTestsFn,
+    });
+    assert.equal(res.executorOk, true);
+    assert.deepEqual(events, ["executor", "tests"], "tests run after the executor finishes");
+    assert.equal(testCalls.length, 1);
+    assert.equal(testCalls[0]!.command, "node --test");
+    assert.equal(testCalls[0]!.workspaceDir, res.workspaceDir, "tests run in the cell's workspace");
+    assert.deepEqual(res.testResults, {
+      command: "node --test",
+      ok: true,
+      passed: 3,
+      failed: 0,
+      raw: "# pass 3",
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("single-shot: no testCommand ⇒ runTests never invoked, testResults undefined", async () => {
+  const { root, runResultsDir, task } = await singleShotFixture(undefined);
+  const variant: Variant = { name: "cm", type: "claude-md", content: "" };
+  const fakeExecutor: ExecutorRunner = async ({ onStdout }) => {
+    onStdout?.('{"type":"result","subtype":"success"}\n');
+    return fakeResult({ stdout: "" });
+  };
+  const testCalls: { workspaceDir: string; command: string }[] = [];
+
+  try {
+    const res = await runVariantTask(variant, task, "sonnet", runResultsDir, {
+      runExecutorFn: fakeExecutor,
+      runTestsFn: fakeTestRunner(testCalls),
+    });
+    assert.equal(res.executorOk, true);
+    assert.equal(testCalls.length, 0, "no command ⇒ no test container");
+    assert.equal(res.testResults, undefined);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("single-shot: executor failure ⇒ tests skipped (nothing meaningful to test)", async () => {
+  const { root, runResultsDir, task } = await singleShotFixture("node --test");
+  const variant: Variant = { name: "cm", type: "claude-md", content: "" };
+  // A timeout is TERMINAL in the retry logic, so this stays a single fast attempt.
+  const fakeExecutor: ExecutorRunner = async () =>
+    fakeResult({ exitCode: null, timedOut: true });
+  const testCalls: { workspaceDir: string; command: string }[] = [];
+
+  try {
+    const res = await runVariantTask(variant, task, "sonnet", runResultsDir, {
+      runExecutorFn: fakeExecutor,
+      runTestsFn: fakeTestRunner(testCalls),
+    });
+    assert.equal(res.executorOk, false);
+    assert.equal(testCalls.length, 0, "failed executor ⇒ no test container");
+    assert.equal(res.testResults, undefined);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("single-shot: a runTests crash degrades to ok:false — never kills the cell", async () => {
+  const { root, runResultsDir, task } = await singleShotFixture("node --test");
+  const variant: Variant = { name: "cm", type: "claude-md", content: "" };
+  const fakeExecutor: ExecutorRunner = async ({ onStdout }) => {
+    onStdout?.('{"type":"result","subtype":"success"}\n');
+    return fakeResult({ stdout: "" });
+  };
+  const runTestsFn: TestRunner = async () => {
+    throw new Error("docker daemon exploded");
+  };
+
+  try {
+    const res = await runVariantTask(variant, task, "sonnet", runResultsDir, {
+      runExecutorFn: fakeExecutor,
+      runTestsFn,
+    });
+    assert.equal(res.executorOk, true, "the cell itself survives");
+    assert.deepEqual(res.testResults, {
+      command: "node --test",
+      ok: false,
+      raw: "docker daemon exploded",
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runSequenceTask: meta.testCommand runs ONCE against the FINAL workspace state", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "bench-seq-tests-"));
+  const runResultsDir = path.join(root, "results");
+  const taskDir = path.join(root, "task");
+  await fs.mkdir(runResultsDir, { recursive: true });
+  await fs.mkdir(taskDir, { recursive: true });
+
+  const variant: Variant = { name: "cm", type: "claude-md", content: "" };
+  const task: Task = {
+    dir: taskDir,
+    prompt: "unused for a sequence task",
+    meta: {
+      id: "seqtests",
+      title: "SequenceTests",
+      logicBearing: true,
+      securityRelevant: false,
+      testCommand: "node --test",
+      steps: [
+        { prompt: "step one", id: "one" },
+        { prompt: "step two", id: "two" },
+      ],
+    },
+  };
+
+  const events: string[] = [];
+  const fakeExecutor: ExecutorRunner = async ({ workspaceDir, taskPrompt, onStdout }) => {
+    events.push(taskPrompt);
+    onStdout?.('{"type":"result","subtype":"success"}\n');
+    await fs.mkdir(path.join(workspaceDir, "src"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspaceDir, "src", `${taskPrompt.replace(/\s+/g, "-")}.ts`),
+      "export {};\n",
+    );
+    return fakeResult({ stdout: "" });
+  };
+  const testCalls: { workspaceDir: string; command: string }[] = [];
+  const runTestsFn: TestRunner = async (opts) => {
+    events.push("tests");
+    testCalls.push({ workspaceDir: opts.workspaceDir, command: opts.command });
+    return { command: opts.command, ok: true, raw: "# pass 1" };
+  };
+
+  try {
+    const final = await runSequenceTask(variant, task, "sonnet", runResultsDir, {
+      runExecutorFn: fakeExecutor,
+      runTestsFn,
+    });
+    // Exactly one test run, and only after EVERY step has finished.
+    assert.deepEqual(events, ["step one", "step two", "tests"]);
+    assert.equal(testCalls.length, 1);
+    assert.equal(testCalls[0]!.command, "node --test");
+    assert.equal(testCalls[0]!.workspaceDir, final.workspaceDir);
+    assert.deepEqual(final.testResults, { command: "node --test", ok: true, raw: "# pass 1" });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runCampaign: per-link testCommand overrides meta-level; failed link skips tests", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "bench-camp-tests-"));
+  const runResultsDir = path.join(root, "results");
+  const taskDir = path.join(root, "task");
+  await fs.mkdir(runResultsDir, { recursive: true });
+  await fs.mkdir(taskDir, { recursive: true });
+
+  const variant: Variant = { name: "cm", type: "claude-md", content: "" };
+  const task: Task = {
+    dir: taskDir,
+    prompt: "unused",
+    meta: {
+      id: "camptests",
+      title: "CampaignTests",
+      logicBearing: true,
+      securityRelevant: false,
+      testCommand: "npm test",
+      campaign: [
+        { prompt: "link one", id: "one" }, // inherits the meta-level command
+        { prompt: "link two", id: "two", testCommand: "npm run test:wide" }, // override wins
+        { prompt: "link three", id: "three" }, // executor fails ⇒ tests skipped
+      ],
+    },
+  };
+
+  const fakeExecutor: ExecutorRunner = async ({ workspaceDir, taskPrompt, onStdout }) => {
+    onStdout?.('{"type":"result","subtype":"success"}\n');
+    if (taskPrompt === "link three") return fakeResult({ exitCode: 1, stderr: "boom" });
+    await fs.mkdir(path.join(workspaceDir, "src"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspaceDir, "src", `${taskPrompt.replace(/\s+/g, "-")}.ts`),
+      "export {};\n",
+    );
+    return fakeResult({ stdout: "" });
+  };
+  const testCalls: { workspaceDir: string; command: string }[] = [];
+
+  try {
+    const results = await runCampaign(variant, task, "sonnet", runResultsDir, {
+      runExecutorFn: fakeExecutor,
+      runTestsFn: fakeTestRunner(testCalls),
+    });
+
+    assert.equal(results.length, 3);
+    // One test container per SUCCESSFUL link, with the resolved command.
+    assert.deepEqual(
+      testCalls.map((c) => c.command),
+      ["npm test", "npm run test:wide"],
+    );
+    assert.equal(results[0]!.testResults?.command, "npm test");
+    assert.equal(results[1]!.testResults?.command, "npm run test:wide", "link override wins");
+    // The failed link has NO verdict — absence, not a fabricated failure.
+    assert.equal(results[2]!.artifacts.executorOk, false);
+    assert.equal(results[2]!.testResults, undefined);
+    // Every test run happened in the shared campaign workspace.
+    for (const c of testCalls) {
+      assert.equal(c.workspaceDir, results[0]!.artifacts.workspaceDir);
+    }
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

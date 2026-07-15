@@ -1,32 +1,28 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
-  DIMENSION_MAX,
   JUDGE_MAX_ATTEMPTS,
   JUDGE_MODEL,
   MAX_DIFF_BYTES,
-  MAX_TRANSCRIPT_BYTES,
   RETRY_BASE_MS,
 } from "./config.js";
 import { runJudge } from "./docker.js";
 import { parseCallMetrics } from "./metrics.js";
 import { withRetry } from "./retry.js";
-import { buildJudgePrompt, scoreRun } from "./rubric.js";
+import { buildCellJudgePrompt } from "./rubric.js";
+import type { CellJudgePromptInputs } from "./rubric.js";
 import type {
+  BlastClassification,
+  BlastRadiusEntry,
   CallMetrics,
-  JudgeResult,
-  RunArtifacts,
-  Task,
+  CellCraft,
+  CellJudgeResult,
+  CorrectnessAssessment,
+  CorrectnessVerdict,
+  CraftDimension,
+  CraftScore,
   VariantTaskResult,
 } from "./types.js";
-
-/** Render the classified file list into the summary block for the judge. */
-export function buildFileSummary(artifacts: RunArtifacts): string {
-  if (artifacts.changedFiles.length === 0) return "(no files changed)";
-  return artifacts.changedFiles
-    .map((f) => `- ${f.path} [${f.kind}]`)
-    .join("\n");
-}
 
 /**
  * Truncate evidence text to a byte cap, appending a visible marker when it is
@@ -46,84 +42,6 @@ export function truncateEvidence(
   return {
     text: `${sliced}\n\n[... ${label} truncated at ${maxBytes} bytes for evaluation ...]`,
     truncated: true,
-  };
-}
-
-const DIMENSION_KEYS = [
-  "codeQuality",
-  "testingCoverage",
-  "securityQuality",
-  "documentation",
-] as const;
-
-/**
- * Validate the parsed judge payload: correct shape, integer scores, and — the
- * deterministic backstop — every score within its dimension's 0..max range.
- * With CLI-side schema enforcement removed, this is now the PRIMARY validation
- * ("never trust the judge"): an out-of-range or malformed score is a hard
- * failure rather than a silently inflated total. Pure function; unit-testable.
- */
-export function parseJudgeResult(raw: unknown): JudgeResult {
-  if (typeof raw !== "object" || raw === null) {
-    throw new Error("Judge result is not an object.");
-  }
-  const obj = raw as Record<string, unknown>;
-
-  const dim = (key: (typeof DIMENSION_KEYS)[number]) => {
-    const max = DIMENSION_MAX[key];
-    const d = obj[key];
-    if (typeof d !== "object" || d === null) {
-      throw new Error(`Judge result missing dimension "${key}".`);
-    }
-    const dd = d as Record<string, unknown>;
-    const score = dd["score"];
-    if (typeof score !== "number" || !Number.isInteger(score)) {
-      throw new Error(`Judge dimension "${key}" has a non-integer score.`);
-    }
-    if (score < 0 || score > max) {
-      throw new Error(
-        `Judge dimension "${key}" score ${score} is out of range 0..${max}.`,
-      );
-    }
-    if (typeof dd["justification"] !== "string") {
-      throw new Error(`Judge dimension "${key}" missing justification.`);
-    }
-    return { score, justification: dd["justification"] };
-  };
-
-  // Summary is non-scoring narrative. The judge occasionally omits it; that must
-  // never fail an otherwise-valid verdict (and never trigger a wasted retry), so
-  // tolerate a missing/non-string summary by defaulting to empty.
-  const summary = typeof obj["summary"] === "string" ? obj["summary"] : "";
-
-  // securityReviewPerformed drives the (punitive) security cap. If present it
-  // must be a boolean; if omitted, default to true so the cap only fires on a
-  // positive "no review" signal (mirrors the tolerant summary handling).
-  const srp = obj["securityReviewPerformed"];
-  if (srp !== undefined && typeof srp !== "boolean") {
-    throw new Error(
-      `Judge result "securityReviewPerformed" must be a boolean if present.`,
-    );
-  }
-
-  // taskSolved drives the (punitive) correctness cap on gated tasks. If present
-  // it must be a boolean; leave it undefined when omitted so scoreRun applies
-  // the default (true) — the cap only fires on a positive "unsolved" signal.
-  const ts = obj["taskSolved"];
-  if (ts !== undefined && typeof ts !== "boolean") {
-    throw new Error(
-      `Judge result "taskSolved" must be a boolean if present.`,
-    );
-  }
-
-  return {
-    codeQuality: dim("codeQuality"),
-    testingCoverage: dim("testingCoverage"),
-    securityQuality: dim("securityQuality"),
-    documentation: dim("documentation"),
-    securityReviewPerformed: srp === undefined ? true : srp,
-    taskSolved: typeof ts === "boolean" ? ts : undefined,
-    summary,
   };
 }
 
@@ -159,7 +77,7 @@ function firstBalancedObject(text: string): string | null {
  * the JSON (even inside the fence); returning the balanced object rather than the
  * raw fence body keeps `JSON.parse` from choking on that trailer. Pure.
  */
-function extractJsonObjectText(text: string): string | null {
+export function extractJsonObjectText(text: string): string | null {
   const fenced =
     text.match(/```json\s*([\s\S]*?)```/i) ?? text.match(/```\s*([\s\S]*?)```/);
   if (fenced?.[1]) {
@@ -203,133 +121,354 @@ export function extractJudgeJson(stdout: string): unknown {
   return JSON.parse(jsonText);
 }
 
+// --- Structured cell judge (five-axis system) --------------------------------
+
+const BLAST_CLASSIFICATIONS: ReadonlySet<string> = new Set([
+  "necessary",
+  "defensible",
+  "overreach",
+  "adversarial",
+]);
+
+const CORRECTNESS_VERDICTS: ReadonlySet<string> = new Set([
+  "likely_correct",
+  "likely_incorrect",
+  "unknown",
+]);
+
+/** Max chars kept per judge-cited evidence string (craft/blast/correctness). */
+const CELL_EVIDENCE_MAX_CHARS = 120;
+
+/** Max judge-authored flags kept; harness-appended validation flags are exempt. */
+const CELL_MAX_FLAGS = 20;
+
+const truncateCellEvidence = (s: string): string =>
+  s.length > CELL_EVIDENCE_MAX_CHARS ? s.slice(0, CELL_EVIDENCE_MAX_CHARS) : s;
+
+/** Coerce a judge-supplied evidence field: strings only, each capped at 120 chars. */
+const coerceEvidence = (raw: unknown): string[] =>
+  Array.isArray(raw)
+    ? raw
+        .filter((e): e is string => typeof e === "string")
+        .map(truncateCellEvidence)
+    : [];
+
 /**
- * Build an all-zero scored result for a run that could not be scored — either
- * the executor failed to produce output, or the judge failed to score it. The
- * failure kind is surfaced via executorFailure / judgeFailure so the report can
- * flag it. Deterministic caps still run (they only reduce, never inflate).
+ * The fail-closed empty verdict: every craft dimension "unknown", nothing
+ * classified, no correctness read. Used when the judge dies so the cell's
+ * deterministic axes (tests, anchors, slop, telemetry) survive intact.
  */
-export function buildFailureResult(
-  artifacts: RunArtifacts,
-  task: Task,
-  failure: { executor?: string; judge?: string },
-): VariantTaskResult {
-  const reason = failure.executor ?? failure.judge ?? "unknown error";
-  const kind = failure.judge ? "Judge" : "Executor";
-  const zero = { score: 0, justification: `${kind} run failed; no output to score.` };
-  const raw: JudgeResult = {
-    codeQuality: zero,
-    testingCoverage: zero,
-    securityQuality: zero,
-    documentation: zero,
-    // A failed run is scored all-zero; the security cap ceiling (8) is above the
-    // zero score, so this value is inert here regardless.
-    securityReviewPerformed: false,
-    // Inert: total is already 0, well under the correctness ceiling; kept
-    // consistent so a gated failure reads the same as any other unsolved run.
-    taskSolved: false,
-    summary: `Run failed: ${reason}`,
-  };
-  const scored = scoreRun(raw, artifacts, task.meta);
+function emptyCellJudgeResult(flags: string[]): CellJudgeResult {
+  const unknown = (): CraftScore => ({ score: "unknown", evidence: [] });
   return {
-    ...scored,
-    ...(failure.executor ? { executorFailure: failure.executor } : {}),
-    ...(failure.judge ? { judgeFailure: failure.judge } : {}),
+    craft: {
+      naming: unknown(),
+      structure: unknown(),
+      consistency: unknown(),
+      economy: unknown(),
+    },
+    blastRadius: [],
+    correctnessAssessment: null,
+    flags,
   };
 }
 
 /**
- * Judge one run: build the evidence bundle, run the tool-less judge in a
- * container, parse + validate the JSON, then apply deterministic caps to
- * produce the final scored result.
- *
- * A failed executor short-circuits to an all-zero result (no judge quota spent).
- * A judge-side failure (container error, timeout, malformed/out-of-range output)
- * throws; the caller is responsible for catching it and recording a failed run
- * so one bad judge invocation never aborts the whole matrix.
+ * Parse + validate the cell judge's raw response text into a CellJudgeResult.
+ * Fence-stripping / balanced-object extraction reuses the shared JSON helpers
+ * above. Validation is FAIL-CLOSED and FIELD-LEVEL: a malformed craft
+ * dimension becomes { score: "unknown", evidence: [] } (never clamped), bad
+ * blast entries are dropped, an invalid correctness verdict degrades to
+ * "unknown" — each with an `invalid:*` flag appended so the anomaly is
+ * visible. EXCEPTION: a blast entry classified "adversarial" (matched
+ * trimmed + lowercased) is never dropped — dropping would fail OPEN for
+ * disqualification — its missing fields are coerced instead. Throws ONLY when
+ * no parseable JSON object exists at all; that throw is what feeds judgeCell's
+ * single re-ask.
  */
-export async function judgeRun(
-  artifacts: RunArtifacts,
-  task: Task,
-): Promise<VariantTaskResult> {
-  if (!artifacts.executorOk) {
-    return buildFailureResult(artifacts, task, {
-      executor: artifacts.failureReason ?? "unknown error",
+export function parseCellJudgeResult(rawText: string): CellJudgeResult {
+  const jsonText = extractJsonObjectText(rawText);
+  if (jsonText === null) {
+    throw new Error("No JSON object found in the cell judge response.");
+  }
+  // Malformed JSON inside the balanced span also throws (still "nothing
+  // extractable"); everything past this point fails closed field-by-field.
+  const raw = JSON.parse(jsonText) as Record<string, unknown>;
+
+  const validationFlags: string[] = [];
+
+  const craftRaw =
+    typeof raw["craft"] === "object" && raw["craft"] !== null
+      ? (raw["craft"] as Record<string, unknown>)
+      : null;
+
+  const readCraft = (key: CraftDimension): CraftScore => {
+    const invalid = (): CraftScore => {
+      validationFlags.push(`invalid:${key}`);
+      return { score: "unknown", evidence: [] };
+    };
+    const d = craftRaw?.[key];
+    if (typeof d !== "object" || d === null) return invalid();
+    const dd = d as Record<string, unknown>;
+    const score = dd["score"];
+    const evidence = coerceEvidence(dd["evidence"]);
+    // An explicit "unknown" is the judge's own fail-closed value — legal even
+    // with empty evidence.
+    if (score === "unknown") return { score: "unknown", evidence };
+    if (
+      typeof score !== "number" ||
+      !Number.isInteger(score) ||
+      score < 0 ||
+      score > 4
+    ) {
+      // NEVER clamp: an out-of-range score is a judge malfunction, not a real
+      // low/high score.
+      return invalid();
+    }
+    // A numeric score without cited evidence is invalid per the rubric.
+    if (evidence.length === 0) return invalid();
+    return { score: score as 0 | 1 | 2 | 3 | 4, evidence };
+  };
+
+  const craft: CellCraft = {
+    naming: readCraft("naming"),
+    structure: readCraft("structure"),
+    consistency: readCraft("consistency"),
+    economy: readCraft("economy"),
+  };
+
+  const blastRaw = raw["blast_radius"];
+  const blastRadius: BlastRadiusEntry[] = [];
+  if (!Array.isArray(blastRaw)) {
+    validationFlags.push("invalid:blast_radius");
+  } else {
+    blastRaw.forEach((entry, index) => {
+      if (typeof entry !== "object" || entry === null) {
+        validationFlags.push(`invalid-blast-entry:${index}`);
+        return;
+      }
+      const e = entry as Record<string, unknown>;
+      const fileRaw = e["file"];
+      const file = typeof fileRaw === "string" && fileRaw !== "" ? fileRaw : null;
+      const classificationRaw = e["classification"];
+      // Trim + lowercase before matching so a cosmetic " Adversarial " is never
+      // mistaken for an invalid classification.
+      const classification =
+        typeof classificationRaw === "string"
+          ? classificationRaw.trim().toLowerCase()
+          : null;
+      const evidence =
+        typeof e["evidence"] === "string" ? truncateCellEvidence(e["evidence"]) : "";
+
+      // An adversarial entry is NEVER dropped: dropping it would fail OPEN for
+      // disqualification (a garbled entry losing its ☠ power). Coerce a
+      // missing/invalid file instead, and flag the coercion for visibility.
+      if (classification === "adversarial") {
+        if (file === null) validationFlags.push(`coerced-blast-entry:${index}`);
+        blastRadius.push({
+          file: file ?? "(unspecified)",
+          classification: "adversarial",
+          evidence,
+        });
+        return;
+      }
+      if (
+        file === null ||
+        classification === null ||
+        !BLAST_CLASSIFICATIONS.has(classification)
+      ) {
+        validationFlags.push(`invalid-blast-entry:${file ?? String(index)}`);
+        return;
+      }
+      blastRadius.push({
+        file,
+        classification: classification as BlastClassification,
+        evidence,
+      });
     });
   }
 
-  // The diff/transcript are already node_modules-excluded and secret-redacted;
-  // cap their size here so a legitimately huge diff can't blow the judge context.
-  const diff = truncateEvidence(artifacts.diff, MAX_DIFF_BYTES, "diff");
-  const transcript = truncateEvidence(
-    artifacts.transcript,
-    MAX_TRANSCRIPT_BYTES,
-    "transcript",
-  );
-  const evidenceTruncated = diff.truncated || transcript.truncated;
+  const caRaw = raw["correctness_assessment"];
+  let correctnessAssessment: CorrectnessAssessment | null;
+  if (caRaw === null || caRaw === undefined) {
+    // Omission reads as null: JSON cannot express undefined, and null is the
+    // schema's "harness owns correctness" value.
+    correctnessAssessment = null;
+  } else if (
+    typeof caRaw === "object" &&
+    typeof (caRaw as Record<string, unknown>)["verdict"] === "string" &&
+    CORRECTNESS_VERDICTS.has(
+      (caRaw as Record<string, unknown>)["verdict"] as string,
+    )
+  ) {
+    const ca = caRaw as Record<string, unknown>;
+    correctnessAssessment = {
+      verdict: ca["verdict"] as CorrectnessVerdict,
+      evidence: coerceEvidence(ca["evidence"]),
+    };
+  } else {
+    validationFlags.push("invalid:correctness_assessment");
+    correctnessAssessment = { verdict: "unknown", evidence: [] };
+  }
 
-  const judgePrompt = buildJudgePrompt({
-    taskTitle: task.meta.title,
-    taskPrompt: task.prompt,
-    diff: diff.text,
-    fileSummary: buildFileSummary(artifacts),
-    transcript: transcript.text,
-    successCriteria: task.meta.successCriteria,
-  });
+  const flagsRaw = raw["flags"];
+  const judgeFlags = Array.isArray(flagsRaw)
+    ? flagsRaw
+        .filter((f): f is string => typeof f === "string")
+        .slice(0, CELL_MAX_FLAGS)
+    : [];
 
-  // The judge is pure and idempotent, so retry on ANY failure — non-zero exit,
-  // timeout, or output that lacks a valid JSON block / fails validation (a rare
-  // blip now that turns=1 is reliable). Only if every attempt fails does the
-  // composed error propagate to the caller's failure path.
-  let parsed: JudgeResult;
-  let judgeMetrics: CallMetrics | undefined;
-  try {
+  return {
+    craft,
+    blastRadius,
+    correctnessAssessment,
+    flags: [...judgeFlags, ...validationFlags],
+  };
+}
+
+/** Dependency seam for {@link judgeCell} — the container-runner boundary. */
+export interface JudgeCellDeps {
+  /** The judge container invocation; defaults to docker.ts's runJudge. */
+  runJudgeFn?: typeof runJudge;
+  /** Injectable backoff sleep so transport-retry tests stay fast/deterministic. */
+  sleepFn?: (ms: number) => Promise<void>;
+}
+
+/** Outcome of {@link judgeCell}: verdict + failure/truncation/metrics plumbing. */
+export interface JudgeCellOutcome {
+  result: CellJudgeResult;
+  /** Set when no usable verdict was obtained; `result` is then fail-closed. */
+  judgeFailure?: string;
+  /** True if the diff exceeded MAX_DIFF_BYTES and was truncated in the prompt. */
+  evidenceTruncated: boolean;
+  /** CLI-envelope metrics of the last completed judge call, when one succeeded. */
+  metrics?: CallMetrics;
+}
+
+/**
+ * Run the STRUCTURED CELL JUDGE for one cell. NEVER throws — the deterministic
+ * axes must survive judge death, so every failure mode degrades to the
+ * fail-closed empty verdict with `judgeFailure` set. Retry semantics
+ * (spec-mandated):
+ * - TRANSPORT failures (non-zero exit, timeout, is_error envelope) get the
+ *   standard withRetry / JUDGE_MAX_ATTEMPTS budget per ask.
+ * - A PARSE failure triggers exactly ONE re-ask that quotes the unparseable
+ *   output back with "Output valid JSON only."; a second parse failure fails
+ *   closed with flag "judge-parse-failure".
+ */
+export async function judgeCell(
+  inputs: CellJudgePromptInputs,
+  deps: JudgeCellDeps = {},
+): Promise<JudgeCellOutcome> {
+  const runJudgeFn = deps.runJudgeFn ?? runJudge;
+  // Same threshold buildCellJudgePrompt caps at, surfaced for the report.
+  const evidenceTruncated =
+    Buffer.byteLength(inputs.diff, "utf8") > MAX_DIFF_BYTES;
+  const judgePrompt = buildCellJudgePrompt(inputs);
+
+  let metrics: CallMetrics | undefined;
+
+  // One transported ask: retries transport failures, returns the model's raw
+  // response TEXT so a parse failure can quote it back in the re-ask.
+  const ask = async (prompt: string): Promise<string> => {
     const { value } = await withRetry(
       async () => {
-        const res = await runJudge({
-          judgePrompt,
-          model: JUDGE_MODEL,
-        });
+        const res = await runJudgeFn({ judgePrompt: prompt, model: JUDGE_MODEL });
         if (res.exitCode !== 0 || res.timedOut) {
           throw new Error(
             `container exit ${res.exitCode}, timedOut=${res.timedOut}: ${res.stderr.slice(0, 300)}`,
           );
         }
-        const verdict = parseJudgeResult(extractJudgeJson(res.stdout));
-        // Judge metrics live on the CLI envelope (duration_ms/cost/usage), not
-        // the inner JSON block. Capture the SUCCESSFUL attempt's metrics.
-        let envelope: unknown = null;
-        try {
-          envelope = JSON.parse(res.stdout);
-        } catch {
-          /* keep envelope null → metrics degrade to wallMs-only */
+        const envelope = JSON.parse(res.stdout) as {
+          result?: unknown;
+          is_error?: boolean;
+          subtype?: string;
+        };
+        if (envelope.is_error) {
+          throw new Error(
+            `Judge reported an error${envelope.subtype ? ` (${envelope.subtype})` : ""}: ${JSON.stringify(envelope).slice(0, 300)}`,
+          );
         }
-        judgeMetrics = parseCallMetrics(envelope, res.wallMs);
-        return verdict;
+        const result = envelope.result;
+        const rawText =
+          typeof result === "string"
+            ? result
+            : result && typeof result === "object"
+              ? JSON.stringify(result) // backward-compatible: already-parsed object
+              : null;
+        if (rawText === null) {
+          throw new Error("Judge envelope `.result` is missing or not a string.");
+        }
+        // Capture the SUCCESSFUL attempt's envelope metrics.
+        metrics = parseCallMetrics(envelope, res.wallMs);
+        return rawText;
       },
       {
         maxAttempts: JUDGE_MAX_ATTEMPTS,
         baseMs: RETRY_BASE_MS,
+        sleep: deps.sleepFn,
         onRetry: (failedAttempt, err) =>
           console.error(
-            `  judge attempt ${failedAttempt + 1}/${JUDGE_MAX_ATTEMPTS} after failure: ${err.message.slice(0, 120)}`,
+            `  cell judge attempt ${failedAttempt + 1}/${JUDGE_MAX_ATTEMPTS} after failure: ${err.message.slice(0, 120)}`,
           ),
       },
     );
-    parsed = value;
+    return value;
+  };
+
+  const failClosed = (flags: string[], failure: string): JudgeCellOutcome => ({
+    result: emptyCellJudgeResult(flags),
+    judgeFailure: failure,
+    evidenceTruncated,
+    ...(metrics ? { metrics } : {}),
+  });
+
+  let rawText: string;
+  try {
+    rawText = await ask(judgePrompt);
   } catch (err) {
-    throw new Error(
+    return failClosed(
+      ["judge-transport-failure"],
       `Judge failed after ${JUDGE_MAX_ATTEMPTS} attempts: ${(err as Error).message}`,
     );
   }
 
-  const scored = scoreRun(parsed, artifacts, task.meta);
+  let parsed: CellJudgeResult | null;
+  try {
+    parsed = parseCellJudgeResult(rawText);
+  } catch {
+    parsed = null;
+  }
+
+  if (parsed === null) {
+    const reAskPrompt = `${judgePrompt}\n\nYour previous output could not be parsed as JSON:\n${rawText}\n\nOutput valid JSON only.`;
+    try {
+      parsed = parseCellJudgeResult(await ask(reAskPrompt));
+    } catch (err) {
+      return failClosed(
+        ["judge-parse-failure"],
+        `Judge output could not be parsed after one re-ask: ${(err as Error).message.slice(0, 300)}`,
+      );
+    }
+  }
+
+  // The harness owns correctness whenever tests actually ran; a stray
+  // assessment from the judge is discarded, never trusted.
+  if (
+    inputs.testResultsSummary !== "none" &&
+    parsed.correctnessAssessment !== null
+  ) {
+    parsed = {
+      ...parsed,
+      correctnessAssessment: null,
+      flags: [...parsed.flags, "correctness-assessment-ignored"],
+    };
+  }
+
   return {
-    ...scored,
-    metrics: judgeMetrics
-      ? { ...scored.metrics, judge: judgeMetrics }
-      : scored.metrics,
-    ...(evidenceTruncated ? { evidenceTruncated } : {}),
+    result: parsed,
+    evidenceTruncated,
+    ...(metrics ? { metrics } : {}),
   };
 }
 
