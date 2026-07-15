@@ -22,6 +22,7 @@ import {
   gradeSymbol,
   hasMemoryEffect,
   isScored,
+  levelSparkline,
   regenerateReport,
   renderBehaviorComparison,
   renderBlastRadius,
@@ -38,6 +39,7 @@ import {
   renderReportMarkdown,
   renderRunMetrics,
   renderSlop,
+  sparkline,
 } from "./report.js";
 import type {
   AnchorResult,
@@ -177,6 +179,36 @@ const crossModel = [alphaSon, alphaOpus];
 test("formatScore keeps integers and renders means to one decimal", () => {
   assert.equal(formatScore(86), "86");
   assert.equal(formatScore(22.5), "22.5");
+});
+
+// --- Sparklines ---------------------------------------------------------------
+
+test("sparkline: empty input renders the empty string (no bogus glyph)", () => {
+  assert.equal(sparkline([]), "");
+});
+
+test("sparkline: a single value renders one floor block (no range to normalize)", () => {
+  assert.equal(sparkline([42]), "▁");
+});
+
+test("sparkline: a flat series (no spread) renders all floor blocks", () => {
+  assert.equal(sparkline([5, 5, 5, 5]), "▁▁▁▁");
+});
+
+test("sparkline: a normal series spans floor→peak across its own min/max", () => {
+  const s = sparkline([0, 1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(s.length, 8);
+  assert.equal(s[0], "▁"); // min → floor
+  assert.equal(s[s.length - 1], "█"); // max → peak
+  assert.equal(sparkline([1, 2, 3]), "▁▅█"); // evenly spaced 3-point ramp (mid rounds up)
+});
+
+test("levelSparkline: fixed 0..maxLevel scale — all-high reads tall, all-low reads flat", () => {
+  assert.equal(levelSparkline([], 6), "");
+  assert.equal(levelSparkline([6, 6, 6], 6), "███"); // absolute top, not self-normalized
+  assert.equal(levelSparkline([0, 0, 0], 6), "▁▁▁"); // absolute floor
+  assert.equal(levelSparkline([-3, 9], 6), "▁█"); // clamped into range
+  assert.equal(levelSparkline([3, 3], 0), "▁▁"); // maxLevel 0 → floor, never NaN
 });
 
 test("isScored: genuine judge-0 counts; failures/timeouts are excluded", () => {
@@ -1193,9 +1225,17 @@ test("aggregateReliability: stddev + craft ranges + anchor agreement on a 3-repe
   assert.deepEqual(g!.craftRange.structure, { min: 3, max: 3 });
   assert.equal(g!.craftUnknowns, 1);
   assert.deepEqual(g!.anchorGrades, ["held-by-literal", "held-by-literal", "held-by-literal"]);
+  // Per-run mean-of-dimensions dispersion: rep1 [2,3,3]=2.67, rep2 [4,3,3,3]=3.25, rep3 3.0.
+  assert.ok(Math.abs(g!.craftScore!.min - 2.6667) < 0.001);
+  assert.ok(Math.abs(g!.craftScore!.max - 3.25) < 0.001);
+  // No testResults and no judge correctness assessment → no correctness verdict.
+  assert.equal(g!.verdictRuns, 0);
 
   const md = renderReliability(rs);
-  assert.match(md, /\| `t` × v \[sonnet\] \| 3 \| \$0\.0082 \| 1\.6s \| 2–4 \| 3 \| 3 \| 3 \| 1 \| 3\/3 identical \|/);
+  assert.match(md, /\| `t` × v \[sonnet\] \| 3 \| — \| 2\.7 \/ 3\.0 \/ 3\.3 \| \$0\.0082 \| 1\.6s \| 2–4 \| 3 \| 3 \| 3 \| 1 \| 3\/3 identical \|/);
+  assert.match(md, /Craft score \(min\/mean\/max\)/);
+  assert.match(md, /Targeting: spend repeats on the high-variance/);
+  assert.match(md, /prisma-tx-deadlock/);
   assert.doesNotMatch(md, /undefined|NaN/);
 });
 
@@ -1269,6 +1309,53 @@ test("aggregateReliability counts judge-failed repeats as judgeFailures, never a
 
   const md = renderReliability([ok, judgeFailed]);
   assert.match(md, /\| 0 \(judgeFailures: 1\) \|/);
+});
+
+test("aggregateReliability: correctness verdict rate mixes deterministic tests and judge fallback", () => {
+  const passed = cell("v", "t", {
+    repeat: 1,
+    testResults: makeTestResults(true, 3, 0), // deterministic pass
+  });
+  const judgedWrong = cell("v", "t", {
+    repeat: 2,
+    judge: judgeResult({
+      correctnessAssessment: { verdict: "likely_incorrect", evidence: ["missing branch"] },
+    }),
+  });
+  const noVerdict = cell("v", "t", { repeat: 3, judge: judgeResult() }); // null assessment → no verdict
+  const [g] = aggregateReliability([passed, judgedWrong, noVerdict]);
+  assert.equal(g!.correctRuns, 1);
+  assert.equal(g!.verdictRuns, 2); // the null-assessment run contributes no verdict
+  const md = renderReliability([passed, judgedWrong, noVerdict]);
+  assert.match(md, /\| 1\/2 correct \|/);
+});
+
+test("renderRunMetrics adds a per-task exec-cost sparkline column", () => {
+  const t1 = cell("v", "t1", { metrics: { executor: { wallMs: 10_000, costUsd: 0.02 } } });
+  const t2 = cell("v", "t2", { metrics: { executor: { wallMs: 10_000, costUsd: 0.08 } } });
+  const md = renderRunMetrics([t1, t2]);
+  assert.match(md, /\| Variant \| Model \| Exec time \(s\) \| Exec cost \(USD\) \| Input tok \(uncached\) \| Output tok \| Turns \| Judge cost \(USD\) \| Cost\/task \|/);
+  assert.match(md, /Cost\/task = per-task exec-cost sparkline/);
+  // Two tasks, low→high cost → floor then peak block.
+  assert.match(md, /\| v \| sonnet \|.*\| ▁█ \|/);
+  assert.doesNotMatch(md, /undefined|NaN/);
+});
+
+test("renderRunMetrics renders — for the sparkline when no task reported a cost", () => {
+  const noCost = cell("v", "t", { metrics: { executor: { wallMs: 8000 } } });
+  const md = renderRunMetrics([noCost]);
+  assert.match(md, /\| v \| sonnet \| 8.0s \| — \| — \| — \| — \| — \| — \|/);
+});
+
+test("renderCampaignMemoryEffect renders a per-bundle adherence sparkline across the chain", () => {
+  const md = renderCampaignMemoryEffect(campaigns);
+  assert.match(md, /Adherence sparkline per bundle/);
+  // agentic-os held all 3 (grade-less hold ≈ level 4 of 6) → uniform mid block.
+  assert.match(md, /- agentic-os `▆▆▆`/);
+  // naked hit the trap all 3 → floor blocks.
+  assert.match(md, /- naked `▁▁▁`/);
+  // gstack held→drift→trap (levels 4,1,0) → descending.
+  assert.match(md, /- gstack `▆▂▁`/);
 });
 
 test("renderReliability: single-run reports say so; repeat-less results never group", () => {
