@@ -71,9 +71,48 @@ test("extractJudgeJson throws when there is no JSON object in the response", () 
   assert.throws(() => extractJudgeJson(envelope("I could not evaluate this.")), /No JSON object/);
 });
 
-test("extractJudgeJson throws on malformed JSON in the block", () => {
-  const result = "```json\n{ \"codeQuality\": { \"score\": 10, }\n```"; // trailing comma
-  assert.throws(() => extractJudgeJson(envelope(result)));
+test("extractJudgeJson recovers a fenced object with a trailing comma before }", () => {
+  const result = "```json\n" + JSON.stringify(validPayload).replace(/}$/, ",}") + "\n```";
+  assert.deepEqual(extractJudgeJson(envelope(result)), validPayload);
+});
+
+test("extractJudgeJson recovers trailing commas throughout an object and array", () => {
+  const result =
+    "```json\n" +
+    '{ "codeQuality": { "score": 10, }, "notes": [ "a", "b", ], }' +
+    "\n```";
+  assert.deepEqual(extractJudgeJson(envelope(result)), {
+    codeQuality: { score: 10 },
+    notes: ["a", "b"],
+  });
+});
+
+test("extractJudgeJson recovers a truncated-but-recoverable object by closing it", () => {
+  // Model output cut off mid-object: the open string and containers are closed.
+  const result = '{ "codeQuality": { "score": 10 }, "summary": "great work so far';
+  assert.deepEqual(extractJudgeJson(envelope(result)), {
+    codeQuality: { score: 10 },
+    summary: "great work so far",
+  });
+});
+
+test("extractJudgeJson skips a decoy brace and finds the real outermost object", () => {
+  const result = "Config looks like { path } then here is the verdict: " + JSON.stringify(validPayload);
+  assert.deepEqual(extractJudgeJson(envelope(result)), validPayload);
+});
+
+test("extractJudgeJson returns the real verdict, not a leading complete example", () => {
+  // The judge sometimes echoes a format example (a valid object) BEFORE the real
+  // verdict. Last-parseable selection dodges the example.
+  const result =
+    'Format example: {"winner":"agent_a"}\n\nActual verdict: {"winner":"agent_b"}';
+  assert.deepEqual(extractJudgeJson(envelope(result)), { winner: "agent_b" });
+});
+
+test("extractJudgeJson still throws on truly unrecoverable garbage in the block", () => {
+  // Unquoted tokens cannot be repaired into valid JSON — fail closed.
+  const result = "```json\n{ codeQuality: nonsense here, no quotes at all\n```";
+  assert.throws(() => extractJudgeJson(envelope(result)), /No JSON object/);
 });
 
 test("extractJudgeJson throws on an is_error envelope, surfacing the subtype", () => {
@@ -215,6 +254,55 @@ test("parseCellJudgeResult throws when no JSON object exists (feeds the re-ask)"
 
 test("parseCellJudgeResult throws on malformed JSON in the balanced span", () => {
   assert.throws(() => parseCellJudgeResult('{"craft": nonsense}'));
+});
+
+test("parseCellJudgeResult recovers a payload with trailing commas", () => {
+  const raw = JSON.stringify(validCellPayload).replace(/}/g, ",}").replace(/]/g, ",]");
+  const r = parseCellJudgeResult(raw);
+  assert.equal(r.craft.naming.score, 3);
+  assert.equal(r.craft.testing.score, 3);
+});
+
+test("parseCellJudgeResult recovers a truncated payload by closing open containers", () => {
+  // Cut off after the complete craft + blast_radius, dropping the tail. The root
+  // object is closed by the repair; every craft dimension present survives.
+  const full = JSON.stringify(validCellPayload);
+  const marker = '"blast_radius":[]';
+  const truncated = full.slice(0, full.indexOf(marker) + marker.length);
+  const r = parseCellJudgeResult(truncated);
+  assert.equal(r.craft.naming.score, 3);
+  assert.equal(r.craft.structure.score, 2);
+  assert.deepEqual(r.blastRadius, []);
+});
+
+test("parseCellJudgeResult finds the real object past a decoy brace in prose", () => {
+  const raw = "The config { key } is unrelated. Verdict:\n" + JSON.stringify(validCellPayload);
+  const r = parseCellJudgeResult(raw);
+  assert.equal(r.craft.consistency.score, 4);
+});
+
+test("parseCellJudgeResult returns the real verdict past a leading complete example object", () => {
+  // A full, valid example payload precedes the real one; last-parseable wins.
+  const example = withCraftDim("naming", {
+    score: 0,
+    evidence: ["example — ignore me"],
+  });
+  const raw =
+    "Example of the format:\n```json\n" +
+    JSON.stringify(example) +
+    "\n```\n\nActual verdict:\n```json\n" +
+    JSON.stringify(validCellPayload) +
+    "\n```";
+  const r = parseCellJudgeResult(raw);
+  assert.equal(r.craft.naming.score, 3); // the verdict's 3, not the example's 0
+});
+
+test("parseCellJudgeResult still fails closed on true garbage (no fabricated verdict)", () => {
+  // A brace-bearing but structurally hopeless response must not yield a verdict.
+  assert.throws(
+    () => parseCellJudgeResult("verdict: { totally unparseable, no quotes, 3/5 stars"),
+    /No JSON object/,
+  );
 });
 
 test("parseCellJudgeResult fails an out-of-range craft score closed — never clamped", () => {
