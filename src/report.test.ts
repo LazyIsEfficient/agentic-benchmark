@@ -1226,17 +1226,58 @@ test("renderCraftScore: a variant backed by < MIN_CONFIDENT_DECISIVE comparisons
   assert.match(md, /thin ⚠ low-confidence \(n=4\)/);
 });
 
-test("renderCraftScore: adjacent ranks with < MIN_CONFIDENT_DECISIVE head-to-head are not separable (≈)", () => {
-  // "top" outscores "next" but they only met in 4 decisive comparisons — too few
-  // to rank. The second row must render ≈ (same band), not a distinct rank 2.
-  const results = [cs("top", {}), cs("next", { duplicationDelta: 3 })];
-  const pw = [...beats("top", "next", 3), ...beats("next", "top", 1)];
+test("renderCraftScore tie-band: close-and-thin AND lower won ≥1 → not separable (≈)", () => {
+  // "top" beats "next" 2–1 (3 decisive < 5), both clean slop → scores 77 vs 53,
+  // gap 24 < 25, and next won one of the three. Thin, close, not a shutout → the
+  // second row must render ≈ (same band), not a distinct rank 2.
+  const results = [cs("top", {}), cs("next", {})];
+  const pw = [...beats("top", "next", 2), ...beats("next", "top", 1)];
   const aggs = aggregateCraftScore(results, pw);
-  assert.deepEqual(aggs.map((a) => a.variant), ["top", "next"]); // top still scores higher
+  assert.deepEqual(aggs.map((a) => a.variant), ["top", "next"]); // top scores higher
+  assert.equal(aggs[0]!.score, 77); // round(100·(0.7·0.667 + 0.3·1.0))
+  assert.equal(aggs[1]!.score, 53); // round(100·(0.7·0.333 + 0.3·1.0)); gap 24 < 25
   const md = renderCraftScore(results, pw);
-  assert.match(md, /\| 1 \| top ⚠ low-confidence \(n=4\) \| sonnet \|/);
-  assert.match(md, /\| ≈ \| next ⚠ low-confidence \(n=4\) \| sonnet \|/); // not a rank 2
+  assert.match(md, /\| 1 \| top ⚠ low-confidence \(n=3\) \| sonnet \|/);
+  assert.match(md, /\| ≈ \| next ⚠ low-confidence \(n=3\) \| sonnet \|/); // not a rank 2
   assert.doesNotMatch(md, /\| 2 \|/);
+});
+
+test("renderCraftScore tie-band: a head-to-head SHUTOUT separates even on a thin sample and small gap", () => {
+  // Chain of shutouts with SMALL score gaps (18, 17 — both < 25) so only the
+  // shutout rule can separate them. Macro rates: hi (vs mid 1.0, vs lo .5)=.75;
+  // mid (vs hi 0, vs lo 1.0)=.5; lo (vs hi .5, vs mid 0)=.25. mid is shut out by
+  // hi (0–2); lo is shut out by mid (0–2). Each must get its own rank, not ≈.
+  const results = [cs("hi", {}), cs("mid", {}), cs("lo", {})];
+  const pw = [
+    ...beats("hi", "mid", 2), // mid shut out by hi
+    ...beats("mid", "lo", 2), // lo shut out by mid
+    ...beats("hi", "lo", 1),
+    ...beats("lo", "hi", 1), // hi–lo split 1–1
+  ];
+  const aggs = aggregateCraftScore(results, pw);
+  assert.deepEqual(aggs.map((a) => a.variant), ["hi", "mid", "lo"]);
+  assert.deepEqual(aggs.map((a) => a.score), [83, 65, 48]); // gaps 18, 17 (< 25)
+  const md = renderCraftScore(results, pw);
+  assert.match(md, /\| 1 \| hi ⚠ low-confidence \(n=4\) \| sonnet \| 83 \|/);
+  assert.match(md, /\| 2 \| mid ⚠ low-confidence \(n=4\) \| sonnet \| 65 \|/); // shutout → rank 2
+  assert.match(md, /\| 3 \| lo ⚠ low-confidence \(n=4\) \| sonnet \| 48 \|/); // shutout → rank 3
+  assert.doesNotMatch(md, /\| ≈ \|/); // no banded rows
+});
+
+test("renderCraftScore tie-band: a ≥ 25-point score gap separates even on a thin sample", () => {
+  // "a" beats "b" 3–1 (4 decisive < 5) and b won one (NOT a shutout), so only the
+  // big-gap rule can separate them: a is clean (score 83), b's slop saturates
+  // (score 18) → gap 65 ≥ 25 → distinct ranks, not ≈.
+  const results = [cs("a", {}), cs("b", { duplicationDelta: 10 })];
+  const pw = [...beats("a", "b", 3), ...beats("b", "a", 1)];
+  const aggs = aggregateCraftScore(results, pw);
+  assert.deepEqual(aggs.map((a) => a.variant), ["a", "b"]);
+  assert.equal(aggs[0]!.score, 83);
+  assert.equal(aggs[1]!.score, 18); // gap 65 ≥ 25
+  const md = renderCraftScore(results, pw);
+  assert.match(md, /\| 1 \| a ⚠ low-confidence \(n=4\) \| sonnet \| 83 \|/);
+  assert.match(md, /\| 2 \| b ⚠ low-confidence \(n=4\) \| sonnet \| 18 \|/); // big gap → rank 2
+  assert.doesNotMatch(md, /\| ≈ \|/); // no banded rows
 });
 
 test("aggregateCraftScore: missing pairwise drops the winRate term → round(100·SlopHealth), flagged slop-only", () => {

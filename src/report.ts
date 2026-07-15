@@ -760,6 +760,17 @@ const MIN_DECISIVE_COMPARISONS = 3;
  * slop-only cutoff), not a replacement for it.
  */
 const MIN_CONFIDENT_DECISIVE = 5;
+/**
+ * Craft Score gap (0–100 points) that separates two adjacent ranks even on a
+ * thin sample. The `≈` tie-band exists for close-and-thin pairs; it must not
+ * erase an unambiguous separation. On this scale the win-rate term spans 70
+ * points and SlopHealth 30, so a 25-point gap corresponds to roughly a 0.35
+ * swing in head-to-head win rate (0.7·0.35 ≈ 24.5) — one variant dominating
+ * (~0.9) while the other is barely above even (~0.55). A separation that wide is
+ * not something a comparison or two of sampling noise can plausibly close, so it
+ * earns a distinct rank even below {@link MIN_CONFIDENT_DECISIVE}.
+ */
+const MIN_SEPARABLE_SCORE_GAP = 25;
 
 /** Clamp x into [lo, hi]. */
 function clamp(x: number, lo: number, hi: number): number {
@@ -920,10 +931,15 @@ export function renderCraftScore(
     `| Rank | Variant | Model | Craft Score | Win rate | Slop health |\n` +
     `| --- | --- | --- | --- | --- | --- |`;
   // Competition-style ranking with a confidence tie-band: a scored row gets a
-  // fresh rank number only when it is SEPARABLE from the row above — i.e. the two
-  // variants faced each other in ≥ MIN_CONFIDENT_DECISIVE decisive comparisons.
-  // Otherwise it shares the band and renders `≈` (not separable), so the table
-  // never claims a firm separation the sample can't support.
+  // fresh rank number only when it is SEPARABLE from the row above. Separable
+  // when the sample is large enough OR the separation is unambiguous despite a
+  // thin sample:
+  //   • ≥ MIN_CONFIDENT_DECISIVE decisive comparisons between the two, OR
+  //   • the lower row was SHUT OUT in their direct head-to-head (0 wins against
+  //     the row above — a clean loss no sampling-noise band should erase), OR
+  //   • the Craft Score gap exceeds MIN_SEPARABLE_SCORE_GAP.
+  // Otherwise — thin AND close AND the lower row won ≥1 head-to-head — keep `≈`,
+  // so the table never claims a firm separation the sample can't support.
   let prevScored: CraftScoreAggregate | undefined;
   let band = 0;
   const rows = aggs.map((a) => {
@@ -935,8 +951,14 @@ export function renderCraftScore(
       ? a.headToHead.find((h) => h.opponent === prevScored!.variant)
       : undefined;
     const decisiveBetween = vsPrev ? vsPrev.wins + vsPrev.losses : 0;
+    const shutOut = vsPrev !== undefined && vsPrev.wins === 0 && vsPrev.losses > 0;
+    const bigGap =
+      prevScored !== undefined && prevScored.score! - a.score! >= MIN_SEPARABLE_SCORE_GAP;
     const separable =
-      prevScored === undefined || decisiveBetween >= MIN_CONFIDENT_DECISIVE;
+      prevScored === undefined ||
+      decisiveBetween >= MIN_CONFIDENT_DECISIVE ||
+      shutOut ||
+      bigGap;
     if (separable) band++;
     const rankCell = separable ? String(band) : "≈";
     prevScored = a;
@@ -949,7 +971,7 @@ export function renderCraftScore(
   });
   return [
     "_Within-Craft ranking summary — NOT a cross-axis total (axes are never summed; this combines only Craft's own sub-signals). `Score = round(100·(0.7·winRate + 0.3·SlopHealth))`, where winRate is the HEAD-TO-HEAD macro-average (each opponent weighted once, so beating one weak variant repeatedly earns no extra credit), dup capped at " +
-      `${CRAFT_DUP_CAP}. A variant with fewer than ${MIN_DECISIVE_COMPARISONS} decisive comparisons drops the winRate term and is flagged \`(slop-only)\` (never imputed). Confidence layer: a scored row backed by fewer than ${MIN_CONFIDENT_DECISIVE} decisive comparisons is flagged \`⚠ low-confidence (n=…)\`; two adjacent rows separated by fewer than ${MIN_CONFIDENT_DECISIVE} decisive HEAD-TO-HEAD comparisons share a rank band and render \`≈\` (not separable) rather than distinct ranks. testTamper is a soft penalty via SlopHealth. Disqualified cells are excluded from the inputs but keep their ☠ mark._`,
+      `${CRAFT_DUP_CAP}. A variant with fewer than ${MIN_DECISIVE_COMPARISONS} decisive comparisons drops the winRate term and is flagged \`(slop-only)\` (never imputed). Confidence layer: a scored row backed by fewer than ${MIN_CONFIDENT_DECISIVE} decisive comparisons is flagged \`⚠ low-confidence (n=…)\`; two adjacent rows share a rank band and render \`≈\` (not separable) when their direct head-to-head is thin (< ${MIN_CONFIDENT_DECISIVE} decisive) AND their Craft Score gap is under ${MIN_SEPARABLE_SCORE_GAP} AND the lower row won at least one of those comparisons — a head-to-head shutout (0 wins) or a ≥ ${MIN_SEPARABLE_SCORE_GAP}-point gap still separates them. testTamper is a soft penalty via SlopHealth. Disqualified cells are excluded from the inputs but keep their ☠ mark._`,
     "",
     [header, ...rows].join("\n"),
   ].join("\n");
